@@ -10,6 +10,10 @@ Two scheduled tasks start the application at boot:
 - `NewsIntelligenceAPI` runs `start-api.cmd` on `127.0.0.1:8001`.
 - `NewsIntelligenceWeb` runs `start-web.cmd` on `127.0.0.1:3101`.
 
+Both tasks run as SYSTEM with no execution time limit (`PT0S`). On failure,
+Task Scheduler retries every minute, up to 10 times. This replaces the default
+72-hour limit that could stop the long-running API and web processes.
+
 Cloudflare Tunnel publishes `news.primexeu.com` to `http://127.0.0.1:3101`.
 The IIS site `News Intelligence` uses the `NewsIntelligencePool` application
 pool and the same host binding on port 80 as an origin fallback. Its root is
