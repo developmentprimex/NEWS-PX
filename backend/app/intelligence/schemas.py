@@ -6,6 +6,7 @@ from typing import Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from app.intelligence.linkedin_identity import canonical_linkedin_url
 
 SourceType = Literal["WEBSITE", "RSS", "LINKEDIN", "FACEBOOK", "API", "OTHER"]
 SourceStatus = Literal["ACTIVE", "PAUSED"]
@@ -50,10 +51,8 @@ class NewsSourceCreate(BaseModel):
         if self.repost_groups and self.type != "LINKEDIN":
             raise ValueError("Repost watch groups require a LinkedIn source.")
         if self.type == "LINKEDIN":
-            parsed = urlparse(self.url)
-            segments = [part for part in parsed.path.split("/") if part]
-            if parsed.hostname not in {"linkedin.com", "www.linkedin.com"} or len(segments) != 2 or segments[0] not in {"in", "company"}:
-                raise ValueError("Use a LinkedIn profile or company page URL (linkedin.com/in/... or linkedin.com/company/...).")
+            self.fetch_interval_minutes = max(1440, self.fetch_interval_minutes)
+            self.url = canonical_linkedin_url(self.url)
         return self
 
 
@@ -80,6 +79,7 @@ class NewsSourceOut(BaseModel):
     pending_snapshot_id: str | None
     last_error: str | None
     collection_supported: bool = False
+    collection_enabled: bool = False
     email_enabled: bool = False
     created_at: datetime
     updated_at: datetime
@@ -87,6 +87,20 @@ class NewsSourceOut(BaseModel):
     repost_guidance: dict[RepostGroup, str] = Field(default_factory=dict)
 
     model_config = {"from_attributes": True}
+
+
+class LinkedInMonitorOut(BaseModel):
+    """Read-only feed metadata; no editor instructions, subscriptions or billing."""
+    id: uuid.UUID
+    name: str
+    url: str
+    type: Literal["LINKEDIN"]
+    status: SourceStatus
+    fetch_interval_minutes: int
+    last_checked_at: datetime | None
+    pending_snapshot_id: str | None
+    last_error: str | None
+    collection_enabled: bool
 
 
 class StructuredNewsAnalysis(BaseModel):

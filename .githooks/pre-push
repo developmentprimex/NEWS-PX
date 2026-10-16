@@ -1,0 +1,3 @@
+#!/bin/sh
+# Install only in this repository: git config --local core.hooksPath .githooks
+node deploy/check-push.cjs

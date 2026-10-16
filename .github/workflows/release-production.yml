@@ -1,0 +1,36 @@
+name: Approve paused News production release
+on:
+  workflow_dispatch:
+    inputs:
+      approval_reference:
+        description: Explicit owner approval and external readiness evidence reference
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: news-production-release
+  cancel-in-progress: false
+jobs:
+  verify:
+    uses: ./.github/workflows/deploy.yml
+  approve:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: news-production
+    steps:
+      - name: Record reviewed immutable commit (no server deployment)
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          APPROVAL_REF: ${{ inputs.approval_reference }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          sha = os.environ['RELEASE_SHA']
+          assert len(sha) == 40 and all(c in '0123456789abcdef' for c in sha)
+          assert os.environ['APPROVAL_REF'].strip() and len(os.environ['APPROVAL_REF']) <= 200
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as f:
+              f.write(f'Paused release checks passed for `{sha}`. A separately approved server-console release permit and all external gates are still required.\n')
+          PY

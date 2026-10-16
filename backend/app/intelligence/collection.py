@@ -8,21 +8,22 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import or_, select
+from sqlalchemy import case, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.db import SessionLocal
+from app.db import SessionLocal, engine
 from app.intelligence.ai_service import analyze_news_item
 from app.intelligence.generic_website_adapter import GenericWebsiteAdapter
-from app.intelligence.linkedin_adapter import BrightDataLinkedInAdapter, LinkedInCollectionError
+from app.intelligence.linkedin_adapter import LinkedInCollectionError
+from app.intelligence.linkedin_identity import identity_or_none, lock_key, collection_owner
+from app.intelligence.linkedin_collection import collect_linkedin, incremental_start
 from app.intelligence.models import NewsAnalysis, NewsItem, NewsSource, NewsSourceEmailSubscription
 from app.intelligence.rss_adapter import RSSAdapter, RSSCollectionError, rss_url_is_supported
 from app.intelligence.services import CollectedNewsItem
 from app.intelligence.website_adapter import OfficialWebsiteAdapter, WebsiteCollectionError, WebsiteEntry, source_kind
 
 logger = logging.getLogger(__name__)
-INITIAL_LOOKBACK_DAYS = 60
 CATEGORY_SELECTION = {
     "GRANT": {"Grants", "Funding"}, "TENDER": {"Tenders"},
     "BUSINESS": {"Business"}, "EVENT": {"Events"},
@@ -41,9 +42,7 @@ def linkedin_configured() -> bool:
 
 
 def collection_start_date(last_checked_at: datetime | None, now: datetime) -> str:
-    if last_checked_at is None:
-        return (now.date() - timedelta(days=INITIAL_LOOKBACK_DAYS)).isoformat()
-    return (last_checked_at.date() - timedelta(days=1)).isoformat()
+    return incremental_start(last_checked_at, now).isoformat()
 
 
 async def _store_post(db: AsyncSession, source: NewsSource, post: CollectedNewsItem) -> bool:
@@ -182,47 +181,10 @@ async def check_source(db: AsyncSession, source_id: uuid.UUID, *, force: bool = 
             return await _check_rss_source(db, source, now, force)
         if not settings.BRIGHTDATA_API_TOKEN:
             return "unavailable"
-        adapter = BrightDataLinkedInAdapter(settings.BRIGHTDATA_API_TOKEN, settings.BRIGHTDATA_LINKEDIN_POSTS_DATASET_ID)
-        if source.pending_snapshot_id:
-            if source.last_started_at and source.last_started_at < now - timedelta(days=1):
-                source.pending_snapshot_id = None
-                source.last_error = "Previous collection timed out. A new check will start."
-            else:
-                progress = await adapter.progress(source.pending_snapshot_id)
-                if progress in {"starting", "running"}:
-                    return "pending"
-                if progress == "failed":
-                    source.pending_snapshot_id = None
-                    source.last_error = "Provider could not complete this check. Try again later."
-                    await db.commit()
-                    return "error"
-                posts = await adapter.download(source.pending_snapshot_id, source)
-                seen: set[str] = set()
-                for post in posts:
-                    if post.url in seen:
-                        continue
-                    seen.add(post.url)
-                    await _store_post(db, source, post)
-                source.pending_snapshot_id = None
-                source.last_checked_at = now
-                source.last_error = None
-                await db.commit()
-                return "completed"
-
-        minimum_interval = 5 if force else source.fetch_interval_minutes
-        if source.last_started_at and source.last_started_at > now - timedelta(minutes=minimum_interval):
-            return "pending"
-        snapshot = await adapter.trigger(
-            source,
-            # Revisit the recent window so comments, engagement and edits refresh too.
-            start_date=collection_start_date(None, now),
-            end_date=now.date().isoformat(),
-        )
-        source.pending_snapshot_id = snapshot
-        source.last_started_at = now
-        source.last_error = None
-        await db.commit()
-        return "started"
+        # Web requests cannot start or poll LinkedIn snapshots, including force=True.
+        if force:
+            return "paused"
+        return await protected_linkedin_check(db, source, now)
     except (LinkedInCollectionError, WebsiteCollectionError, RSSCollectionError, httpx.HTTPError) as exc:
         await db.rollback()
         source = await db.get(NewsSource, source_id)
@@ -236,10 +198,14 @@ async def check_source(db: AsyncSession, source_id: uuid.UUID, *, force: bool = 
 
 
 async def check_due_sources() -> dict[str, int]:
+    if not settings.NEWS_ENABLE_COLLECTION:
+        return {"checked": 0}
     async with SessionLocal() as db:
         sources = list((await db.execute(select(NewsSource).where(
             NewsSource.type.in_(["LINKEDIN", "WEBSITE", "RSS"]), NewsSource.status == "ACTIVE",
-        ))).scalars().all())
+        ).order_by(NewsSource.last_started_at.asc().nullsfirst(),
+                   case((NewsSource.priority == "HIGH", 0), (NewsSource.priority == "NORMAL", 1), else_=2),
+                   NewsSource.last_new_posts.desc(), NewsSource.id))).scalars().all())
     ids = [source.id for source in sources if
            (source.type == "LINKEDIN" and linkedin_configured()) or
            (source.type == "WEBSITE" and rss_url_is_supported(source.url)) or
@@ -254,3 +220,25 @@ async def check_due_sources() -> dict[str, int]:
         except Exception:
             logger.exception("Intelligence collection failed for source %s", source_id)
     return {"checked": checked}
+
+
+async def protected_linkedin_check(db, source, now, *, reason="scheduled", backfill=None):
+    if not settings.NEWS_ENABLE_COLLECTION:
+        return "paused"
+    # Dedicated connection holds a session advisory lock through every commit.
+    # Row locks alone would be released by the pre-POST reservation commit.
+    identity = identity_or_none(source.url)
+    if not identity:
+        return "unavailable"
+    key = lock_key(identity)
+    async with engine.connect() as connection:
+        acquired = await connection.scalar(text("SELECT pg_try_advisory_lock(:key)"), {"key": key})
+        if not acquired:
+            return "pending"
+        try:
+            if not await collection_owner(db, source):
+                await db.commit()
+                return "paused"
+            return await collect_linkedin(db, source, now, _store_post, reason=reason, backfill=backfill)
+        finally:
+            await connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})

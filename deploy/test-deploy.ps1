@@ -75,6 +75,31 @@ try {
     Assert-Test (-not (Test-Path -LiteralPath $backup)) 'Cleanup must process multiple paths in the same request.'
     Assert-Test (Test-Path -LiteralPath (Join-Path $shared 'keep.txt')) 'Cleanup must preserve junction targets.'
     Assert-Test (-not (Test-Path -LiteralPath (Join-Path $queue 'request.json'))) 'Successful cleanup must drain its queue.'
+    # A port collision must fail closed, never kill a process by generic name/port.
+    $fn = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Stop-News' }, $true)
+    . ([scriptblock]::Create($fn.Extent.Text))
+    $tasks = @('NewsIntelligenceAPI', 'NewsIntelligenceWeb')
+    $stoppedTasks = [Collections.Generic.List[string]]::new()
+    $script:forcedProcessStops = 0
+    function Stop-ScheduledTask { param($TaskName) $stoppedTasks.Add($TaskName) }
+    function Start-Sleep { }
+    function Get-NetTCPConnection { param($LocalPort) if ($LocalPort -eq 3101) { [pscustomobject]@{OwningProcess=123456} } }
+    function Get-CimInstance { [pscustomobject]@{CommandLine='node_modules\next\dist\bin\next start --port 3101'} }
+    function Stop-Process { $script:forcedProcessStops++ }
+    $blocked = $false
+    try { Stop-News } catch { $blocked = $true }
+    Assert-Test $blocked 'Occupied ports must require owner review.'
+    Assert-Test ($script:forcedProcessStops -eq 0) 'Release must not force-stop a process by port or command pattern.'
+    Assert-Test (($stoppedTasks -join ',') -eq 'NewsIntelligenceAPI,NewsIntelligenceWeb') 'Only News tasks may be stopped.'
+    $fn = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Start-News' }, $true)
+    . ([scriptblock]::Create($fn.Extent.Text))
+    function Assert-NewsPausedConfiguration { }
+    function Get-NewsInheritedCollectionSettings { @{} }
+    $script:taskStarts = 0
+    function Start-ScheduledTask { $script:taskStarts++ }
+    $blocked = $false
+    try { Start-News } catch { $blocked = $true }
+    Assert-Test ($blocked -and $script:taskStarts -eq 0) 'Occupied ports must prevent every restart path from starting another instance.'
     Write-Output 'PASS: dependency invalidation, partial/full rollback, cleanup boundaries, junction safety, worker lock.'
 } finally {
     # Explicitly verified test directory within deploy; remove links without traversal.

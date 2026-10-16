@@ -16,23 +16,14 @@ import { StrategicBriefPanel } from "./strategic-brief"
 import { RepostWatchPanel } from "./repost-watch-panel"
 import { filters } from "./news-filters"
 import { intelligenceFeedService, type ReadState } from "../data/news.service"
+import { eligibleLinkedInSources, selectLinkedInSources, sourceFilterKey, feedScopes, type LinkedInMonitoringSource } from "../linkedin-monitoring"
 import type { DailyBrief, IntelligenceView, NewsEntry, NewsFilter, NewsSource, StrategicBrief } from "../types"
 
 const DEMO_READ_PREFIX = "news-intelligence-demo-read:"
 const DEMO_SAVED_PREFIX = "news-intelligence-demo-saved:"
-const companyPages = [{ key: "primex", name: "PrimEx", path: "/company/primexeu", url: "https://www.linkedin.com/company/primexeu/" }, { key: "mendex", name: "Mendex", path: "/company/mendex-ai", url: "https://www.linkedin.com/company/mendex-ai/" }, { key: "ganimete", name: "GA", path: "/in/ganimete-arifaj-canolli-27641927a", url: "https://www.linkedin.com/in/ganimete-arifaj-canolli-27641927a/" }] as const
 const opportunityCategories = new Set(["GRANT", "TENDER", "BUSINESS", "PARTNERSHIP"])
 type FeedMode = ReadState | "dueSoon" | "saved"
 type SourceCheckStatus = { state: "idle" | "running" | "finished"; total: number; processed: number; failed: number; started: number; pending: number }
-
-function companyForSource(source: NewsSource) {
-  if (source.type !== "LINKEDIN") return undefined
-  try {
-    const url = new URL(source.url)
-    if (!["linkedin.com", "www.linkedin.com"].includes(url.hostname)) return undefined
-    return companyPages.find((company) => url.pathname.replace(/\/+$/, "").toLowerCase() === company.path)
-  } catch { return undefined }
-}
 
 function matchFilter(item: NewsEntry, filter: NewsFilter) {
   const { category, relevanceScore, tags } = item.analysis
@@ -90,12 +81,13 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
   const [aiConfigured, setAiConfigured] = React.useState(false)
   const primexView = view === "primex-linkedin"
   const activityView = primexView || view === "repost-watch"
-  const [companySources, setCompanySources] = React.useState<NewsSource[]>([])
-  const companyFilter = searchParams.get("company") === "primex" ? "primex" : searchParams.get("company") === "mendex" ? "mendex" : searchParams.get("company") === "ganimete" ? "ganimete" : "all"
-  const selectedSources = companySources.filter((source) => companyFilter === "all" || companyForSource(source)?.key === companyFilter)
-  const companyLabel = companyFilter === "primex" ? "PrimEx" : companyFilter === "mendex" ? "Mendex" : companyFilter === "ganimete" ? "GA" : "PrimEx, Mendex & GA"
+  const [companySources, setCompanySources] = React.useState<LinkedInMonitoringSource[]>([])
+  const companyFilter = searchParams.get("company") || "all"
+  const selectedSources = selectLinkedInSources(companySources, companyFilter)
+  const companyLabel = companyFilter === "all" ? "LinkedIn accounts" : selectedSources[0]?.name || "Selected account"
+  const [collectionEnabled, setCollectionEnabled] = React.useState<boolean | null>(null)
   const [selectedActivityKind, setActivityKind] = React.useState<"ALL" | "POST" | "REPOST">("ALL")
-  const activityKind = companyFilter === "primex" || companyFilter === "mendex" ? "POST" : selectedActivityKind
+  const activityKind = selectedActivityKind
   const category = searchParams.get("category")
   const highPriorityOnly = !primexView && searchParams.get("priority") === "high"
   const filter: NewsFilter = primexView ? "All" : filters.find((value) => value === category) || (view === "for-you" ? "For You" : "All")
@@ -115,24 +107,21 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
     const request = ++feedRequest.current
     if (!quiet) { setLoading(true); setError(false) }
     try {
-      let scopedSources: NewsSource[] | undefined
+      let scopedSources: LinkedInMonitoringSource[] | undefined
       if (primexView) {
-        const response = await apiFetch("/intelligence/sources")
+        const response = await apiFetch("/intelligence/linkedin-sources")
         if (!response.ok) throw new Error("Could not load LinkedIn sources.")
-        const sources = await response.json() as NewsSource[]
-        const monitored = sources.filter((entry) => Boolean(companyForSource(entry)))
+        const sources = await response.json() as LinkedInMonitoringSource[]
+        const monitored = eligibleLinkedInSources(sources)
         if (request !== feedRequest.current) return
         setCompanySources(monitored)
-        scopedSources = monitored.filter((entry) => companyFilter === "all" || companyForSource(entry)?.key === companyFilter)
+        scopedSources = selectLinkedInSources(monitored, companyFilter)
+        setCollectionEnabled(sources.some(source => source.type === "LINKEDIN" && source.collection_enabled === true))
         if (!scopedSources.length) { setItems([]); setIsDemo(false); setError(false); return }
       }
       const readState = view === "saved" || feedMode === "dueSoon" || feedMode === "saved" ? "all" : feedMode
-      const feeds = scopedSources ? await Promise.all(scopedSources
-        .filter((source) => activityKind !== "REPOST" || companyForSource(source)?.key === "ganimete")
-        .map((source) => intelligenceFeedService.getFeed(apiFetch, readState, false, feedMode === "saved", undefined, {
-          sourceId: source.id,
-          activityKind: companyForSource(source)?.key === "ganimete" ? activityKind === "ALL" ? undefined : activityKind : "POST",
-        }))) : null
+      const feeds = scopedSources ? await Promise.all(feedScopes(scopedSources, activityKind)
+        .map(scope => intelligenceFeedService.getFeed(apiFetch, readState, false, feedMode === "saved", undefined, scope))) : null
       if (feeds && !feeds.length) { setItems([]); setIsDemo(false); setError(false); return }
       const feed = feeds ? { ...feeds[0], items: feeds.flatMap((entry) => entry.items) } : await intelligenceFeedService.getFeed(apiFetch, readState, feedMode === "dueSoon" && view !== "saved", view === "saved" || feedMode === "saved", view === "repost-watch" ? repostGroup : undefined)
       if (request !== feedRequest.current) return
@@ -201,11 +190,16 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
   }, [apiFetch, checkStatus?.state, loadFeed])
 
   const checkForUpdates = async () => {
+    if (activityView) {
+      await loadFeed(true)
+      toast.info("Feed refreshed. LinkedIn sources are checked automatically each day when collection is available.")
+      return
+    }
     if (startingCheck || checkStatus?.state === "running") return
     setStartingCheck(true)
     try {
       if (primexView && !selectedSources.length) throw new Error("Add the selected LinkedIn company page in Sources first.")
-      const response = await apiFetch(`/intelligence/sources/check-all${primexView ? `?${selectedSources.map((source) => `source_ids=${encodeURIComponent(source.id)}`).join("&")}` : view === "repost-watch" ? `?repost_group=${repostGroup}` : ""}`, { method: "POST" })
+      const response = await apiFetch("/intelligence/sources/check-all", { method: "POST" })
       const payload = await response.json().catch(() => null)
       if (!response.ok) throw new Error(typeof payload?.detail === "string" ? payload.detail : "Could not start source checks.")
       setCheckStatus(payload as SourceCheckStatus)
@@ -313,7 +307,7 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
       }
       if (view === "opportunities" && !opportunityCategories.has(item.analysis.category)) return false
       if (view === "repost-watch" && !item.repostGroups?.includes(repostGroup)) return false
-      if (primexView && !companySources.some((source) => source.id === item.sourceId && (companyFilter === "all" || companyForSource(source)?.key === companyFilter))) return false
+      if (primexView && !selectLinkedInSources(companySources, companyFilter).some(source => source.id === item.sourceId)) return false
       if (primexView && activityKind !== "ALL" && (activityKind === "REPOST" ? item.linkedin?.kind !== "REPOST" : item.linkedin?.kind === "REPOST")) return false
       if (feedMode === "dueSoon" && !hasNearApplicationDeadline(item, today)) return false
       if (highPriorityOnly && item.priority !== "HIGH") return false
@@ -339,7 +333,7 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
   return <div className="min-h-screen px-4 pb-16 pt-7 text-[#24342a] sm:px-7 lg:px-10 lg:pt-10">
     <div className="mx-auto max-w-[1370px]">
       <div className="flex flex-wrap items-start justify-between gap-5">
-        <div><div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-[#83958a]"><span className="size-1.5 rounded-full bg-[#7ca889]" /> News portal <span className="font-normal normal-case tracking-normal text-[#a0aaa2]">/ {isDemo ? "Sample data" : "Live sources"}</span></div><h1 className="mt-2 text-[32px] font-semibold tracking-[-0.045em] sm:text-[38px]">{pageHeading}</h1><p className="mt-1 text-sm text-[#758179]">{primexView ? "Company posts from PrimEx and Mendex, plus posts and reposts from GA." : view === "repost-watch" ? "Follow your curated accounts and review new posts for reposting." : view === "for-you" ? "Selected updates and opportunities relevant to your company." : view === "overview" ? "All updates and opportunities, newest first." : "Updates and opportunities, all in one place."}</p></div>
+        <div><div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-[#83958a]"><span className="size-1.5 rounded-full bg-[#7ca889]" /> News portal <span className="font-normal normal-case tracking-normal text-[#a0aaa2]">/ {isDemo ? "Sample data" : "Live sources"}</span></div><h1 className="mt-2 text-[32px] font-semibold tracking-[-0.045em] sm:text-[38px]">{pageHeading}</h1><p className="mt-1 text-sm text-[#758179]">{primexView ? "Original posts and supported reposts from your LinkedIn sources." : view === "repost-watch" ? "Follow your curated accounts and review new posts for reposting." : view === "for-you" ? "Selected updates and opportunities relevant to your company." : view === "overview" ? "All updates and opportunities, newest first." : "Updates and opportunities, all in one place."}</p></div>
         {!isDemo ? <div className="flex flex-wrap gap-2"><Button size="sm" disabled={loading || (primexView && !selectedSources.some((source) => source.status === "ACTIVE")) || startingCheck || checkStatus?.state === "running"} className="bg-[#2d5b3d] text-white hover:bg-[#244b32]" onClick={() => void checkForUpdates()}><RefreshCw className={cn("size-4", (startingCheck || checkStatus?.state === "running") && "animate-spin")} /> {checkStatus?.state === "running" ? `Checking ${checkStatus.processed}/${checkStatus.total}…` : startingCheck ? "Starting…" : "Check for updates"}</Button><Button variant="outline" size="sm" disabled={loading} className="border-[#e2e8e1] bg-white text-[#536359]" onClick={() => void loadFeed()}><RefreshCw className="size-4" /> Refresh feed</Button></div> : null}
       </div>
 
@@ -349,16 +343,15 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
       {view === "repost-watch" ? <RepostWatchPanel group={repostGroup} apiFetch={apiFetch} /> : null}
       {primexView ? <div className="mt-7 rounded-xl border border-[#e5eae4] bg-white p-5">
         <div className="flex flex-wrap items-center justify-between gap-3"><h2 className="font-semibold text-[#214a31]">LinkedIn activity</h2><Link href="/intelligence/sources" className="text-xs text-[#64746a] hover:underline">Manage sources</Link></div>
-        <p className="mt-2 text-sm text-[#758179]">Posts from PrimEx and Mendex, plus posts and reposts from GA, newest first. This page refreshes every 30 seconds.</p>
-        <div role="group" aria-label="Company filter" className="mt-4 inline-flex flex-wrap gap-1 rounded-lg bg-[#edf1ec] p-1 text-sm">{(["all", "primex", "mendex", "ganimete"] as const).map((company) => <button key={company} type="button" aria-pressed={companyFilter === company} onClick={() => { const params = new URLSearchParams(searchParams.toString()); if (company === "all") params.delete("company"); else params.set("company", company); router.push(`/intelligence/primex-linkedin${params.size ? `?${params}` : ""}`) }} className={cn("rounded-md px-4 py-1.5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#5e806c]", companyFilter === company ? "bg-white font-medium text-[#214a31] shadow-sm" : "text-[#64746a]")}>{company === "all" ? "All accounts" : company === "primex" ? "PrimEx" : company === "mendex" ? "Mendex" : "GA"}</button>)}</div>
-        <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{companyPages.filter((company) => companyFilter === "all" || company.key === companyFilter).map((company) => {
-          const source = companySources.find((entry) => companyForSource(entry)?.key === company.key)
-          return <div key={company.key} className="rounded-lg border border-[#e5eae4] p-3"><a href={company.url} target="_blank" rel="noopener noreferrer" className="text-sm font-semibold text-[#214a31] hover:underline">{company.name} on LinkedIn ↗</a>
-            {source ? <p className="mt-2 text-xs text-[#68776b]">{source.status === "PAUSED" ? "Monitoring paused" : source.pending_snapshot_id ? "Checking for new activity…" : `Monitoring every ${source.fetch_interval_minutes} minutes`}{source.last_checked_at ? ` · Last checked ${new Date(source.last_checked_at).toLocaleString("en-GB")}` : " · No completed check yet"}</p> : !loading && !error ? <p className="mt-2 text-xs text-[#68776b]">Add {company.name} in Sources to monitor this page.</p> : null}
-            {source?.last_error ? <p role="alert" className="mt-2 text-xs text-[#9a6e61]">Last check failed: {source.last_error}</p> : null}
-          </div>
-        })}</div>
-        {companyFilter === "all" || companyFilter === "ganimete" ? <div role="group" aria-label="LinkedIn activity type" className="mt-4 inline-flex gap-1 rounded-lg bg-[#edf1ec] p-1 text-sm">{(["ALL", "POST", "REPOST"] as const).map((kind) => <button key={kind} type="button" aria-pressed={activityKind === kind} onClick={() => setActivityKind(kind)} className={cn("rounded-md px-4 py-1.5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#5e806c]", activityKind === kind ? "bg-white font-medium text-[#214a31] shadow-sm" : "text-[#64746a]")}>{kind === "ALL" ? "All activity" : kind === "POST" ? "Posts" : "GA reposts"}</button>)}</div> : null}
+        <p className="mt-2 text-sm text-[#758179]">All eligible LinkedIn sources, newest first. Refreshing reads stored posts; it does not start collection.</p>
+        <p role="status" className="mt-2 text-sm text-[#68776b]">{collectionEnabled === true ? "Collection is enabled subject to source eligibility, billing verification and available budget." : "Collection is paused or not enabled. Existing posts remain available."}</p>
+        <div role="group" aria-label="LinkedIn source filter" className="mt-4 flex flex-wrap gap-1 text-sm">{[{key: "all", name: "All accounts"}, ...companySources.map(source => ({key: sourceFilterKey(source)!, name: source.name}))].filter((entry, index, all) => all.findIndex(other => other.key === entry.key) === index).map(entry => <button key={entry.key} type="button" aria-pressed={companyFilter === entry.key} onClick={() => { const params = new URLSearchParams(searchParams.toString()); if (entry.key === "all") params.delete("company"); else params.set("company", entry.key); router.push(`/intelligence/primex-linkedin${params.size ? `?${params}` : ""}`) }} className={cn("rounded-md px-4 py-1.5", companyFilter === entry.key ? "bg-[#eaf1e9] font-medium text-[#214a31]" : "text-[#64746a]")}>{entry.name}</button>)}</div>
+        <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{selectedSources.map(source => <div key={source.id} className="rounded-lg border border-[#e5eae4] p-3">
+          <a href={source.url} target="_blank" rel="noopener noreferrer" className="text-sm font-semibold text-[#214a31] hover:underline">{source.name} on LinkedIn</a>
+          <p className="mt-2 text-xs text-[#68776b]">{source.status === "PAUSED" ? "Monitoring paused" : source.pending_snapshot_id ? "Collection pending" : "Daily eligibility, subject to budget"}{source.last_checked_at ? ` · Last checked ${new Date(source.last_checked_at).toLocaleString("en-GB")}` : " · No completed check yet"}</p>
+          {source.last_error ? <p role="alert" className="mt-2 text-xs text-[#9a6e61]">Last collection status: {source.last_error}</p> : null}
+        </div>)}</div>
+        <div role="group" aria-label="LinkedIn activity type" className="mt-4 inline-flex gap-1 rounded-lg bg-[#edf1ec] p-1 text-sm">{(["ALL", "POST", "REPOST"] as const).map(kind => <button key={kind} type="button" aria-pressed={activityKind === kind} onClick={() => setActivityKind(kind)} className={cn("rounded-md px-4 py-1.5", activityKind === kind ? "bg-white font-medium text-[#214a31] shadow-sm" : "text-[#64746a]")}>{kind === "ALL" ? "All activity" : kind === "POST" ? "Posts" : "Reposts"}</button>)}</div>
       </div> : null}
       {showBrief && brief && !loading ? <div className="mt-8"><AIBrief brief={brief} items={items} /></div> : null}
       {showBrief && !loading && !isDemo && aiConfigured && items.length ? <div className="mt-8"><StrategicBriefPanel brief={strategicBrief} generating={generatingBrief} onGenerate={() => void generateBrief()} /></div> : null}

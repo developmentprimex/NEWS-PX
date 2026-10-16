@@ -1,21 +1,35 @@
-name: Verify and Deploy News
+name: Verify News (no deployment)
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
+  pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: news-production
+  group: news-ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      credit-test-db:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: credit_test
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 55439:5432
+        options: >-
+          --health-cmd "pg_isready -U credit_test -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,6 +39,16 @@ jobs:
           node-version: '24'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install backend test dependencies
+        run: pip install -r backend/requirements-dev.txt
+      - name: Test protected collection with mocked provider and isolated PostgreSQL
+        run: python -m pytest tests -q
+        working-directory: backend
+        env:
+          NEWS_TEST_USE_POSTGRES_SERVICE: '1'
       - name: Check Windows deployment safeguards
         shell: pwsh
         run: |
@@ -43,8 +67,15 @@ jobs:
         working-directory: frontend
         env:
           NEWS_API_INTERNAL_URL: http://127.0.0.1:8001
+      - name: Check frontend source selection and TypeScript
+        working-directory: frontend
+        run: |
+          node --test test/linkedin-monitoring.test.cjs
+          npx tsc --noEmit
       - name: Check backend Python syntax
         run: python -m compileall -q backend
+      - name: Verify development push guard
+        run: node --test deploy/check-push.test.cjs
 
   verify-windows-deployment:
     runs-on: windows-latest
@@ -55,4 +86,6 @@ jobs:
           persist-credentials: false
       - name: Test deployment rollback and cleanup with Windows PowerShell
         shell: powershell
-        run: ./deploy/test-deploy.ps1
+        run: |
+          ./deploy/test-deploy.ps1
+          ./deploy/test-release-control.ps1

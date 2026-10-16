@@ -102,6 +102,7 @@ export interface NewsSource {
   pending_snapshot_id: string | null
   last_error: string | null
   collection_supported: boolean
+  collection_enabled?: boolean
   email_enabled: boolean
   repost_groups: RepostGroup[]
   repost_guidance: Partial<Record<RepostGroup, string>>

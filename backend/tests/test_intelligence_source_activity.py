@@ -31,37 +31,6 @@ def test_company_feed_filters_source_and_activity_before_limit(activity_kind):
         assert "REPOST" in compiled.params.values() if activity_kind == "REPOST" else ["POST", "ARTICLE"] in compiled.params.values()
 
 
-def test_company_refresh_schedules_only_the_selected_source(monkeypatch):
-    source_id = uuid4()
-    statements = []
-    checked = []
-
-    class FakeDB:
-        async def execute(self, query):
-            statements.append(query)
-            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [
-                SimpleNamespace(id=source_id, type="LINKEDIN")
-            ]))
-
-    async def fake_checks(ids):
-        checked.extend(ids)
-
-    monkeypatch.setattr(news_router, "_check_all_task", None)
-    monkeypatch.setattr(news_router, "_check_all_sources", fake_checks)
-    monkeypatch.setattr(news_router, "linkedin_configured", lambda: True)
-
-    async def run():
-        result = await news_router.check_all_sources_now(db=FakeDB(), _=None, source_id=source_id)
-        await news_router._check_all_task
-        assert result["total"] == 1
-
-    asyncio.run(run())
-    compiled = statements[0].compile(dialect=postgresql.dialect())
-    assert "intelligence_sources.id =" in str(compiled)
-    assert source_id in compiled.params.values()
-    assert checked == [source_id]
-
-
 def test_combined_company_feed_applies_both_sources_before_limit():
     statements = []
     ids = [uuid4(), uuid4()]
@@ -78,32 +47,20 @@ def test_combined_company_feed_applies_both_sources_before_limit():
     assert str(compiled).index("WHERE") < str(compiled).index("LIMIT")
 
 
-def test_combined_company_refresh_schedules_only_requested_sources(monkeypatch):
-    ids = [uuid4(), uuid4()]
-    statements = []
-    checked = []
 
-    class FakeDB:
-        async def execute(self, query):
-            statements.append(query)
-            return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [
-                SimpleNamespace(id=source_id, type="LINKEDIN") for source_id in ids
-            ]))
-
-    async def fake_checks(source_ids):
-        checked.extend(source_ids)
-
+def test_linkedin_refresh_endpoints_do_not_schedule_scraping(monkeypatch):
+    from fastapi import HTTPException
+    from unittest.mock import AsyncMock
+    source = SimpleNamespace(id=uuid4(), type="LINKEDIN", status="ACTIVE")
+    db = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [source]))))
+    checker = AsyncMock()
+    monkeypatch.setattr(news_router, "check_source", checker)
     monkeypatch.setattr(news_router, "_check_all_task", None)
-    monkeypatch.setattr(news_router, "_check_all_sources", fake_checks)
-    monkeypatch.setattr(news_router, "linkedin_configured", lambda: True)
-
-    async def run():
-        result = await news_router.check_all_sources_now(db=FakeDB(), _=None, source_ids=ids)
-        await news_router._check_all_task
-        assert result["total"] == 2
-
-    asyncio.run(run())
-    compiled = statements[0].compile(dialect=postgresql.dialect())
-    assert ids in compiled.params.values()
-    assert "intelligence_sources.id IN" in str(compiled)
-    assert checked == ids
+    monkeypatch.setattr(news_router, "_get_source", AsyncMock(return_value=source))
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(news_router.check_all_sources_now(db=db, _=None))
+    assert error.value.status_code == 409
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(news_router.check_source_now(source.id, db=db, _=None))
+    assert error.value.status_code == 409
+    checker.assert_not_awaited()
