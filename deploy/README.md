@@ -1,60 +1,25 @@
-# Windows Server deployment
+# Windows release controls
 
-The deployment on `192.168.10.8` lives at `E:\websites\news-intelligence`.
-It uses a dedicated PostgreSQL 18 database and role named `news_intel`, a
-Python virtual environment in `.venv`, and a Next.js production build in
-`frontend\.next`. Private settings are in the server's `.env` file.
+Production deployment remains **NO-GO** until the external evidence in [the consolidated checklist](../docs/release-readiness.md) is accepted. No production modification or provider activation is authorized by these instructions.
 
-Two scheduled tasks start the application at boot:
+`deploy.yml` runs CI on development pushes and pull requests. `release-production.yml` requires a deliberate manual dispatch and a protected production environment; it records a tested SHA and does not deploy. Repository administrators must configure required reviewers, prevent self-approval and restrict the release branch. YAML alone does not configure these protections.
 
-- `NewsIntelligenceAPI` runs `start-api.cmd` on `127.0.0.1:8001`.
-- `NewsIntelligenceWeb` runs `start-web.cmd` on `127.0.0.1:3101`.
+The installed legacy sync follows successful verification on `main`. Development branch pushes do not match that branch filter. Do not push or merge `main`, dispatch a release, or re-enable legacy deployment until its approved maintenance transition. The candidate `sync.ps1` is inert. An application directory swap does not replace root-level sync launchers; the administrator must keep the existing task held or separately install and hash-verify the reviewed inert launcher.
 
-Both tasks run as SYSTEM with no execution time limit (`PT0S`). On failure,
-Task Scheduler retries every minute, up to 10 times. This replaces the default
-72-hour limit that could stop the long-running API and web processes.
+The deployment entrypoint requires `-ReleasePermit` referencing a private, ACL-reviewed JSON permit bound to the clean checkout's exact SHA. It must contain owner approval, an expiry within 24 hours and evidence-backed Boolean gates for runtime inventory, fresh backup rehearsal, held restart paths, isolated consumers, paused rollback and protected workflow approval. Consumption is durable and one-use. Never commit a permit or create one merely to satisfy a check.
 
-Cloudflare Tunnel publishes `news.primexeu.com` to `http://127.0.0.1:3101`.
-The IIS site `News Intelligence` uses the `NewsIntelligencePool` application
-pool and the same host binding on port 80 as an origin fallback. Its root is
-`iis-proxy`, which proxies requests to the Next.js service. The other IIS
-sites and PostgreSQL databases are separate.
+Before mutation and before candidate/rollback startup, all collection, LinkedIn-fetch, canary and snapshot-import flags must explicitly be false. The application environment must contain no usable provider credential. Ambiguous dotenv syntax, exported or multiline overrides and duplicate collection settings fail closed. Current-console environment checks do not prove another task principal or launcher has the same settings; administrator evidence is required.
 
-Pushing to `main` runs `.github/workflows/deploy.yml` on GitHub Actions to
-verify the frontend build and backend syntax. The server task
-`NewsIntelligenceSync` checks the latest workflow result every five minutes.
-When the successful run matches the current `main` commit, `sync.ps1` fetches
-that commit and runs `deploy/deploy.ps1`. A failed workflow never deploys.
+Only the News API and web tasks are managed. Occupied ports or surviving child processes require administrator ownership review; the script does not force-kill processes by port/name or start another instance. Unrelated applications, runners and workers must remain untouched. No execution-policy bypass is requested.
 
-`deploy/deploy.ps1` builds the checkout in `_deploy\stage`, replaces only this
-application's `backend` and `frontend` directories (and `.venv` only when
-Python requirements or its runtime change), then checks the
-API and web endpoints. It restores the previous directories if the health
-check fails. The two latest backups stay in `_deploy\backups`. The production
-`.env`, PostgreSQL database, `data` directory, IIS configuration, and
-Cloudflare route are outside the replacement set.
+The deployment stages backend/frontend and changed dependencies separately, then swaps only code/environment directories. It does not restore, migrate backwards or reset the production database, account ledger or stored posts. A partial switch restores only directories actually backed up. Keep an independently reviewed paused rollback artifact outside automatic cleanup.
 
-Cloudflare Tunnel manages the public DNS record and HTTPS endpoint.
+Local checks (mocked process/task calls and throwaway directories only):
 
-Deployments reuse immutable frontend dependencies in `_deploy\node-cache`,
-keyed by `package.json`, `package-lock.json`, project `.npmrc`, Node/npm
-versions and architecture. Each release links to its cache entry; it never
-runs `npm ci` against the live frontend. The first optimized deployment imports
-the existing dependencies with a parallel copy. Changed dependencies create
-a new cache entry. Cache entries are retained for the releases that use them.
+```powershell
+powershell.exe -NoProfile -NonInteractive -File deploy/test-deploy.ps1
+powershell.exe -NoProfile -NonInteractive -File deploy/test-release-control.ps1
+node --test deploy/check-push.test.cjs
+```
 
-Unchanged Python requirements/runtime reuse the working `.venv` and Chromium;
-`pip check` verifies the environment. A changed environment is built separately
-and participates in rollback. Health checks complete before the deployed SHA
-is written. Partial directory switches restore only directories actually backed up.
-
-`cleanup.ps1` drains `_deploy\cleanup-queue` in a hidden background process,
-independent of deployment success. It keeps the two latest backups and removes
-only explicitly queued release directories. Junctions are unlinked without
-following them into shared dependency caches. A file lock prevents overlapping
-cleanup workers; the sync task retries deferred requests on later checks.
-Failures are recorded in `_deploy\cleanup.log` and do not roll back a healthy site.
-
-Run `powershell -NoProfile -ExecutionPolicy Bypass -File deploy/test-deploy.ps1`
-to check dependency invalidation, partial/full rollback, cleanup path boundaries,
-junction preservation and the cleanup worker lock.
+Private server bindings, diagnostic exports, backup locations, credentials and operational runbooks are retained outside the release commit. A reviewed administrator runbook supplies the actual approved server-console command after all gates pass.

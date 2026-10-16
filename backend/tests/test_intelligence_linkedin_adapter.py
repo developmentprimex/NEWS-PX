@@ -10,6 +10,43 @@ from app.intelligence.linkedin_adapter import BrightDataLinkedInAdapter, LinkedI
 from app.intelligence.schemas import NewsSourceCreate
 
 
+def test_profile_request_explicitly_allows_non_authored_activity(monkeypatch):
+    import asyncio
+    import json
+    requests = []
+    async def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={'snapshot_id': 'sd_reviewed123'})
+    adapter = BrightDataLinkedInAdapter('offline-test-token', 'gd_lyy3tktm25m4avu764')
+    monkeypatch.setattr(adapter, '_client', lambda: httpx.AsyncClient(base_url='https://api.brightdata.com/datasets/v3/', transport=httpx.MockTransport(respond)))
+    async def run():
+        for path in ('in', 'company'):
+            await adapter.trigger(SimpleNamespace(url=f'https://www.linkedin.com/{path}/example/'), start_date='2026-10-14', end_date='2026-10-15', limit=6)
+    asyncio.run(run())
+    assert json.loads(requests[0].content)[0]['only_authored_posts'] is False
+    assert 'only_authored_posts' not in json.loads(requests[1].content)[0]
+    assert all(request.url.params['limit_per_input'] == '6' for request in requests)
+
+
+def test_company_repost_cannot_be_attributed_to_the_wrong_reposter():
+    source = SimpleNamespace(name='Example company', url='https://www.linkedin.com/company/example/')
+    row = {'id':'500', 'url':'https://www.linkedin.com/posts/original_activity-500-x',
+           'post_text':'Original content', 'company_name':'Original company',
+           'reposted_by':'https://www.linkedin.com/company/another/'}
+    with pytest.raises(LinkedInCollectionError):
+        parse_posts([row], source)
+
+
+def test_company_plain_repost_keeps_original_author_and_reposter():
+    source = SimpleNamespace(name='Example company', url='https://www.linkedin.com/company/example/')
+    row = {'id':'501', 'url':'https://www.linkedin.com/posts/original_activity-501-x',
+           'post_text':'Original content', 'company_name':'Original company',
+           'reposted_by':{'url':'https://linkedin.com/company/example/?trk=test'}}
+    activity = parse_posts([row], source)[0].linkedin_data
+    assert activity['kind'] == 'REPOST' and activity['authorName'] == 'Example company'
+    assert activity['originalAuthor'] == 'Original company'
+
+
 def test_posts_keep_only_direct_links_and_parse_publication_date():
     source = SimpleNamespace(name="Example")
     posts = parse_posts([
@@ -126,7 +163,7 @@ def test_provider_error_keeps_actionable_message_without_echoing_token():
 
 def test_first_check_covers_recent_posts_then_uses_incremental_window():
     now = datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc)
-    assert collection_start_date(None, now) == "2026-07-26"
+    assert collection_start_date(None, now) == "2026-09-23"
     assert collection_start_date(datetime(2026, 9, 20, tzinfo=timezone.utc), now) == "2026-09-19"
 
 
@@ -135,7 +172,7 @@ def test_inactive_provider_account_has_actionable_error(content_type):
     adapter = BrightDataLinkedInAdapter("private-token", "test-dataset")
     response = httpx.Response(400, text="Customer is not active", headers={"content-type": content_type},
                               request=httpx.Request("POST", "https://api.brightdata.com/datasets/v3/trigger"))
-    with pytest.raises(LinkedInCollectionError, match=r"HTTP 400.*account is inactive.*Activate"):
+    with pytest.raises(LinkedInCollectionError, match=r"HTTP 400.*account is inactive.*approval"):
         adapter._json(response)
 
 
@@ -196,3 +233,18 @@ def test_activity_rejects_untrusted_comment_links_and_strips_html():
     }], SimpleNamespace(name="Company"))[0].linkedin_data
     assert activity["comments"][0]["url"] is None
     assert activity["comments"][0]["text"] == "Useful"
+
+
+def test_server_side_date_filters_and_limit_are_sent_for_company():
+    import json
+    requests = []
+    adapter = BrightDataLinkedInAdapter("test-token", "test-dataset")
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={"snapshot_id": "sd_company123"})
+    adapter._client = lambda: httpx.AsyncClient(base_url="https://api.brightdata.com/datasets/v3/", transport=httpx.MockTransport(respond))
+    source = SimpleNamespace(url="https://www.linkedin.com/company/example/")
+    asyncio.run(adapter.trigger(source, start_date="2026-10-13", end_date="2026-10-14", limit=6))
+    assert requests[0].url.params["limit_per_input"] == "6"
+    assert requests[0].url.params["discover_by"] == "company_url"
+    assert json.loads(requests[0].content) == [{"url": source.url, "start_date": "2026-10-13", "end_date": "2026-10-14"}]

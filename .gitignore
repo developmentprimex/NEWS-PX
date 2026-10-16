@@ -1,7 +1,24 @@
 **/.env
+**/.env.*
+!**/.env.example
 **/.next/
 **/node_modules/
 **/__pycache__/
 **/.pytest_cache/
 **/.venv/
 **/*.pyc
+**/*.tsbuildinfo
+tmp/credit-pg-*/
+
+# Private investigations, exports and local preparation tools never ship.
+/audit/
+/tmp/
+/docs/brightdata-*.md
+/docs/linkedin-provider-fallback-analysis.md
+**/private/
+*.pem
+*.key
+*.pfx
+*.p12
+*.dump
+*.backup

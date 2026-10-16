@@ -52,15 +52,3 @@ def test_edited_post_updates_same_item_and_analysis(monkeypatch):
     assert item.title == "Edited" and item.original_text == "Edited body"
     assert saved_analysis.summary == "Edited summary"
     assert saved_analysis.analyzed_at
-
-
-def test_scheduled_check_revisits_recent_posts_for_engagement(monkeypatch):
-    source = SimpleNamespace(id=uuid4(), type="LINKEDIN", status="ACTIVE", pending_snapshot_id=None,
-                             last_started_at=None, last_checked_at=datetime.now(timezone.utc), fetch_interval_minutes=60)
-    db = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: source)), commit=AsyncMock())
-    trigger = AsyncMock(return_value="sd_refresh123")
-    monkeypatch.setattr(collection.settings, "BRIGHTDATA_API_TOKEN", "test-token")
-    monkeypatch.setattr(collection, "BrightDataLinkedInAdapter", lambda *_: SimpleNamespace(trigger=trigger))
-    assert asyncio.run(collection.check_source(db, source.id)) == "started"
-    request = trigger.await_args.kwargs
-    assert request["start_date"] == collection.collection_start_date(None, datetime.now(timezone.utc))

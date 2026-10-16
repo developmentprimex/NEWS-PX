@@ -11,6 +11,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.intelligence.models import NewsSource
+from app.intelligence.linkedin_identity import identity_or_none
 from app.intelligence.services import CollectedNewsItem
 
 API_BASE = "https://api.brightdata.com/datasets/v3/"
@@ -18,7 +19,24 @@ SNAPSHOT_ID = re.compile(r"^(?:s|sd)_[A-Za-z0-9]+$")
 
 
 class LinkedInCollectionError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, pause_account: bool = False):
+        super().__init__(message)
+        self.pause_account = pause_account
+
+
+def discovery_request(dataset_id, source, start_date, end_date, limit=6):
+    """One shared specification for normal collection and the guarded canary."""
+    if not 1 <= limit <= 130:
+        raise LinkedInCollectionError("Invalid record limit.")
+    company = urlparse(source.url).path.startswith("/company/")
+    body = {"url": source.url, "start_date": start_date, "end_date": end_date}
+    if not company:
+        # Confirmed replacement-account Boolean input. This removes an author-only
+        # restriction; actual repost discovery/completeness still needs a live test.
+        body["only_authored_posts"] = False
+    return {"dataset_id": dataset_id, "type": "discover_new",
+            "discover_by": "company_url" if company else "profile_url",
+            "limit_per_input": limit, "include_errors": "true", "notify": "false"}, [body]
 
 
 def _post_url(value: object) -> str | None:
@@ -54,6 +72,13 @@ def _profile_id(value: object) -> str | None:
 
 def _belongs_to_source(record: dict, source: NewsSource) -> bool:
     source_path = urlparse(getattr(source, "url", "")).path.strip("/").split("/")
+    if len(source_path) >= 2 and source_path[0] == "company" and _reposter(record):
+        reposter = _reposter(record)
+        if isinstance(reposter, dict):
+            reposter = reposter.get("url") or reposter.get("company_url") or reposter.get("user_url") or reposter.get("user_id")
+        if isinstance(reposter, str) and "://" in reposter:
+            return identity_or_none(reposter) == identity_or_none(source.url)
+        return isinstance(reposter, str) and reposter.casefold() == source_path[1].casefold()
     if len(source_path) < 2 or source_path[0] != "in":
         return True
     profile_id = source_path[1].casefold()
@@ -171,7 +196,7 @@ def parse_posts(records: object, source: NewsSource) -> list[CollectedNewsItem]:
         raise LinkedInCollectionError("The provider returned an unexpected snapshot format.")
     posts: list[CollectedNewsItem] = []
     for record in records:
-        if not isinstance(record, dict) or record.get("error"):
+        if not isinstance(record, dict) or record.get("error") or record.get("error_code"):
             continue
         url = _post_url(record.get("url") or record.get("post_url"))
         if not url or not _belongs_to_source(record, source):
@@ -192,7 +217,8 @@ def parse_posts(records: object, source: NewsSource) -> list[CollectedNewsItem]:
         title = record.get("title")
         if not isinstance(title, str) or not title.strip():
             title = body[:140].rstrip(" .") + ("…" if len(body) > 140 else "") if body else f"Post by {source.name}"
-        identifier = record.get("id") or record.get("post_id") or url
+        # Stable activity IDs deduplicate alternate LinkedIn URL forms as well.
+        identifier = linkedin_post_id(record, url)
         posts.append(CollectedNewsItem(
             external_id=str(identifier)[:500], url=url, title=title.strip()[:500],
             original_text=body[:20_000] or None,
@@ -202,6 +228,17 @@ def parse_posts(records: object, source: NewsSource) -> list[CollectedNewsItem]:
     if records and not posts:
         raise LinkedInCollectionError("Provider returned no usable direct post links for this source.")
     return posts
+
+
+def linkedin_post_id(record: dict, url: str) -> str:
+    for value in (record.get("id"), record.get("post_id"), url):
+        value = str(value or "")
+        if value.isdigit():
+            return value
+        match = re.search(r"(?:activity[:\-]|share:|ugcPost:)(\d+)", value)
+        if match:
+            return match.group(1)
+    return str(record.get("id") or record.get("post_id") or url)[:500]
 
 
 class BrightDataLinkedInAdapter:
@@ -230,20 +267,21 @@ class BrightDataLinkedInAdapter:
             except ValueError:
                 # Some provider failures (including inactive accounts) are plain text.
                 detail = _text(response.text.replace(self.token, "[redacted]"), 250) or ""
+            pause_account = response.status_code in {401, 402, 403} or any(
+                hint in detail.casefold() for hint in ("not active", "inactive", "balance", "credit", "payment"))
             if "customer is not active" in detail.casefold():
-                detail = "Bright Data account is inactive. Activate the account in Bright Data to resume LinkedIn checks."
+                detail = "Bright Data account is inactive. Verify billing and obtain approval before resuming LinkedIn checks."
             suffix = f" {detail}" if detail else ""
-            raise LinkedInCollectionError(f"Provider request failed (HTTP {response.status_code}).{suffix}") from exc
+            raise LinkedInCollectionError(f"Provider request failed (HTTP {response.status_code}).{suffix}", pause_account=pause_account) from exc
         except ValueError as exc:
             raise LinkedInCollectionError("Provider returned invalid JSON.") from exc
 
-    async def trigger(self, source: NewsSource, *, start_date: str, end_date: str) -> str:
-        discovery = "company_url" if urlparse(source.url).path.startswith("/company/") else "profile_url"
+    async def trigger(self, source: NewsSource, *, start_date: str, end_date: str, limit: int = 6) -> str:
+        query, body = discovery_request(self.dataset_id, source, start_date, end_date, limit)
         async with self._client() as client:
             response = await client.post(
                 "trigger",
-                params={"dataset_id": self.dataset_id, "type": "discover_new", "discover_by": discovery, "limit_per_input": 100},
-                json=[{"url": source.url, "start_date": start_date, "end_date": end_date}],
+                params=query, json=body,
             )
         payload = self._json(response)
         snapshot_id = payload.get("snapshot_id") if isinstance(payload, dict) else None
@@ -263,8 +301,14 @@ class BrightDataLinkedInAdapter:
         return state
 
     async def download(self, snapshot_id: str, source: NewsSource) -> list[CollectedNewsItem]:
+        return parse_posts(await self.download_records(snapshot_id), source)
+
+    async def download_records(self, snapshot_id: str) -> list[dict]:
         if not SNAPSHOT_ID.fullmatch(snapshot_id):
             raise LinkedInCollectionError("Invalid snapshot ID.")
         async with self._client() as client:
             response = await client.get(f"snapshot/{snapshot_id}", params={"format": "json"})
-        return parse_posts(self._json(response), source)
+        records = self._json(response)
+        if not isinstance(records, list):
+            raise LinkedInCollectionError("The provider returned an unexpected snapshot format.")
+        return records

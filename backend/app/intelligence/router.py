@@ -17,14 +17,17 @@ from app.auth import User, get_current_user, require_admin
 from app.config import settings
 from app.db import SessionLocal, get_db
 from app.intelligence.collection import check_source, linkedin_configured
+from app.intelligence.credit_control import budget_status
 from app.intelligence.email_service import INTELLIGENCE_RECIPIENT, send_news_email
 from app.intelligence.focus import opportunity_focus_score
 from app.intelligence.insights import InsightGenerationError, cached_brief, deep_insight, strategic_brief
 from app.intelligence.linkedin_adapter import LinkedInCollectionError
-from app.intelligence.models import NewsAnalysis, NewsItem, NewsSource, NewsSourceEmailSubscription, NewsUserState
+from app.intelligence.linkedin_identity import identity_or_none, lock_source_identity, lock_identity_change, matching_sources
+from app.intelligence.models import LinkedInSourceIdentity
+from app.intelligence.models import BrightDataExecution, NewsAnalysis, NewsItem, NewsSource, NewsSourceEmailSubscription, NewsUserState
 from app.intelligence.priority import analyzed_news_priority
 from app.intelligence.rss_adapter import rss_url_is_supported
-from app.intelligence.schemas import DeepInsightOut, EmailShareOut, IntelligenceStatusOut, NewsFeedOut, NewsSourceCreate, NewsSourceEmailInput, NewsSourceOut, NewsSourceUpdate, SourceCheckOut, StrategicBriefOut
+from app.intelligence.schemas import DeepInsightOut, EmailShareOut, IntelligenceStatusOut, LinkedInMonitorOut, NewsFeedOut, NewsSourceCreate, NewsSourceEmailInput, NewsSourceOut, NewsSourceUpdate, SourceCheckOut, StrategicBriefOut
 from app.intelligence.website_adapter import source_kind
 
 router = APIRouter()
@@ -69,12 +72,28 @@ def _source_out(source: NewsSource, email_enabled: bool = False) -> NewsSourceOu
     output = NewsSourceOut.model_validate(source)
     output.collection_supported = source.type == "LINKEDIN" or (source.type in {"WEBSITE", "RSS"} and rss_url_is_supported(source.url))
     output.email_enabled = email_enabled
+    output.collection_enabled = source.type == "LINKEDIN" and source.status == "ACTIVE" and settings.NEWS_ENABLE_COLLECTION and settings.NEWS_LINKEDIN_FETCH_ENABLED and not settings.NEWS_BRIGHTDATA_CANARY_LIVE_ENABLED and not source.linkedin_paused_reason
     return output
 
 
 @router.get("/status", response_model=IntelligenceStatusOut)
 async def intelligence_status(_: User = Depends(require_admin)) -> IntelligenceStatusOut:
     return IntelligenceStatusOut(linkedinConfigured=linkedin_configured())
+
+
+@router.get("/collection-budget")
+async def collection_budget(db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)) -> dict:
+    return await budget_status(db)
+
+
+@router.get("/collection-executions")
+async def collection_executions(db: AsyncSession = Depends(get_db), _: User = Depends(require_admin),
+    limit: int = Query(default=100, ge=1, le=500), source_id: uuid.UUID | None = None) -> list[dict]:
+    query = select(BrightDataExecution).order_by(BrightDataExecution.started_at.desc()).limit(limit)
+    if source_id:
+        query = query.where(BrightDataExecution.source_id == source_id)
+    rows = (await db.scalars(query)).all()
+    return [{column.name: getattr(row, column.name) for column in BrightDataExecution.__table__.columns} for row in rows]
 
 
 @router.get("/items", response_model=NewsFeedOut)
@@ -347,6 +366,13 @@ async def list_sources(db: AsyncSession = Depends(get_db), user: User = Depends(
     return [_source_out(source, source.id in subscribed) for source in sources]
 
 
+@router.get("/linkedin-sources", response_model=list[LinkedInMonitorOut])
+async def linkedin_monitoring_sources(db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)) -> list[LinkedInMonitorOut]:
+    # Feed readers can discover monitored accounts without receiving admin settings.
+    sources = await db.scalars(select(NewsSource).where(NewsSource.type == "LINKEDIN").order_by(NewsSource.created_at, NewsSource.id))
+    return [LinkedInMonitorOut(**_source_out(source).model_dump()) for source in sources]
+
+
 @router.get("/sources/check-all/status")
 async def check_all_sources_status(_: User = Depends(require_admin)) -> dict[str, object]:
     return _check_all_status.copy()
@@ -358,7 +384,7 @@ async def check_all_sources_now(db: AsyncSession = Depends(get_db), _: User = De
     async with _check_all_lock:
         if _check_all_task and not _check_all_task.done():
             return _check_all_status.copy()
-        query = select(NewsSource).where(NewsSource.status == "ACTIVE")
+        query = select(NewsSource).where(NewsSource.status == "ACTIVE", NewsSource.type != "LINKEDIN")
         if repost_group:
             query = query.where(NewsSource.repost_groups.contains([repost_group]))
         if source_id is not None:
@@ -367,10 +393,9 @@ async def check_all_sources_now(db: AsyncSession = Depends(get_db), _: User = De
             query = query.where(NewsSource.id.in_(source_ids))
         sources = (await db.execute(query)).scalars().all()
         source_ids = [source.id for source in sources if
-                      (source.type in {"WEBSITE", "RSS"} and rss_url_is_supported(source.url)) or
-                      (source.type == "LINKEDIN" and linkedin_configured())]
+                      source.type in {"WEBSITE", "RSS"} and rss_url_is_supported(source.url)]
         if not source_ids:
-            raise HTTPException(status_code=409, detail="No active, connected sources are available to check.")
+            raise HTTPException(status_code=409, detail="LinkedIn checks run on the protected daily scheduler. Refresh the feed to see stored posts.")
         _check_all_status = {"state": "running", "total": len(source_ids), "processed": 0, "failed": 0, "started": 0, "pending": 0}
         _check_all_task = asyncio.create_task(_check_all_sources(source_ids))
         return _check_all_status.copy()
@@ -380,9 +405,15 @@ async def check_all_sources_now(db: AsyncSession = Depends(get_db), _: User = De
 async def create_source(payload: NewsSourceCreate, db: AsyncSession = Depends(get_db), user: User = Depends(require_admin)) -> NewsSourceOut:
     if payload.type in {"RSS", "WEBSITE"} and not rss_url_is_supported(payload.url):
         raise HTTPException(status_code=422, detail="Use a public HTTP or HTTPS URL without credentials or a custom port.")
+    if payload.type == "LINKEDIN":
+        identity = await lock_source_identity(db, payload.url)
+        if await matching_sources(db, identity):
+            raise HTTPException(status_code=409, detail="This LinkedIn source already exists. Edit or resume the existing source.")
     source = NewsSource(**payload.model_dump(exclude={"email_enabled"}))
     db.add(source)
     await db.flush()
+    if payload.type == "LINKEDIN":
+        db.add(LinkedInSourceIdentity(canonical_url=identity, source_id=source.id))
     if payload.email_enabled:
         from app.intelligence.digest_service import ensure_digest_settings
         await ensure_digest_settings(db, user.id)
@@ -411,32 +442,44 @@ async def check_source_now(source_id: uuid.UUID, db: AsyncSession = Depends(get_
         return SourceCheckOut(state="started")
     if source.type != "LINKEDIN":
         raise HTTPException(status_code=422, detail="No connector is available for this source yet.")
-    if source.status != "ACTIVE":
-        raise HTTPException(status_code=422, detail="Activate this source before checking it.")
-    if not linkedin_configured():
-        raise HTTPException(status_code=503, detail="LinkedIn collection requires a Bright Data API token on the server.")
-    try:
-        state = await check_source(db, source_id, force=True)
-    except LinkedInCollectionError as exc:
-        await db.rollback()
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception:
-        await db.rollback()
-        raise HTTPException(status_code=502, detail="Could not check this source right now.")
-    return SourceCheckOut(state=state)
+    raise HTTPException(status_code=409, detail="LinkedIn checks run on the protected daily scheduler. Refresh the feed to see stored posts.")
 
 
 @router.put("/sources/{source_id}", response_model=NewsSourceOut)
 async def update_source(source_id: uuid.UUID, payload: NewsSourceUpdate, db: AsyncSession = Depends(get_db), user: User = Depends(require_admin)) -> NewsSourceOut:
     if payload.type in {"RSS", "WEBSITE"} and not rss_url_is_supported(payload.url):
         raise HTTPException(status_code=422, detail="Use a public HTTP or HTTPS URL without credentials or a custom port.")
-    source = await _get_source(db, source_id)
-    source_changed = source.url != payload.url or source.type != payload.type or source.status != payload.status
-    if source.url != payload.url or source.type != payload.type:
+    initial = await _get_source(db, source_id)
+    initial_identity = (initial.type, initial.url)
+    await lock_identity_change(db, initial.url if initial.type == "LINKEDIN" else "", payload.url if payload.type == "LINKEDIN" else "")
+    source = await db.scalar(select(NewsSource).where(NewsSource.id == source_id).with_for_update().execution_options(populate_existing=True))
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+    if (source.type, source.url) != initial_identity:
+        raise HTTPException(status_code=409, detail="Source changed during editing. Refresh and try again.")
+    url_changed = source.type != payload.type or (identity_or_none(source.url) != identity_or_none(payload.url) if payload.type == "LINKEDIN" else source.url != payload.url)
+    if url_changed and (source.pending_execution_id or source.pending_snapshot_id):
+        raise HTTPException(status_code=409, detail="Reconcile the pending collection before changing this source URL or type.")
+    if url_changed and "LINKEDIN" in {source.type, payload.type}:
+        history = source.last_started_at or source.last_successful_fetch_at or await db.scalar(select(NewsItem.id).where(NewsItem.source_id == source_id).limit(1)) or await db.scalar(select(BrightDataExecution.id).where(BrightDataExecution.source_id == source_id).limit(1))
+        if history:
+            raise HTTPException(status_code=409, detail="A collected LinkedIn identity cannot be changed. Pause it and add a separate source to preserve history and daily limits.")
+    if payload.type == "LINKEDIN":
+        identity = await lock_source_identity(db, payload.url)
+        if any(row.id != source_id for row in await matching_sources(db, identity)):
+            raise HTTPException(status_code=409, detail="This LinkedIn source already exists. Edit or resume the existing source.")
+    source_changed = url_changed or source.status != payload.status
+    if url_changed:
+        owner = await db.scalar(select(LinkedInSourceIdentity).where(LinkedInSourceIdentity.source_id == source_id))
+        if owner is not None:
+            await db.delete(owner)
+            await db.flush()
         source.pending_snapshot_id = None
         source.last_started_at = None
         source.last_checked_at = None
         source.last_error = None
+    if payload.type == "LINKEDIN" and url_changed:
+        db.add(LinkedInSourceIdentity(canonical_url=identity, source_id=source_id))
     for field, value in payload.model_dump(exclude={"email_enabled"}).items():
         setattr(source, field, value)
     subscription = await db.get(NewsSourceEmailSubscription, source_id)
@@ -474,6 +517,16 @@ async def set_source_email(source_id: uuid.UUID, payload: NewsSourceEmailInput, 
 @router.delete("/sources/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_source(source_id: uuid.UUID, db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)) -> Response:
     source = await _get_source(db, source_id)
+    identity = (source.type, source.url)
+    await lock_identity_change(db, source.url if source.type == "LINKEDIN" else "", "")
+    source = await db.scalar(select(NewsSource).where(NewsSource.id == source_id).with_for_update().execution_options(populate_existing=True))
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+    if (source.type, source.url) != identity:
+        raise HTTPException(status_code=409, detail="Source changed. Refresh before deleting.")
+    if source.type == "LINKEDIN":
+        if source.pending_execution_id or source.pending_snapshot_id or source.last_started_at or source.last_successful_fetch_at or await db.scalar(select(NewsItem.id).where(NewsItem.source_id == source_id).limit(1)) or await db.scalar(select(BrightDataExecution.id).where(BrightDataExecution.source_id == source_id).limit(1)):
+            raise HTTPException(status_code=409, detail="This LinkedIn source has history or a pending collection. Pause it to preserve posts and saved state.")
     await db.delete(source)
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

@@ -13,6 +13,7 @@ from app.db import AppMetadata, Base, SessionLocal, engine
 from app.import_primeflow import import_export
 from app.intelligence import models  # noqa: F401 - registers isolated tables
 from app.intelligence.collection import check_due_sources
+from app.intelligence.credit_migration import migrate_credit_controls
 from app.intelligence.company_sources import ensure_company_sources, ensure_personal_activity_source
 from app.intelligence.digest_service import run_digest_cycle
 from app.intelligence.router import router as intelligence_router
@@ -26,6 +27,7 @@ async def lifespan(_: FastAPI):
         await connection.execute(text("ALTER TABLE intelligence_items ADD COLUMN IF NOT EXISTS linkedin_data JSONB"))
         await connection.execute(text("ALTER TABLE intelligence_sources ADD COLUMN IF NOT EXISTS repost_groups JSONB NOT NULL DEFAULT '[]'::jsonb"))
         await connection.execute(text("ALTER TABLE intelligence_sources ADD COLUMN IF NOT EXISTS repost_guidance JSONB NOT NULL DEFAULT '{}'::jsonb"))
+        await migrate_credit_controls(connection)
     snapshot = Path(__file__).resolve().parents[2] / "data" / "primeflow-export.json"
     if settings.NEWS_AUTO_IMPORT_SNAPSHOT and snapshot.is_file():
         async with SessionLocal() as session:
@@ -37,7 +39,8 @@ async def lifespan(_: FastAPI):
         await ensure_personal_activity_source(session)
     scheduler = AsyncIOScheduler(timezone="UTC")
     if settings.NEWS_ENABLE_COLLECTION:
-        scheduler.add_job(check_due_sources, "interval", minutes=5, next_run_time=datetime.now(timezone.utc), max_instances=1)
+        scheduler.add_job(check_due_sources, "interval", minutes=5, id="source-collection", coalesce=True,
+                          misfire_grace_time=60, max_instances=1)
     scheduler.add_job(run_digest_cycle, "interval", minutes=1, next_run_time=datetime.now(timezone.utc), max_instances=1)
     scheduler.start()
     try:

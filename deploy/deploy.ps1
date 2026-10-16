@@ -1,4 +1,21 @@
+param([string]$ReleasePermit)
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'release-control.ps1')
+if (-not $ReleasePermit) { throw 'Manual release requires an explicitly approved private release permit.' }
+$permitPath = [IO.Path]::GetFullPath($ReleasePermit)
+if (-not $permitPath.StartsWith('E:\private\primex-release-approvals\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Release permit must be outside the application and checkout.' }
+$parent = Get-Item -LiteralPath $permitPath
+while ($parent -and $parent.FullName -ne 'E:\') {
+    if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Release permit path cannot contain reparse points.' }
+    $parent = if ($parent.PSIsContainer) { $parent.Parent } else { $parent.Directory }
+}
+$permit = Get-Content -LiteralPath $permitPath -Raw | ConvertFrom-Json
+Assert-NewsReleasePermit $permit $env:GITHUB_SHA
+if (-not $env:GITHUB_WORKSPACE) { throw 'Explicit reviewed checkout is required.' }
+$checkoutSha = & git -C $env:GITHUB_WORKSPACE rev-parse HEAD
+if ($LASTEXITCODE -ne 0 -or $checkoutSha -cne $env:GITHUB_SHA) { throw 'Checkout does not match release approval.' }
+$dirty = & git -C $env:GITHUB_WORKSPACE status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'Release checkout must be clean, including untracked files.' }
 
 $root = 'E:\websites\news-intelligence'
 $workspace = $env:GITHUB_WORKSPACE
@@ -7,6 +24,14 @@ $npm = 'C:\Program Files\nodejs\npm.cmd'
 $node = 'C:\Program Files\nodejs\node.exe'
 $started = Get-Date
 $tasks = @('NewsIntelligenceAPI', 'NewsIntelligenceWeb')
+Assert-NewsPausedConfiguration (Join-Path $root '.env') (Get-NewsInheritedCollectionSettings)
+if ((Get-ScheduledTask -TaskName 'NewsIntelligenceSync').State -ne 'Disabled') { throw 'Legacy sync task must be held by the approved administrator transition.' }
+foreach ($task in $tasks) {
+    if ((Get-ScheduledTask -TaskName $task).State -eq 'Disabled') { throw 'API/Web tasks must be startable with reviewed paused launchers before release.' }
+}
+# Durable one-use permit consumption precedes all release mutations.
+$permitUse = [IO.File]::Open(($permitPath + '.consumed'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+$permitUse.Dispose()
 
 if (-not $workspace -or -not (Test-Path -LiteralPath (Join-Path $workspace 'frontend\package-lock.json'))) {
     throw 'GITHUB_WORKSPACE does not contain the News application.'
@@ -55,30 +80,23 @@ function Invoke-Checked([string]$executable, [string[]]$arguments, [string]$dire
 function Stop-News {
     foreach ($task in $tasks) { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 2
-    foreach ($port in @(8001, 3101)) {
-        $listener = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
-        foreach ($socket in $listener) {
-            $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($socket.OwningProcess)"
-            $command = [string]$process.CommandLine
-            $expected = if ($port -eq 8001) { $command -match [regex]::Escape((Join-Path $root '.venv\Scripts\python.exe')) -and $command -match 'uvicorn app\.main:app.+8001' }
-                        else { $command -match 'node_modules\\next\\dist\\bin\\next start.+3101' }
-            if (-not $expected) { throw "Port $port belongs to an unexpected process." }
-            Stop-Process -Id $socket.OwningProcess -Force -ErrorAction SilentlyContinue
-        }
-    }
-    Get-CimInstance Win32_Process | Where-Object {
-        $_.CommandLine -match [regex]::Escape((Join-Path $root '.venv\Scripts\python.exe')) -and
-        $_.CommandLine -match 'uvicorn app\.main:app.+8001'
-    } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Seconds 1
+    # Windows task stop may leave child processes. Never kill by a port/name
+    # heuristic: the administrator must retire the freshly mapped News tree.
     foreach ($port in @(8001, 3101)) {
         if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) {
-            throw "News port $port did not stop."
+            throw "News port $port remains occupied. Revalidate process ownership; no process was force-stopped."
         }
     }
 }
 
 function Start-News {
+    # Also applies to rollback: old code must never regain a provider key.
+    Assert-NewsPausedConfiguration (Join-Path $root '.env') (Get-NewsInheritedCollectionSettings)
+    foreach ($port in @(8001, 3101)) {
+        if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) {
+            throw "Refusing duplicate startup while News port $port is occupied. Administrator ownership review is required."
+        }
+    }
     foreach ($task in $tasks) { Start-ScheduledTask -TaskName $task }
 }
 
@@ -130,7 +148,7 @@ function Queue-NewsCleanup([string[]]$paths) {
     Move-Item -LiteralPath $temporary -Destination $request
     $worker = Join-Path $deployRoot 'cleanup.ps1'
     Copy-Item -LiteralPath (Join-Path $workspace 'deploy\cleanup.ps1') -Destination $worker -Force
-    Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $worker + '"'), '-Root', ('"' + $root + '"')) | Out-Null
+    Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -WindowStyle Hidden -ArgumentList @('-NoProfile', '-File', ('"' + $worker + '"'), '-Root', ('"' + $root + '"')) | Out-Null
 }
 
 New-Item -ItemType Directory -Path $stageRoot, $backupRoot, $cacheRoot -Force | Out-Null
