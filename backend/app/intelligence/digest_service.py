@@ -184,8 +184,8 @@ def digest_content(entries: list[dict], slot: datetime, source_names: list[str] 
     return subject, "\n".join(text_lines), html
 
 
-async def _send_digest(subject: str, body: str, html: str) -> None:
-    mailer = GmailService()
+async def _send_digest(subject: str, body: str, html: str, *, credentials: tuple[str, str] | None = None) -> None:
+    mailer = GmailService(credentials=credentials) if credentials is not None else GmailService()
     if mailer.port != 465 and not await _smtp_reachable(mailer.host, mailer.port):
         if not await _smtp_reachable(mailer.host, 465):
             raise ConnectionError("SMTP submission ports are unreachable")
@@ -193,14 +193,14 @@ async def _send_digest(subject: str, body: str, html: str) -> None:
     await mailer.send_verified(subject, [settings.NEWS_EMAIL_RECIPIENT], body, html=html)
 
 
-async def send_digest_test() -> None:
+async def send_digest_test(*, credentials: tuple[str, str] | None = None) -> None:
     subject = "[News Intelligence] Test i raportit me email"
     body = "Ky është një email test. Raportet e planifikuara do të përmbajnë lajmet, postimet, repostimet dhe artikujt e rinj nga burimet ku emaili është aktiv."
     html = ('<div style="max-width:600px;margin:auto;padding:28px;font-family:Arial,sans-serif;color:#24342a">'
             '<p style="color:#63866a;font-size:12px;font-weight:700;letter-spacing:2px">NEWS INTELLIGENCE</p>'
             '<h1 style="font-size:24px">Test i raportit me email</h1>'
             '<p>Konfigurimi i emailit po punon. Raportet e planifikuara do të përmbajnë lajmet, postimet, repostimet dhe artikujt e rinj nga burimet ku emaili është aktiv.</p></div>')
-    await _send_digest(subject, body, html)
+    await _send_digest(subject, body, html, credentials=credentials)
 
 
 async def process_digest(db: AsyncSession, user_id: uuid.UUID, now: datetime | None = None) -> int:
