@@ -147,6 +147,27 @@ def test_repeated_results_deduplicate_and_preserve_read_state(database, monkeypa
     asyncio.run(run())
 
 
+def test_duplicate_snapshot_rows_refresh_activity_without_another_item(database, monkeypatch):
+    _, sessions = database
+    first = records()[0]
+    detailed = {**first, "url": "https://www.linkedin.com/feed/update/urn:li:activity:42",
+                "num_likes": 9, "num_comments": 1, "comments": [{"text": "Useful"}]}
+    provider = Provider(monkeypatch, [first, detailed, first])
+    async def run():
+        sid = await source(sessions)
+        assert await check(sessions, sid) == "started"
+        assert await check(sessions, sid) == "completed"
+        async with sessions() as db:
+            item = (await db.scalars(select(NewsItem))).one()
+            execution = (await db.scalars(select(BrightDataExecution))).one()
+            assert item.linkedin_data["reactionCount"] == 9
+            assert item.linkedin_data["comments"][0]["text"] == "Useful"
+            assert execution.newly_saved_posts == 1 and execution.duplicate_posts == 2
+            assert execution.returned_records == 3 and execution.ignored_records == 0
+        assert len(provider.triggers) == 1
+    asyncio.run(run())
+
+
 def test_zero_results_keep_usage_reservation(database, monkeypatch):
     _, sessions = database
     Provider(monkeypatch)
@@ -221,6 +242,80 @@ def test_restart_resumes_snapshot_without_new_post(database, monkeypatch):
         # Entirely new DB session; only persistent source + execution state exist.
         assert await check(sessions, sid) == "completed"
         assert await check(sessions, sid) == "pending"
+        assert len(provider.triggers) == 1
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("already_completed", [False, True])
+def test_stale_session_reloads_job_under_source_lock(database, monkeypatch, already_completed):
+    _, sessions = database
+    provider = Provider(monkeypatch)
+    async def run():
+        sid = await source(sessions)
+        async with sessions() as stale:
+            row = await stale.get(NewsSource, sid)
+            await stale.commit()
+            assert await check(sessions, sid) == "started"
+            if already_completed:
+                assert await check(sessions, sid) == "completed"
+            result = await collection.protected_linkedin_check(stale, row, datetime.now(timezone.utc))
+            assert result == ("pending" if already_completed else "completed")
+        assert len(provider.triggers) == 1
+        async with sessions() as db:
+            assert len((await db.scalars(select(BrightDataExecution))).all()) == 1
+    asyncio.run(run())
+
+
+def test_stale_session_observes_new_account_pause(database, monkeypatch):
+    from app.intelligence.credit_control import locked_account
+    _, sessions = database
+    provider = Provider(monkeypatch)
+    async def run():
+        sid = await source(sessions)
+        async with sessions() as stale:
+            row = await stale.get(NewsSource, sid)
+            account = await locked_account(stale)
+            assert not account.paused_reason
+            await stale.commit()
+            async with sessions() as db:
+                current = await db.get(BrightDataAccount, 1)
+                current.paused_reason = "Billing reconciliation required"
+                await db.commit()
+            assert await collection.protected_linkedin_check(stale, row, datetime.now(timezone.utc)) == "paused"
+        assert provider.requests == []
+    asyncio.run(run())
+
+
+def test_stale_session_observes_source_deactivation(database, monkeypatch):
+    _, sessions = database
+    provider = Provider(monkeypatch)
+    async def run():
+        sid = await source(sessions)
+        async with sessions() as stale:
+            row = await stale.get(NewsSource, sid)
+            await stale.commit()
+            async with sessions() as db:
+                current = await db.get(NewsSource, sid)
+                current.status = "PAUSED"
+                await db.commit()
+            assert await collection.protected_linkedin_check(stale, row, datetime.now(timezone.utc)) == "paused"
+        assert provider.requests == []
+    asyncio.run(run())
+
+
+def test_malformed_url_keeps_valid_results_and_blocks_watermark(database, monkeypatch):
+    _, sessions = database
+    provider = Provider(monkeypatch, [*records(), {"url": "https://[invalid/posts/bad"}])
+    async def run():
+        sid = await source(sessions)
+        assert await check(sessions, sid) == "started"
+        assert await check(sessions, sid) == "completed"
+        async with sessions() as db:
+            row = await db.get(NewsSource, sid)
+            execution = (await db.scalars(select(BrightDataExecution))).one()
+            assert row.last_successful_fetch_at is None and row.linkedin_paused_reason
+            assert execution.state == "partial" and execution.ignored_records == 1
+            assert len((await db.scalars(select(NewsItem))).all()) == 1
         assert len(provider.triggers) == 1
     asyncio.run(run())
 

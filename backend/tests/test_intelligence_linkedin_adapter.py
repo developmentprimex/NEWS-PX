@@ -37,6 +37,60 @@ def test_company_repost_cannot_be_attributed_to_the_wrong_reposter():
         parse_posts([row], source)
 
 
+def test_original_author_is_not_mistaken_for_the_reposter():
+    source = SimpleNamespace(name="Example", url="https://www.linkedin.com/in/example/")
+    with pytest.raises(LinkedInCollectionError):
+        parse_posts([{"url": "https://www.linkedin.com/posts/example_activity-42-x",
+                      "user_id": "example", "reposted_by": "someone-else"}], source)
+
+
+def test_unidentified_reposter_cannot_fall_back_to_the_original_author():
+    source = SimpleNamespace(name="Example", url="https://www.linkedin.com/in/example/")
+    with pytest.raises(LinkedInCollectionError):
+        parse_posts([{"url": "https://linkedin.com/posts/example_activity-42-x",
+                      "user_id": "example", "reposted_by": {"name": "Another person"}}], source)
+
+
+def test_company_repost_accepts_localized_actor_url():
+    source = SimpleNamespace(name="Example", url="https://www.linkedin.com/company/example/")
+    post = parse_posts([{"url": "https://linkedin.com/posts/original_activity-42-x",
+                         "reposted_by": {"company_url": "https://de.linkedin.com/company/EXAMPLE/"}}], source)[0]
+    assert post.linkedin_data["kind"] == "REPOST"
+    assert post.linkedin_data["authorName"] == "Example"
+
+
+def test_company_discovery_rejects_explicitly_different_company_author():
+    source = SimpleNamespace(name="Example", url="https://www.linkedin.com/company/example/")
+    with pytest.raises(LinkedInCollectionError):
+        parse_posts([{"url": "https://linkedin.com/posts/other_activity-42-x",
+                      "company_url": "https://linkedin.com/company/other/"}], source)
+
+
+def test_bad_url_in_snapshot_does_not_discard_valid_posts():
+    source = SimpleNamespace(name="Example", url="https://www.linkedin.com/in/example/")
+    posts = parse_posts([
+        {"url": "https://[invalid/posts/bad", "user_id": "example"},
+        {"url": "https://linkedin.com/posts/example_activity-42-x", "user_id": "example",
+         "user_url": "https://[invalid", "top_visible_comments": [{"text": "Hi", "url": "https://[invalid"}]},
+    ], source)
+    assert len(posts) == 1
+    assert posts[0].linkedin_data["authorUrl"] is None
+    assert posts[0].linkedin_data["comments"][0]["url"] is None
+
+
+def test_profile_author_url_must_be_a_linkedin_identity():
+    source = SimpleNamespace(name="Example", url="https://www.linkedin.com/in/example/")
+    with pytest.raises(LinkedInCollectionError):
+        parse_posts([{"url": "https://linkedin.com/posts/example_activity-42-x",
+                      "user_url": "https://evil.test/in/example/"}], source)
+
+
+def test_publication_dates_are_normalized_to_utc_for_window_checks():
+    post = parse_posts([{"url": "https://linkedin.com/posts/example_activity-42-x",
+                         "date_posted": "2026-10-15T00:30:00+02:00"}], SimpleNamespace(name="Example"))[0]
+    assert post.published_at.isoformat() == "2026-10-14T22:30:00+00:00"
+
+
 def test_company_plain_repost_keeps_original_author_and_reposter():
     source = SimpleNamespace(name='Example company', url='https://www.linkedin.com/company/example/')
     row = {'id':'501', 'url':'https://www.linkedin.com/posts/original_activity-501-x',

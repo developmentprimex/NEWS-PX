@@ -52,3 +52,34 @@ def test_edited_post_updates_same_item_and_analysis(monkeypatch):
     assert item.title == "Edited" and item.original_text == "Edited body"
     assert saved_analysis.summary == "Edited summary"
     assert saved_analysis.analyzed_at
+
+
+def test_sparse_refresh_keeps_content_and_previously_observed_activity(monkeypatch):
+    previous = {"kind": "REPOST", "reactionCount": 7, "commentCount": 3,
+                "originalPostText": "Shared news", "comments": [{"text": "Useful"}]}
+    item = SimpleNamespace(id=uuid4(), title="Original", original_text="Body", published_at=None,
+                           linkedin_data=previous)
+    db = SimpleNamespace(scalar=AsyncMock(return_value=item), get=AsyncMock())
+    analyze = AsyncMock()
+    monkeypatch.setattr(collection, "analyze_news_item", analyze)
+    post = CollectedNewsItem("42", "https://linkedin.com/posts/example_activity-42-x", "Post by Example", None, None,
+                             linkedin_data={"kind": "POST", "reactionCount": None, "commentCount": 0,
+                                            "originalPostText": None, "comments": []})
+    assert asyncio.run(collection._store_post(db, SimpleNamespace(id=uuid4(), type="LINKEDIN"), post)) is False
+    assert item.title == "Original" and item.original_text == "Body"
+    assert item.linkedin_data["kind"] == "REPOST"
+    assert item.linkedin_data["reactionCount"] == 7
+    assert item.linkedin_data["commentCount"] == 0
+    assert item.linkedin_data["comments"] == []
+    assert item.linkedin_data["originalPostText"] == "Shared news"
+    analyze.assert_not_awaited()
+
+
+def test_missing_comment_preview_does_not_erase_observed_comments(monkeypatch):
+    item = SimpleNamespace(id=uuid4(), title="Original", original_text="Body", published_at=None,
+                           linkedin_data={"comments": [{"text": "Useful"}]})
+    db = SimpleNamespace(scalar=AsyncMock(return_value=item))
+    post = CollectedNewsItem("42", "https://linkedin.com/posts/example_activity-42-x", "Original", "Body", None,
+                             linkedin_data={"comments": [], "commentCount": None})
+    asyncio.run(collection._store_post(db, SimpleNamespace(id=uuid4(), type="LINKEDIN"), post))
+    assert item.linkedin_data["comments"] == [{"text": "Useful"}]
