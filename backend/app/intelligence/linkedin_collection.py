@@ -1,16 +1,31 @@
 """Persistent snapshot lifecycle. No automatic retries of billable triggers."""
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import case, func, select
+
 from app.config import settings
 from app.intelligence.credit_control import locked_account, reserve_execution, record_alerts, usage_totals, executions_for_budget
 from app.intelligence.linkedin_adapter import BrightDataLinkedInAdapter, parse_posts
 from app.intelligence.linkedin_schedule import is_due
 from app.intelligence.models import BrightDataExecution
 
+DAILY_REASON = "scheduled-day"
+
+
+def daily_window(covered_through, now, *, first_attempt=None):
+    """One closed UTC day; only a completed daily execution advances coverage.
+
+    A first-time rollout starts with yesterday, without inferring coverage from
+    legacy wall-clock watermarks. Once daily attempts exist, retain their anchor.
+    """
+    yesterday = now.astimezone(timezone.utc).date() - timedelta(days=1)
+    day = covered_through + timedelta(days=1) if covered_through else first_attempt or yesterday
+    return (day, day) if day <= yesterday else None
+
 
 def incremental_start(last_success, now):
-    # Date-only provider filters require a one-day boundary overlap. Long outages
-    # never silently become historical backfills.
+    # Retained for the explicitly controlled legacy canary; normal scheduled
+    # discovery uses closed UTC days and the durable execution ledger instead.
     start = (last_success.date() - timedelta(days=1)) if last_success else now.date() - timedelta(days=1)
     return max(start, now.date() - timedelta(days=7))
 
@@ -113,7 +128,7 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
                 else:
                     # Category exclusions are tracked separately from duplicates.
                     from app.intelligence.models import NewsItem
-                    from sqlalchemy import or_, select
+                    from sqlalchemy import or_
                     exists = await db.scalar(select(NewsItem.id).where(NewsItem.source_id == source.id,
                         or_(NewsItem.external_id == post.external_id, NewsItem.url == post.url)).limit(1))
                     if exists:
@@ -139,12 +154,27 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
             record_alerts(account, usage_totals(account, await executions_for_budget(db), now))
             await db.commit()
             return "error" if errors else "completed"
-        extra = not is_due(source, now) and is_due(source, now, extra=True)
-        if not backfill and not is_due(source, now, extra=True):
+        if not backfill and not is_due(source, now):
             return "pending"
-        start, end, limit = backfill if backfill else (incremental_start(source.last_successful_fetch_at, now), now.date(), settings.NEWS_LINKEDIN_RECORD_LIMIT)
+        execution_reason = reason
+        if backfill:
+            start, end, limit = backfill
+        elif reason.startswith("scheduled"):
+            covered_through, first_attempt = (await db.execute(select(
+                func.max(case((BrightDataExecution.state == "completed", BrightDataExecution.end_date))),
+                func.min(BrightDataExecution.start_date),
+            ).where(BrightDataExecution.source_id == source.id,
+                    BrightDataExecution.trigger_reason == DAILY_REASON))).one()
+            window = daily_window(covered_through, now, first_attempt=first_attempt)
+            if window is None:
+                return "pending"
+            start, end = window
+            limit = settings.NEWS_LINKEDIN_RECORD_LIMIT
+            execution_reason = DAILY_REASON
+        else:
+            start, end, limit = incremental_start(source.last_successful_fetch_at, now), now.date(), settings.NEWS_LINKEDIN_RECORD_LIMIT
         execution = await reserve_execution(db, source, now, start, end,
-            reason=reason if backfill else "scheduled-extra" if extra else reason, limit=limit)
+            reason=execution_reason, limit=limit)
         if not execution:
             return "paused"
         execution_id = execution.id

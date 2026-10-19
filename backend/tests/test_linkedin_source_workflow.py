@@ -26,13 +26,14 @@ from test_brightdata_postgres_integration import Provider, database, private_pos
 def test_new_source_to_persistent_feed_with_budget_and_daily_schedule(database, monkeypatch, path, discovery):
     _, sessions = database
     now = datetime.now(timezone.utc)
+    published = (now - timedelta(days=1)).isoformat()
     url = f'https://www.linkedin.com/{path}/workflow-example/'
     rows = [
         {'id': '91001', 'url': 'https://www.linkedin.com/feed/update/urn:li:activity:91001',
-         'user_id': 'workflow-example', 'post_text': 'Original workflow post', 'date_posted': now.isoformat()},
+         'user_id': 'workflow-example', 'post_text': 'Original workflow post', 'date_posted': published},
         {'id': '91002', 'url': 'https://www.linkedin.com/posts/original_activity-91002-x',
          'user_id': 'original', 'reposted_by': url, 'post_type': 'repost',
-         'post_text': 'Shared workflow post', 'date_posted': now.isoformat()},
+         'post_text': 'Shared workflow post', 'date_posted': published},
     ]
     provider = Provider(monkeypatch, [*rows, rows[0]])
     app = FastAPI()  # Router only: never imports/starts production lifespan.
@@ -58,7 +59,7 @@ def test_new_source_to_persistent_feed_with_budget_and_daily_schedule(database, 
             trigger = provider.triggers[0]
             assert trigger.url.params['discover_by'] == discovery
             assert trigger.url.params['limit_per_input'] == '6'
-            expected_input = {'url': url, 'start_date': (now - timedelta(days=1)).date().isoformat(), 'end_date': now.date().isoformat()}
+            expected_input = {'url': url, 'start_date': (now - timedelta(days=1)).date().isoformat(), 'end_date': (now - timedelta(days=1)).date().isoformat()}
             if path == 'in': expected_input['only_authored_posts'] = False
             assert json.loads(trigger.content) == [expected_input]
             await collection.check_due_sources()  # Known snapshot is polled and persisted.
@@ -78,7 +79,7 @@ def test_new_source_to_persistent_feed_with_budget_and_daily_schedule(database, 
                 account.provider_billable_records = 4000
                 account.usage_as_of = account.verified_at = datetime.now(timezone.utc)
                 await db.commit()
-            await collection.check_due_sources()  # Due source, but monthly budget blocks traffic.
+            await collection.check_due_sources()  # The completed date is not purchased again.
             assert len(provider.triggers) == 1
             monkeypatch.setattr(settings, 'NEWS_LINKEDIN_FETCH_ENABLED', False)
             for _ in range(3):
