@@ -11,7 +11,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.intelligence.models import NewsSource
-from app.intelligence.services import CollectedNewsItem
+from app.intelligence.services import CollectedNewsItem, publication_has_precise_time
 
 API_BASE = "https://api.brightdata.com/datasets/v3/"
 SNAPSHOT_ID = re.compile(r"^(?:s|sd)_[A-Za-z0-9]+$")
@@ -208,7 +208,8 @@ def parse_posts(records: object, source: NewsSource) -> list[CollectedNewsItem]:
         body = _text(body, 20000) or ""
         activity = _activity(record)
         activity_time = _published(record.get("date_posted") or record.get("published_at"))
-        activity['activityAt'] = activity_time.isoformat() if activity_time and activity['kind'] != 'REPOST' else None
+        precise = publication_has_precise_time(record.get('date_posted') or record.get('published_at'))
+        activity['activityAt'] = activity_time.isoformat() if precise and activity_time and activity['kind'] != 'REPOST' else None
         activity['activityTimeEvidence'] = 'post-publication' if activity['activityAt'] else 'unknown'
         if activity["kind"] == "REPOST" and _reposter(record):
             # A plain repost can retain the original author's fields and URL.
@@ -230,6 +231,7 @@ def parse_posts(records: object, source: NewsSource) -> list[CollectedNewsItem]:
             original_text=body[:20_000] or None,
             published_at=_published(record.get("date_posted") or record.get("published_at")),
             linkedin_data=activity,
+            publication_time_verified=precise and activity['kind'] != 'REPOST',
         ))
     if records and not posts:
         raise LinkedInCollectionError("Provider returned no usable direct post links for this source.")

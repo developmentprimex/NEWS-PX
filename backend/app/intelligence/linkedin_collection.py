@@ -38,7 +38,8 @@ def finish(execution, now, state, error=None):
 
 
 async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", backfill=None,
-                           adapter=None, validate_records=None, cycle_source_id=None):
+                           adapter=None, validate_records=None, cycle_source_id=None, clock=None):
+    now = clock() if clock else now
     source_id = source.id
     execution_id = None
     if reason == 'trial-poll' and not source.pending_execution_id:
@@ -59,6 +60,9 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
             # A completed/uncertain execution is never replaced by a second POST.
             previous = await db.get(BrightDataExecution, cycle_row.execution_id)
             cycle_row.state = previous.state if previous and previous.state in TERMINAL else 'uncertain'
+            if cycle_row.state == 'completed' and not cycle_row.coverage_confirmed:
+                cycle_row.state = 'partial'
+                cycle_row.coverage_warning = 'Completion has no proven cycle coverage; review the original execution.'
             await db.commit()
             return 'completed'
         if not cycle_row.execution_id and not trial_active(await trial_configuration(db), now):
@@ -207,11 +211,20 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
             execution_reason = DAILY_REASON
         else:
             start, end, limit = incremental_start(source.last_successful_fetch_at, now), now.date(), settings.NEWS_LINKEDIN_RECORD_LIMIT
+        now = clock() if clock else now
+        if cycle_row and not trial_active(await trial_configuration(db), now):
+            return 'paused'
         execution = await reserve_execution(db, source, now, start, end,
             reason=execution_reason, limit=limit, cycle_source_id=cycle_source_id)
         if not execution:
             return "paused"
         execution_id = execution.id
+        if cycle_row and not trial_active(await trial_configuration(db), clock() if clock else now):
+            finish(execution, clock() if clock else now, 'cancelled', 'Trial expired before POST; conservative reservation retained.')
+            cycle_row.state, cycle_row.coverage_warning = 'blocked', execution.api_errors
+            source.pending_execution_id = None
+            await db.commit()
+            return 'paused'
         snapshot = await adapter.trigger(source, start_date=start.isoformat(), end_date=end.isoformat(), limit=limit)
         source.pending_snapshot_id = execution.snapshot_id = snapshot
         source.last_error = None

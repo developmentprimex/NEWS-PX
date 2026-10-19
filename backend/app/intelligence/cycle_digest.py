@@ -106,10 +106,43 @@ async def process_trial_digest(db, cycle_id, now):
         await db.commit()
         return 0
     entries = await trial_digest_entries(db, cycle_id, user_id)
+    # Serialize final authorization with source edits and unsubscribe. Selection
+    # above may have awaited network-free queries while preferences changed.
+    from app.db import AppMetadata
+    from app.intelligence.cycle_service import TRIAL_KEY
+    config_record = await db.scalar(select(AppMetadata).where(AppMetadata.key == TRIAL_KEY)
+                                    .with_for_update().execution_options(populate_existing=True))
+    import json
+    fresh_config = json.loads(config_record.value) if config_record else {}
+    if not fresh_config.get('enabled') or fresh_config.get('recipient_fingerprint') != fingerprint:
+        await db.commit()
+        return 0
+    source_ids = list(await db.scalars(select(CollectionCycleSource.source_id).where(CollectionCycleSource.cycle_id == cycle_id)))
+    source_rows = list(await db.scalars(select(NewsSource).where(NewsSource.id.in_(source_ids)).order_by(NewsSource.id)
+        .with_for_update().execution_options(populate_existing=True)))
+    sources_by_id = {s.id: s for s in source_rows if s.status == 'ACTIVE'}
+    subscriptions = list(await db.scalars(select(NewsSourceEmailSubscription).where(
+        NewsSourceEmailSubscription.user_id == user_id, NewsSourceEmailSubscription.source_id.in_(source_ids))
+        .with_for_update().execution_options(populate_existing=True)))
+    authorized = {s.source_id: s for s in subscriptions if s.source_id in sources_by_id}
+    entries = [entry for entry in entries if entry['source'].id in authorized
+        and source_identity(sources_by_id[entry['source'].id]) == source_identity(entry['source'])
+        and confirmed_activity_time(entry['item']) >= authorized[entry['source'].id].enabled_at
+        and entry['item'].created_at >= authorized[entry['source'].id].enabled_at]
+    if not authorized:
+        await db.commit()
+        return 0
     windows = []
     for row, _ in await subscribed_windows(db, cycle_id, user_id):
+        if row.source_id not in authorized or source_identity(sources_by_id[row.source_id]) != row.canonical_url:
+            continue
         items = list(await db.scalars(select(NewsItem).where(NewsItem.source_id == row.source_id)))
         windows.append({'row': row, 'unknown': sum(confirmed_activity_time(item) is None for item in items)})
+    valid_ids = {window['row'].source_id for window in windows}
+    entries = [entry for entry in entries if entry['source'].id in valid_ids]
+    if not windows:
+        await db.commit()
+        return 0
     subject, body, html = trial_digest_content(entries, windows, cycle.cutoff_at)
     report.content = {'item_ids': [str(e['item'].id) for e in entries], 'subject': subject, 'body': body, 'html': html}
     report.state, report.claimed_at = 'sending', now

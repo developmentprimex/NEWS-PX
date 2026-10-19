@@ -84,7 +84,10 @@ async def record_usage_observation(db, *, label, evidence, now):
         raise ValueError('Trial date is not configured.')
     day = date.fromisoformat(config['date'])
     record = TrialUsageObservation(trial_date=day, label=label, observed_at=now,
-        evidence={**evidence, 'counters': execution_counters(await trial_executions(db, day))})
+        evidence={**evidence, 'counters': execution_counters(await trial_executions(db, day)),
+            'account_execution_boundary': [{'id': str(e.id), 'state': e.state, 'started_at': e.started_at.isoformat(),
+                'completed_at': e.completed_at.isoformat() if e.completed_at else None}
+                for e in await db.scalars(select(BrightDataExecution))]})
     db.add(record)
     await db.commit()
     return record.id
@@ -127,8 +130,18 @@ async def trial_usage_summary(db, trial_date):
         result['attribution'] = 'incomparable'
         return result
     result['providerDeltaRecords'] = delta
-    isolated = first.get('consumers_isolated') is True and last.get('consumers_isolated') is True
+    baseline_cutoff = datetime.fromisoformat(first['usage_as_of'])
+    last_cutoff = datetime.fromisoformat(last['usage_as_of'])
+    trial_ids = {str(e.id) for e in executions}
+    all_executions = list(await db.scalars(select(BrightDataExecution)))
+    unrelated = [e for e in all_executions if str(e.id) not in trial_ids and e.state != 'cancelled'
+        and e.started_at <= last_cutoff and (e.started_at >= baseline_cutoff or e.completed_at is None
+            or e.completed_at >= baseline_cutoff)]
+    isolated = (first.get('consumers_isolated') is True and last.get('consumers_isolated') is True
+                and not unrelated)
     result['attribution'] = 'isolated' if isolated else 'uncertain'
+    result['nonTrialExecutionsAffectingDelta'] = len(unrelated)
+    result['accountDeltaRecords'] = delta
     cutoff = datetime.fromisoformat(last['usage_as_of'])
     cycles = list(await db.scalars(select(CollectionCycle).where(CollectionCycle.trial_date == trial_date)))
     evening = next((cycle for cycle in cycles if cycle.phase == 'evening'), None)

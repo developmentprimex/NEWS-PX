@@ -105,5 +105,12 @@ def confirmed_activity_time(item) -> datetime | None:
             return value.astimezone(timezone.utc) if value.tzinfo else None
         except (KeyError, ValueError, TypeError):
             return None
+    if not getattr(item, 'publication_time_verified', False):
+        return None
     value = item.published_at
     return value.astimezone(timezone.utc) if value and value.tzinfo else None
+
+
+async def migrate_trial_schema(connection):
+    from sqlalchemy import text
+    await connection.execute(text('ALTER TABLE intelligence_items ADD COLUMN IF NOT EXISTS publication_time_verified BOOLEAN NOT NULL DEFAULT false'))

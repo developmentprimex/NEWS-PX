@@ -20,7 +20,26 @@ def test_provider_dates_enclose_precise_utc_interval():
     now = datetime(2026, 10, 19, 8, tzinfo=timezone.utc)
     assert tuple(str(d) for d in provider_dates(TemporalWindow(now, now+timedelta(hours=13), True))) == ('2026-10-18', '2026-10-20')
     assert confirmed_activity_time(SimpleNamespace(published_at=now, linkedin_data={'kind': 'REPOST'})) is None
-    assert confirmed_activity_time(SimpleNamespace(published_at=now, linkedin_data={'kind': 'POST'})) == now
+    assert confirmed_activity_time(SimpleNamespace(published_at=now, linkedin_data={'kind': 'POST'}, publication_time_verified=True)) == now
+
+
+@pytest.mark.parametrize('raw', ['2026-10-19', '2026-10-19T08:00:00'])
+def test_date_only_and_unknown_zone_are_not_confirmed_interval_times(raw):
+    from app.intelligence.linkedin_adapter import parse_posts
+    src = SimpleNamespace(url='https://www.linkedin.com/company/example/', name='Example')
+    record = {**records()[0], 'date_posted': raw}
+    post = parse_posts([record], src)[0]
+    assert confirmed_activity_time(post) is None
+
+
+def test_rss_and_website_date_only_values_retain_unknown_hour():
+    from app.intelligence.rss_adapter import parse_feed
+    from app.intelligence.generic_website_adapter import parse_html_article, Page
+    raw = b'<rss version="2.0"><channel><title>News</title><item><title>Date only</title><link>https://example.com/date</link><pubDate>2026-10-19</pubDate></item></channel></rss>'
+    assert confirmed_activity_time(parse_feed(raw, 'https://example.com/feed')[0]) is None
+    html = b'<html><head><meta property="article:published_time" content="2026-10-19"></head><body><article><h1>New article with unknown hour</h1><p>This is article content that contains sufficient text for the monitored news adapter to retain the article.</p></article></body></html>'
+    post = parse_html_article(Page('https://example.com/date', html, 'text/html'), 'Fallback title')
+    assert post is not None and confirmed_activity_time(post) is None
 
 
 async def prepare(sessions, now, phase='manual'):

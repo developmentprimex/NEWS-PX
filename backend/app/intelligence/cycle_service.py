@@ -123,9 +123,10 @@ async def trial_owns_source(db, source_id, now):
         BrightDataExecution.state.in_(['reserved', 'running', 'retry', 'uncertain'])).limit(1)))
 
 
-async def dispatch_cycle_source(db, row_id, now):
+async def dispatch_cycle_source(db, row_id, now, *, allow_new_requests=True, clock=None):
     from app.intelligence.collection import check_source, protected_linkedin_check
     row = await db.get(CollectionCycleSource, row_id)
+    now = clock() if clock else now
     if row.state in TERMINAL:
         return row.state
     source = await db.get(NewsSource, row.source_id)
@@ -138,15 +139,22 @@ async def dispatch_cycle_source(db, row_id, now):
         await db.commit()
         return row.state
     if source.pending_execution_id and source.pending_execution_id != row.execution_id:
-        await protected_linkedin_check(db, source, now, reason='trial-poll')
+        owner = await db.scalar(select(CollectionCycleSource).where(
+            CollectionCycleSource.execution_id == source.pending_execution_id).limit(1))
+        await protected_linkedin_check(db, source, now, reason='trial-poll',
+                                       cycle_source_id=owner.id if owner else None, clock=clock)
         return 'pending'
+    if not row.execution_id and not allow_new_requests:
+        row.state, row.coverage_warning = 'blocked', 'Fresh billing verification failed; no new request was authorized.'
+        await db.commit()
+        return row.state
     if not row.execution_id:
         point = await latest_verified_checkpoint(db, source.id)
         if point and row.window_start < point <= row.window_end:
             row.window_start, row.verified_start = point, True
         await db.commit()
     if row.type == 'LINKEDIN':
-        result = await protected_linkedin_check(db, source, now, cycle_source_id=row.id)
+        result = await protected_linkedin_check(db, source, now, cycle_source_id=row.id, clock=clock)
         await db.refresh(row)
         execution = await db.get(BrightDataExecution, row.execution_id) if row.execution_id else None
         if execution and execution.state in {'failed', 'uncertain'}:
@@ -154,11 +162,16 @@ async def dispatch_cycle_source(db, row_id, now):
         elif result in {'paused', 'unavailable'} and row.state not in TERMINAL:
             row.state, row.coverage_warning = 'blocked', source.linkedin_paused_reason or source.last_error or 'Collection is unavailable.'
     else:
-        result = await check_source(db, source.id, force=True, now=now)
+        result = await check_source(db, source.id, force=True, now=clock() if clock else now,
+                                    expected_identity=(row.type, row.canonical_url), strict_times=True)
         if result == 'completed':
             row.state, row.coverage_confirmed, row.completed_at = 'completed', True, now
         elif result in {'error', 'paused', 'unavailable'}:
             row.state, row.coverage_warning = 'failed', 'Source check did not complete.'
+        elif result == 'identity-changed':
+            row.state, row.coverage_warning = 'blocked', 'Source identity changed before collection.'
+        elif result == 'partial':
+            row.state, row.coverage_warning = 'partial', 'Publication times are unverified; interval coverage is incomplete.'
     await db.commit()
     return row.state
 
@@ -179,9 +192,29 @@ async def capture_phase_usage(db, cycle, when, now):
         return False
 
 
-async def run_collection_trial_cycle(now=None):
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+async def run_collection_trial_reports(now=None):
+    """Separate scheduler job: a long source check cannot hold the report deadline."""
     from app.intelligence import collection
-    now = now or datetime.now(timezone.utc)
+    from app.intelligence.cycle_digest import process_trial_digest
+    now = now or utc_now()
+    async with collection.SessionLocal() as db:
+        if trial_active(await trial_configuration(db), now) and now.astimezone(ZONE).time() >= time(21):
+            cycle = await ensure_cycle(db, phase='evening', now=now)
+            await freeze_inventory(db, cycle)
+        ids = list(await db.scalars(select(CollectionCycle.id).where(CollectionCycle.phase == 'evening')))
+    for cid in ids:
+        async with collection.SessionLocal() as db:
+            await process_trial_digest(db, cid, now)
+
+
+async def run_collection_trial_cycle(now=None, *, clock=None):
+    from app.intelligence import collection
+    clock = clock or ((lambda: now) if now is not None else utc_now)
+    now = clock()
     if not settings.NEWS_ENABLE_COLLECTION:
         return
     async with collection.engine.connect() as lock:
@@ -196,15 +229,14 @@ async def run_collection_trial_cycle(now=None):
                 cycles = list(await db.scalars(select(CollectionCycle).order_by(CollectionCycle.cutoff_at)))
             for cycle in cycles:
                 async with collection.SessionLocal() as db:
-                    if not await capture_phase_usage(db, cycle, 'before', now):
-                        continue
+                    billing_verified = await capture_phase_usage(db, cycle, 'before', clock())
                 async with collection.SessionLocal() as db:
                     ids = list(await db.scalars(select(CollectionCycleSource.id).where(
                         CollectionCycleSource.cycle_id == cycle.id, CollectionCycleSource.state.not_in(TERMINAL))))
                 for row_id in ids:
                     async with collection.SessionLocal() as db:
                         try:
-                            await dispatch_cycle_source(db, row_id, now)
+                            await dispatch_cycle_source(db, row_id, clock(), allow_new_requests=billing_verified, clock=clock)
                         except Exception:
                             await db.rollback()
                             row = await db.get(CollectionCycleSource, row_id)
@@ -215,16 +247,16 @@ async def run_collection_trial_cycle(now=None):
                     status = await cycle_status(db, cycle.id)
                     if not status['pending']:
                         stored = await db.get(CollectionCycle, cycle.id)
-                        stored.state, stored.finished_at = 'finished', stored.finished_at or now
+                        stored.state, stored.finished_at = 'finished', stored.finished_at or clock()
                         await db.commit()
-                    if not status['pending'] or now >= cycle.deadline_at:
-                        await capture_phase_usage(db, cycle, 'after', now)
+                    if not status['pending'] or clock() >= cycle.deadline_at:
+                        await capture_phase_usage(db, cycle, 'after', clock())
                 if cycle.phase == 'evening':
                     from app.intelligence.cycle_digest import process_trial_digest
                     async with collection.SessionLocal() as db:
-                        await process_trial_digest(db, cycle.id, now)
+                        await process_trial_digest(db, cycle.id, clock())
             async with collection.SessionLocal() as db:
                 from app.intelligence.trial_usage import record_settled_usage
-                await record_settled_usage(db, now)
+                await record_settled_usage(db, clock())
         finally:
             await lock.execute(text('SELECT pg_advisory_unlock(:key)'), {'key': key})

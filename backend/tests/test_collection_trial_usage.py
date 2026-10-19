@@ -157,3 +157,31 @@ def test_month_rollover_does_not_subtract_incomparable_usage(database):
             assert summary['providerDeltaRecords'] is None
             assert summary['attribution'] == 'incomparable' and summary['provisional']
     asyncio.run(run())
+
+
+def test_normal_next_day_usage_cannot_be_final_trial_cost(database):
+    from app.intelligence.collection_cycles import TrialUsageObservation
+    _, sessions = database
+    async def run():
+        async with sessions() as db:
+            db.add(AppMetadata(key=TRIAL_KEY, value=json.dumps({'date': '2026-10-19'})))
+            cycle = CollectionCycle(trial_date=NOW.date(), phase='evening', cutoff_at=NOW,
+                deadline_at=NOW+timedelta(minutes=30), state='finished')
+            db.add(cycle)
+            await db.commit()
+            binding, responses = fixture()
+            evidence = service.parse_billing_proof({'credentialSha256': binding['credentialSha256'],
+                'responses': {k: {'status': 200, 'data': v} for k, v in responses.items()}}, binding, NOW)
+            await service.record_usage_observation(db, label='baseline', evidence=evidence, now=NOW)
+            db.add(BrightDataExecution(source_id=uuid4(), started_at=NOW+timedelta(days=1),
+                completed_at=NOW+timedelta(days=1, minutes=1), budget_month='2026-10', trigger_reason='scheduled-day',
+                endpoint='mock', dataset_id='mock', start_date=NOW.date(), end_date=NOW.date(), record_limit=6,
+                estimated_billable_usage=6, state='completed', snapshot_id='sd_nextday'))
+            await db.commit()
+            nextday = NOW+timedelta(days=1, hours=1)
+            last = {**evidence, 'usage_as_of': nextday.isoformat(), 'billable_records': 7}
+            await service.record_usage_observation(db, label='after_evening', evidence=last, now=nextday)
+            summary = await service.trial_usage_summary(db, NOW.date())
+            assert summary['attribution'] == 'uncertain'
+            assert summary['provisional'] is True
+    asyncio.run(run())

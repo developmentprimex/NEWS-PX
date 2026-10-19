@@ -7,7 +7,7 @@ The trial is disabled until an operator explicitly activates it. Deployment alon
 - Production root: `E:\websites\news-intelligence`; API loopback 8001; frontend 3101; public origin `https://news.primexeu.com`.
 - Preserve API/Web boot and retry definitions, the hourly GET-only billing task and the disabled inert legacy sync task. Touch no unrelated service or application.
 - Use the current ACL-restricted private launcher, its normalized backend manifest and the retained rollback configuration. The checked-in start script is not sufficient evidence of the actual launch context.
-- Retain sources, posts, analyses, reading/saved state, subscriptions, old execution reservations, canary approvals and account/source pause latches. The four cycle/usage tables are additive. No production restore, ledger reset or inferred full-day coverage is part of this change.
+- Retain sources, posts, analyses, reading/saved state, subscriptions, old execution reservations, canary approvals and account/source pause latches. The four cycle/usage tables and `intelligence_items.publication_time_verified` are additive. Existing items default to unverified precision; date-only or timezone-unknown input must not be inferred as a known hour. No production restore, ledger reset or inferred full-day coverage is part of this change.
 
 ## Verify and release the candidate
 
@@ -48,7 +48,7 @@ After activation, the user clicks **Check for updates** once. The cutoff is serv
 
 At local 21:00 the worker starts the evening phase. Each source uses its successful morning checkpoint; without one it uses the last proven checkpoint. Missing historical proof is explicitly labelled and uses the bounded startup horizon. It never treats a click, a partial snapshot or a legacy migrated wall-clock watermark as successful coverage. An earlier pending snapshot is polled under its original execution, not replaced or retriggered.
 
-The evening report waits until source work finishes, up to 21:30. It includes only confirmed activity time in each source's `(start, 21:00]` interval, including results stored after 21:00. Unknown repost times are excluded from the confirmed interval and counted as unknown in the feed. Failed/partial/pending sources are labelled. Provider date filtering may repeat morning rows and consume credits despite local deduplication; saturation at six retains existing safeguards and is not automatically backfilled.
+The evening report has a separate scheduler job and waits until source work finishes, up to 21:30. Slow collection or failed billing reads do not block the deadline report; billing failures gate new spending while existing snapshots may be polled. The report includes only confirmed activity time in each source's `(start, 21:00]` interval, including results stored after 21:00. Unknown repost times and date-only/zone-unknown publication values are excluded from the confirmed interval and counted as unknown in the feed. Failed/partial/pending sources are labelled. Provider date filtering may repeat morning rows and consume credits despite local deduplication; saturation at six retains existing safeguards and is not automatically backfilled.
 
 The report is claimed durably before SMTP. A successful report is sent once for the date/recipient. A crash or uncertain SMTP outcome requires private verification; do not reset the claim or blindly resend. Missing configuration or changed recipient must be resolved without creating another paid phase.
 

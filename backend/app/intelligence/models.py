@@ -59,6 +59,7 @@ class NewsItem(Base):
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     original_text: Mapped[str | None] = mapped_column(Text)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    publication_time_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text('false'))
     image_url: Mapped[str | None] = mapped_column(String(2000))
     content_hash: Mapped[str | None] = mapped_column(String(64))
     linkedin_data: Mapped[dict | None] = mapped_column(JSONB)

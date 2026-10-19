@@ -44,7 +44,7 @@ def test_morning_to_evening_fetch_storage_billing_and_single_report(database, mo
         afternoon = clock['now'].hour >= 19
         return [CollectedNewsItem(external_id='rss-pm' if afternoon else 'rss-am', url='https://example.com/'+('pm' if afternoon else 'am'),
             title='Afternoon RSS' if afternoon else 'Morning RSS', original_text='Test news',
-            published_at=morning+timedelta(hours=8) if afternoon else morning-timedelta(minutes=1))]
+            published_at=morning+timedelta(hours=8) if afternoon else morning-timedelta(minutes=1), publication_time_verified=True)]
     monkeypatch.setattr(collection.RSSAdapter, 'collect', rss)
     sent = []
     async def send(*content): sent.append(content)

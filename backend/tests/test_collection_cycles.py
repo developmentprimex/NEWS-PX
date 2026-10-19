@@ -120,3 +120,17 @@ def test_evening_slot_tracks_dst_and_additive_tables_survive_restart(database, n
             assert (await db.get(CollectionCycle, cid)).id == cid
             assert (await db.get(AppMetadata, TRIAL_KEY)).value
     asyncio.run(run())
+
+
+def test_precision_migration_never_invents_evidence_for_existing_items(database):
+    from sqlalchemy import text
+    from app.intelligence.collection_cycles import migrate_trial_schema
+    engine, sessions = database
+    async def run():
+        async with engine.begin() as connection:
+            await connection.execute(text('ALTER TABLE intelligence_items DROP COLUMN publication_time_verified'))
+            await migrate_trial_schema(connection)
+            await migrate_trial_schema(connection)
+            default = await connection.scalar(text("SELECT column_default FROM information_schema.columns WHERE table_name='intelligence_items' AND column_name='publication_time_verified'"))
+            assert default == 'false'
+    asyncio.run(run())
