@@ -5,13 +5,12 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import ParseResult, unquote, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
 
 from app.intelligence.models import NewsSource
-from app.intelligence.linkedin_identity import identity_or_none
 from app.intelligence.services import CollectedNewsItem
 
 API_BASE = "https://api.brightdata.com/datasets/v3/"
@@ -39,13 +38,23 @@ def discovery_request(dataset_id, source, start_date, end_date, limit=6):
             "limit_per_input": limit, "include_errors": "true", "notify": "false"}, [body]
 
 
-def _post_url(value: object) -> str | None:
+def _linkedin_parts(value: object) -> ParseResult | None:
     if not isinstance(value, str):
         return None
-    parsed = urlparse(value)
-    if parsed.scheme != "https" or not parsed.hostname or not (
-        parsed.hostname == "linkedin.com" or parsed.hostname.endswith(".linkedin.com")
-    ):
+    try:
+        parsed = urlparse(value)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                or parsed.port is not None or not (
+                    parsed.hostname == "linkedin.com" or parsed.hostname.endswith(".linkedin.com"))):
+            return None
+    except ValueError:
+        return None
+    return parsed
+
+
+def _post_url(value: object) -> str | None:
+    parsed = _linkedin_parts(value)
+    if parsed is None:
         return None
     if not (parsed.path.startswith("/posts/") or parsed.path.startswith("/feed/update/")):
         return None
@@ -56,46 +65,42 @@ def _reposter(record: dict) -> object:
     return record.get("reposted_by") or record.get("shared_by")
 
 
-def _profile_id(value: object) -> str | None:
+def _actor_id(value: object, kind: str) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
     if "://" not in value:
-        return value.strip().casefold()
-    parsed = urlparse(value)
-    path = parsed.path.strip("/").split("/")
-    if parsed.scheme == "https" and parsed.hostname and (
-        parsed.hostname == "linkedin.com" or parsed.hostname.endswith(".linkedin.com")
-    ) and not parsed.username and not parsed.password and len(path) == 2 and path[0] == "in":
+        return unquote(value.strip()).casefold()
+    parsed = _linkedin_parts(value)
+    if parsed is None:
+        return None
+    path = unquote(parsed.path).strip("/").split("/")
+    if len(path) == 2 and path[0] == kind:
         return path[1].casefold()
     return None
 
 
 def _belongs_to_source(record: dict, source: NewsSource) -> bool:
-    source_path = urlparse(getattr(source, "url", "")).path.strip("/").split("/")
-    if len(source_path) >= 2 and source_path[0] == "company" and _reposter(record):
-        reposter = _reposter(record)
-        if isinstance(reposter, dict):
-            reposter = reposter.get("url") or reposter.get("company_url") or reposter.get("user_url") or reposter.get("user_id")
-        if isinstance(reposter, str) and "://" in reposter:
-            return identity_or_none(reposter) == identity_or_none(source.url)
-        return isinstance(reposter, str) and reposter.casefold() == source_path[1].casefold()
-    if len(source_path) < 2 or source_path[0] != "in":
+    source_path = unquote(urlparse(getattr(source, "url", "")).path).strip("/").split("/")
+    if len(source_path) < 2 or source_path[0] not in {"in", "company"}:
         return True
-    profile_id = source_path[1].casefold()
+    kind, source_id = source_path[0], source_path[1].casefold()
     reposter = _reposter(record)
-    if isinstance(reposter, dict):
-        reposter = reposter.get("url") or reposter.get("user_url") or reposter.get("user_id")
-    if _profile_id(reposter) == profile_id:
-        return True
+    # Explicit share attribution identifies the activity's actor. Matching the
+    # original author must never turn another account's share into our repost.
+    if reposter:
+        if isinstance(reposter, dict):
+            reposter = (reposter.get("url") or reposter.get("company_url")
+                        or reposter.get("user_url") or reposter.get("user_id"))
+        return _actor_id(reposter, kind) == source_id
+    if kind == "company":
+        # Some company-discovery records omit author identifiers. Where the
+        # provider supplies one, do not attribute a different company's post.
+        company_url = record.get("company_url")
+        return not company_url or _actor_id(company_url, kind) == source_id
     author_id = record.get("user_id")
     if isinstance(author_id, str) and author_id:
-        return author_id.casefold() == profile_id
-    author_url = record.get("use_url") or record.get("user_url")
-    if isinstance(author_url, str):
-        author_path = urlparse(author_url).path.strip("/").split("/")
-        if len(author_path) >= 2 and author_path[0] == "in":
-            return author_path[1].casefold() == profile_id
-    return False
+        return _actor_id(author_id, kind) == source_id
+    return _actor_id(record.get("use_url") or record.get("user_url"), kind) == source_id
 
 
 def _published(value: object) -> datetime | None:
@@ -108,7 +113,7 @@ def _published(value: object) -> datetime | None:
             parsed = parsedate_to_datetime(value)
         except (TypeError, ValueError):
             return None
-    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 
 def _text(value: object, limit: int = 4000) -> str | None:
@@ -123,10 +128,8 @@ def _text(value: object, limit: int = 4000) -> str | None:
 
 
 def _linkedin_url(value: object) -> str | None:
-    if not isinstance(value, str):
-        return None
-    parsed = urlparse(value)
-    if parsed.scheme != "https" or parsed.username or parsed.password or parsed.hostname not in {"linkedin.com", "www.linkedin.com"}:
+    parsed = _linkedin_parts(value)
+    if parsed is None:
         return None
     return urlunparse(("https", "www.linkedin.com", parsed.path, "", parsed.query, ""))[:2000]
 
@@ -202,7 +205,7 @@ def parse_posts(records: object, source: NewsSource) -> list[CollectedNewsItem]:
         if not url or not _belongs_to_source(record, source):
             continue
         body = record.get("post_text") or record.get("text") or record.get("headline") or ""
-        body = " ".join(body.split()) if isinstance(body, str) else ""
+        body = _text(body, 20000) or ""
         activity = _activity(record)
         if activity["kind"] == "REPOST" and _reposter(record):
             # A plain repost can retain the original author's fields and URL.

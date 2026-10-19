@@ -45,6 +45,22 @@ def collection_start_date(last_checked_at: datetime | None, now: datetime) -> st
     return incremental_start(last_checked_at, now).isoformat()
 
 
+def merge_linkedin_activity(previous: dict | None, observed: dict) -> dict:
+    """Missing provider fields are unknown; retain earlier observations."""
+    merged = dict(previous or {})
+    for field, value in observed.items():
+        if value is None:
+            continue
+        if field == "comments" and not value and observed.get("commentCount") != 0:
+            continue
+        if field == "kind" and value == "POST" and merged.get("kind") in {"REPOST", "ARTICLE"}:
+            # POST is also the parser default when activity details are absent.
+            continue
+        merged[field] = value
+    merged["checkedAt"] = observed.get("checkedAt") or datetime.now(timezone.utc).isoformat()
+    return merged
+
+
 async def _store_post(db: AsyncSession, source: NewsSource, post: CollectedNewsItem) -> bool:
     content_hash = hashlib.sha256(post.url.encode("utf-8")).hexdigest()
     existing = await db.scalar(select(NewsItem).where(
@@ -52,7 +68,10 @@ async def _store_post(db: AsyncSession, source: NewsSource, post: CollectedNewsI
         or_(NewsItem.external_id == post.external_id, NewsItem.content_hash == content_hash, NewsItem.url == post.url),
     ).limit(1))
     if existing and source.type == "LINKEDIN" and post.linkedin_data is not None:
-        content_changed = existing.title != post.title or existing.original_text != post.original_text
+        # A sparse engagement-only response must not replace stored text with a
+        # generated title and an empty body.
+        content_changed = (post.original_text is not None or not existing.original_text) and (
+            existing.title != post.title or existing.original_text != post.original_text)
         if content_changed:
             analysis = await analyze_news_item(post, source)
             saved_analysis = await db.get(NewsAnalysis, existing.id)
@@ -68,7 +87,7 @@ async def _store_post(db: AsyncSession, source: NewsSource, post: CollectedNewsI
                 saved_analysis.analyzed_at = datetime.now(timezone.utc)
             existing.title = post.title
             existing.original_text = post.original_text
-        existing.linkedin_data = {**post.linkedin_data, "checkedAt": post.linkedin_data.get("checkedAt") or datetime.now(timezone.utc).isoformat()}
+        existing.linkedin_data = merge_linkedin_activity(existing.linkedin_data, post.linkedin_data)
         if post.published_at:
             existing.published_at = post.published_at
         return False
@@ -236,6 +255,11 @@ async def protected_linkedin_check(db, source, now, *, reason="scheduled", backf
         if not acquired:
             return "pending"
         try:
+            # Another worker may have committed since this session loaded the
+            # source. Read the pending job and schedule again under the lock.
+            await db.refresh(source, with_for_update=True)
+            if source.type != "LINKEDIN" or source.status != "ACTIVE" or identity_or_none(source.url) != identity:
+                return "paused"
             if not await collection_owner(db, source):
                 await db.commit()
                 return "paused"

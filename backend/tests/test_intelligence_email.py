@@ -9,6 +9,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.intelligence.email_service import INTELLIGENCE_RECIPIENT, news_email_content, send_news_email
+from app.intelligence.focus import opportunity_focus_score
 from app.intelligence.priority import news_priority
 from app.intelligence.router import email_item
 
@@ -41,7 +42,10 @@ def _news():
     return item, source, analysis
 
 
-def test_email_contains_direct_link_and_useful_context():
+def test_email_contains_direct_link_and_useful_context(monkeypatch):
+    # This fixture describes an open call as of publication, before its deadline.
+    monkeypatch.setattr("app.intelligence.priority.opportunity_focus_score",
+                        lambda *args: opportunity_focus_score(*args, today=date(2026, 9, 24)))
     subject, body = news_email_content(*_news())
     assert subject == "[News Intelligence] Digital grant for SMEs"
     assert "Grant · High priority" in body

@@ -69,7 +69,8 @@ async def locked_account(db):
     await db.execute(insert(BrightDataAccount).values(
         id=1, provider_active=False, alert_levels=[]
     ).on_conflict_do_nothing(index_elements=[BrightDataAccount.id]))
-    return await db.scalar(select(BrightDataAccount).where(BrightDataAccount.id == 1).with_for_update())
+    return await db.scalar(select(BrightDataAccount).where(BrightDataAccount.id == 1)
+                           .with_for_update().execution_options(populate_existing=True))
 
 
 async def executions_for_budget(db):

@@ -104,13 +104,9 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
             if invalid or uncertain_dates:
                 execution.coverage_warning = "Snapshot contains invalid, unattributed or out-of-window activity; review coverage before resuming."
                 source.linkedin_paused_reason = execution.coverage_warning
-            seen_ids, seen_urls = set(), set()
             for post in posts:
-                if post.external_id in seen_ids or post.url in seen_urls:
-                    execution.duplicate_posts += 1
-                    continue
-                seen_ids.add(post.external_id)
-                seen_urls.add(post.url)
+                # Storage deduplicates identities while refreshing observations.
+                # A repeated row may contain activity missing from the first row.
                 saved = await store_post(db, source, post)
                 if saved:
                     execution.newly_saved_posts += 1
