@@ -16,6 +16,13 @@ from app.intelligence.credit_control import reserve_execution
 from test_brightdata_postgres_integration import Provider, database, private_postgres, source, records
 
 
+@pytest.fixture(autouse=True)
+def mocked_billing_boundary(monkeypatch):
+    from app.intelligence import cycle_service
+    async def observed(*args): return True
+    monkeypatch.setattr(cycle_service, 'capture_phase_usage', observed)
+
+
 def test_manual_phase_and_evening_worker_reuse_checkpoints_across_restart(database, monkeypatch):
     from app.intelligence import cycle_service as service
     from app.intelligence.collection_cycles import CollectionCycle

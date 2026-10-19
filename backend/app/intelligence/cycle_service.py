@@ -163,6 +163,22 @@ async def dispatch_cycle_source(db, row_id, now):
     return row.state
 
 
+async def capture_phase_usage(db, cycle, when, now):
+    from app.intelligence.collection_cycles import TrialUsageObservation
+    from app.intelligence.trial_usage import capture_trial_usage
+    label = f'{when}_{cycle.phase}'
+    if await db.scalar(select(TrialUsageObservation.id).where(TrialUsageObservation.trial_date == cycle.trial_date,
+                                                          TrialUsageObservation.label == label).limit(1)):
+        return True
+    try:
+        await capture_trial_usage(db, label=label, now=now)
+        return True
+    except Exception:
+        await db.rollback()
+        # Missing billing proof blocks spending; no HTTP response/secrets in logs.
+        return False
+
+
 async def run_collection_trial_cycle(now=None):
     from app.intelligence import collection
     now = now or datetime.now(timezone.utc)
@@ -179,6 +195,9 @@ async def run_collection_trial_cycle(now=None):
                     await freeze_inventory(db, cycle)
                 cycles = list(await db.scalars(select(CollectionCycle).order_by(CollectionCycle.cutoff_at)))
             for cycle in cycles:
+                async with collection.SessionLocal() as db:
+                    if not await capture_phase_usage(db, cycle, 'before', now):
+                        continue
                 async with collection.SessionLocal() as db:
                     ids = list(await db.scalars(select(CollectionCycleSource.id).where(
                         CollectionCycleSource.cycle_id == cycle.id, CollectionCycleSource.state.not_in(TERMINAL))))
@@ -198,9 +217,14 @@ async def run_collection_trial_cycle(now=None):
                         stored = await db.get(CollectionCycle, cycle.id)
                         stored.state, stored.finished_at = 'finished', stored.finished_at or now
                         await db.commit()
+                    if not status['pending'] or now >= cycle.deadline_at:
+                        await capture_phase_usage(db, cycle, 'after', now)
                 if cycle.phase == 'evening':
                     from app.intelligence.cycle_digest import process_trial_digest
                     async with collection.SessionLocal() as db:
                         await process_trial_digest(db, cycle.id, now)
+            async with collection.SessionLocal() as db:
+                from app.intelligence.trial_usage import record_settled_usage
+                await record_settled_usage(db, now)
         finally:
             await lock.execute(text('SELECT pg_advisory_unlock(:key)'), {'key': key})
