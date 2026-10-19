@@ -10,23 +10,38 @@ from app.auth import User, get_current_user
 from app.config import settings
 from app.db import get_db
 from app.intelligence.digest_service import ensure_digest_settings, send_digest_test
+from app.intelligence.cycle_service import trial_active, trial_configuration
+from app.intelligence.cycle_digest import recipient_fingerprint
 from app.intelligence.schemas import DigestSettingsInput
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-def _settings_out(digest) -> dict:
+async def _report_credentials(db: AsyncSession, user_id) -> tuple[str, str] | None:
+    if settings.EMAIL_USER and settings.EMAIL_PASSWORD:
+        return settings.EMAIL_USER, settings.EMAIL_PASSWORD
+    if settings.NEWS_TRIAL_EMAIL_USER and settings.NEWS_TRIAL_EMAIL_PASSWORD:
+        config = await trial_configuration(db)
+        if (trial_active(config, datetime.now(timezone.utc))
+                and config.get('user_id') == str(user_id)
+                and config.get('recipient_fingerprint') == recipient_fingerprint(settings.NEWS_EMAIL_RECIPIENT)):
+            return settings.NEWS_TRIAL_EMAIL_USER, settings.NEWS_TRIAL_EMAIL_PASSWORD
+    return None
+
+
+def _settings_out(digest, credentials: tuple[str, str] | None) -> dict:
     return {"times": digest.times, "timezone": "Europe/Budapest", "recipient": settings.NEWS_EMAIL_RECIPIENT,
             "lastSentAt": digest.last_sent_at, "lastError": digest.last_error,
-            "emailConfigured": bool(settings.EMAIL_USER and settings.EMAIL_PASSWORD)}
+            "emailConfigured": credentials is not None}
 
 
 @router.get("/digest-settings")
 async def get_digest_settings(db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)) -> dict:
     digest = await ensure_digest_settings(db, user.id)
+    credentials = await _report_credentials(db, user.id)
     await db.commit()
-    return _settings_out(digest)
+    return _settings_out(digest, credentials)
 
 
 @router.put("/digest-settings")
@@ -35,16 +50,18 @@ async def update_digest_settings(payload: DigestSettingsInput, db: AsyncSession 
     digest = await ensure_digest_settings(db, user.id)
     digest.times = payload.times
     digest.last_slot_at = datetime.now(timezone.utc)
+    credentials = await _report_credentials(db, user.id)
     await db.commit()
-    return _settings_out(digest)
+    return _settings_out(digest, credentials)
 
 
 @router.post("/digest-settings/test", status_code=status.HTTP_204_NO_CONTENT)
-async def test_digest_email(_: User = Depends(get_current_user)) -> Response:
-    if not settings.EMAIL_USER or not settings.EMAIL_PASSWORD:
+async def test_digest_email(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> Response:
+    credentials = await _report_credentials(db, user.id)
+    if credentials is None:
         raise HTTPException(status_code=503, detail="SMTP is not configured on the server.")
     try:
-        await send_digest_test()
+        await send_digest_test(credentials=credentials)
     except Exception as exc:
         logger.exception("Digest test email failed")
         raise HTTPException(status_code=502, detail="Test email failed. Check the SMTP settings and server logs.") from exc
