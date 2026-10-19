@@ -41,6 +41,8 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
                            adapter=None, validate_records=None, cycle_source_id=None):
     source_id = source.id
     execution_id = None
+    if reason == 'trial-poll' and not source.pending_execution_id:
+        return 'pending'
     cycle_row = None
     if cycle_source_id:
         from app.intelligence.collection_cycles import CollectionCycleSource, CollectionCycle, TemporalWindow, provider_dates, confirmed_activity_time

@@ -233,6 +233,9 @@ async def check_due_sources() -> dict[str, int]:
     for source_id in ids:
         try:
             async with SessionLocal() as db:
+                from app.intelligence.cycle_service import trial_owns_source
+                if await trial_owns_source(db, source_id, datetime.now(timezone.utc)):
+                    continue
                 state = await check_source(db, source_id)
             if state in {"started", "completed"}:
                 checked += 1
@@ -258,6 +261,10 @@ async def protected_linkedin_check(db, source, now, *, reason="scheduled", backf
             # Another worker may have committed since this session loaded the
             # source. Read the pending job and schedule again under the lock.
             await db.refresh(source, with_for_update=True)
+            if not cycle_source_id and reason.startswith('scheduled'):
+                from app.intelligence.cycle_service import trial_owns_source
+                if await trial_owns_source(db, source.id, now):
+                    return 'paused'
             if source.type != "LINKEDIN" or source.status != "ACTIVE" or identity_or_none(source.url) != identity:
                 return "paused"
             if not await collection_owner(db, source):
