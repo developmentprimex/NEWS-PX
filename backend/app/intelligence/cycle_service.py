@@ -198,5 +198,9 @@ async def run_collection_trial_cycle(now=None):
                         stored = await db.get(CollectionCycle, cycle.id)
                         stored.state, stored.finished_at = 'finished', stored.finished_at or now
                         await db.commit()
+                if cycle.phase == 'evening':
+                    from app.intelligence.cycle_digest import process_trial_digest
+                    async with collection.SessionLocal() as db:
+                        await process_trial_digest(db, cycle.id, now)
         finally:
             await lock.execute(text('SELECT pg_advisory_unlock(:key)'), {'key': key})
