@@ -207,6 +207,9 @@ def parse_posts(records: object, source: NewsSource) -> list[CollectedNewsItem]:
         body = record.get("post_text") or record.get("text") or record.get("headline") or ""
         body = _text(body, 20000) or ""
         activity = _activity(record)
+        activity_time = _published(record.get("date_posted") or record.get("published_at"))
+        activity['activityAt'] = activity_time.isoformat() if activity_time and activity['kind'] != 'REPOST' else None
+        activity['activityTimeEvidence'] = 'post-publication' if activity['activityAt'] else 'unknown'
         if activity["kind"] == "REPOST" and _reposter(record):
             # A plain repost can retain the original author's fields and URL.
             # The monitored account is the reposter, not the original author.

@@ -38,9 +38,32 @@ def finish(execution, now, state, error=None):
 
 
 async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", backfill=None,
-                           adapter=None, validate_records=None):
+                           adapter=None, validate_records=None, cycle_source_id=None):
     source_id = source.id
     execution_id = None
+    cycle_row = None
+    if cycle_source_id:
+        from app.intelligence.collection_cycles import CollectionCycleSource, CollectionCycle, TemporalWindow, provider_dates, confirmed_activity_time
+        from app.intelligence.cycle_service import trial_configuration, trial_active, TERMINAL
+        from app.intelligence.linkedin_identity import identity_or_none
+        cycle_row = await db.get(CollectionCycleSource, cycle_source_id)
+        cycle = await db.get(CollectionCycle, cycle_row.cycle_id) if cycle_row else None
+        if (not cycle or cycle_row.source_id != source.id or cycle_row.type != source.type
+                or identity_or_none(source.url) != cycle_row.canonical_url):
+            return 'paused'
+        if cycle_row.state in TERMINAL:
+            return 'completed'
+        if cycle_row.execution_id and source.pending_execution_id != cycle_row.execution_id:
+            # A completed/uncertain execution is never replaced by a second POST.
+            previous = await db.get(BrightDataExecution, cycle_row.execution_id)
+            cycle_row.state = previous.state if previous and previous.state in TERMINAL else 'uncertain'
+            await db.commit()
+            return 'completed'
+        if not cycle_row.execution_id and not trial_active(await trial_configuration(db), now):
+            return 'paused'
+        if source.pending_execution_id and not cycle_row.execution_id:
+            return 'pending'
+        reason = f'trial:{cycle.phase}:{cycle.id}'
     if not settings.BRIGHTDATA_API_TOKEN:
         return "unavailable"
     if not settings.NEWS_ENABLE_COLLECTION or not settings.NEWS_LINKEDIN_FETCH_ENABLED:
@@ -150,14 +173,23 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
             source.last_error = source.linkedin_paused_reason or safe_errors or execution.coverage_warning
             source.pending_snapshot_id = source.pending_execution_id = None
             finish(execution, datetime.now(timezone.utc), "partial" if errors or saturated or invalid or uncertain_dates else "completed", safe_errors)
+            if cycle_row:
+                known_times = all(confirmed_activity_time(post) is not None for post in posts)
+                cycle_row.coverage_confirmed = execution.state == 'completed' and known_times
+                cycle_row.state = 'completed' if cycle_row.coverage_confirmed else 'partial'
+                cycle_row.coverage_warning = source.last_error or (None if known_times else 'Activity time is unverified; interval coverage is incomplete.')
+                cycle_row.completed_at = execution.completed_at
             account = await locked_account(db)
             record_alerts(account, usage_totals(account, await executions_for_budget(db), now))
             await db.commit()
             return "error" if errors else "completed"
-        if not backfill and not is_due(source, now):
+        if not backfill and not cycle_row and not is_due(source, now):
             return "pending"
         execution_reason = reason
-        if backfill:
+        if cycle_row:
+            start, end = provider_dates(TemporalWindow(cycle_row.window_start, cycle_row.window_end, cycle_row.verified_start))
+            limit = settings.NEWS_LINKEDIN_RECORD_LIMIT
+        elif backfill:
             start, end, limit = backfill
         elif reason.startswith("scheduled"):
             covered_through, first_attempt = (await db.execute(select(
@@ -174,7 +206,7 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
         else:
             start, end, limit = incremental_start(source.last_successful_fetch_at, now), now.date(), settings.NEWS_LINKEDIN_RECORD_LIMIT
         execution = await reserve_execution(db, source, now, start, end,
-            reason=execution_reason, limit=limit)
+            reason=execution_reason, limit=limit, cycle_source_id=cycle_source_id)
         if not execution:
             return "paused"
         execution_id = execution.id
@@ -182,6 +214,8 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
         source.pending_snapshot_id = execution.snapshot_id = snapshot
         source.last_error = None
         execution.state = "running"
+        if cycle_row:
+            cycle_row.state = 'running'
         await db.commit()
         return "started"
     except Exception as exc:

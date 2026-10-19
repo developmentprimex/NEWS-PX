@@ -241,7 +241,7 @@ async def check_due_sources() -> dict[str, int]:
     return {"checked": checked}
 
 
-async def protected_linkedin_check(db, source, now, *, reason="scheduled", backfill=None):
+async def protected_linkedin_check(db, source, now, *, reason="scheduled", backfill=None, cycle_source_id=None):
     if not settings.NEWS_ENABLE_COLLECTION:
         return "paused"
     # Dedicated connection holds a session advisory lock through every commit.
@@ -263,6 +263,7 @@ async def protected_linkedin_check(db, source, now, *, reason="scheduled", backf
             if not await collection_owner(db, source):
                 await db.commit()
                 return "paused"
-            return await collect_linkedin(db, source, now, _store_post, reason=reason, backfill=backfill)
+            return await collect_linkedin(db, source, now, _store_post, reason=reason, backfill=backfill,
+                                          cycle_source_id=cycle_source_id)
         finally:
             await connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})
