@@ -118,7 +118,94 @@ async def check(sessions, source_id, force=False):
 
 def records(count=1):
     return [{"id": str(42 + n), "url": f"https://www.linkedin.com/posts/example_activity-{42+n}-abc",
-             "post_text": "New update", "date_posted": datetime.now(timezone.utc).isoformat()} for n in range(count)]
+             "post_text": "New update", "date_posted": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()} for n in range(count)]
+
+
+def test_daily_request_covers_yesterday_only_and_remembers_the_completed_day(database, monkeypatch):
+    _, sessions = database
+    import json
+    now = datetime.now(timezone.utc)
+    day = (now - timedelta(days=1)).date()
+    provider = Provider(monkeypatch, [{**records()[0], "date_posted": f"{day}T12:00:00Z"}])
+    async def run():
+        sid = await source(sessions, last_successful_fetch_at=now - timedelta(days=60))
+        assert await check(sessions, sid) == "started"
+        payload = json.loads(provider.triggers[0].content)[0]
+        assert payload["start_date"] == payload["end_date"] == day.isoformat()
+        assert await check(sessions, sid) == "completed"
+        async with sessions() as db:
+            execution = (await db.scalars(select(BrightDataExecution))).one()
+            assert execution.state == "completed" and execution.start_date == execution.end_date == day
+            assert execution.trigger_reason == "scheduled-day"
+            # A restart or an edited eligibility timestamp must not buy the same day twice.
+            row = await db.get(NewsSource, sid)
+            row.last_started_at -= timedelta(days=2)
+            await db.commit()
+        assert await check(sessions, sid) == "pending"
+        assert len(provider.triggers) == 1
+    asyncio.run(run())
+
+
+def test_daily_checkpoint_uses_ledger_day_not_wall_clock_or_legacy_watermark(database, monkeypatch):
+    _, sessions = database
+    import json
+    now = datetime.now(timezone.utc)
+    day = (now - timedelta(days=2)).date()
+    provider = Provider(monkeypatch)
+    async def run():
+        sid = await source(sessions, last_successful_fetch_at=now)
+        async with sessions() as db:
+            db.add(BrightDataExecution(source_id=sid, started_at=now-timedelta(days=1),
+                budget_month=now.strftime("%Y-%m"), endpoint="mock", dataset_id="mock",
+                start_date=day, end_date=day, trigger_reason="scheduled-day", record_limit=6,
+                estimated_billable_usage=6, state="completed"))
+            # Partial, reconciled and historical runs never certify a daily date.
+            for reason, state in [("scheduled-day", "partial"), ("scheduled-day", "reconciled"),
+                                  ("backfill:test", "completed"), ("scheduled", "completed")]:
+                db.add(BrightDataExecution(source_id=sid, started_at=now,
+                    budget_month=now.strftime("%Y-%m"), endpoint="mock", dataset_id="mock",
+                    start_date=now.date(), end_date=now.date(), trigger_reason=reason,
+                    record_limit=6, estimated_billable_usage=6, state=state))
+            await db.commit()
+        assert await check(sessions, sid) == "started"
+        body = json.loads(provider.triggers[0].content)[0]
+        assert body["start_date"] == body["end_date"] == (now-timedelta(days=1)).date().isoformat()
+    asyncio.run(run())
+
+
+def test_twenty_profiles_three_posts_two_reposts_fit_daily_budget(database, monkeypatch):
+    _, sessions = database
+    import json
+    from collections import Counter
+    day = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+    provider = Provider(monkeypatch)
+    async def run():
+        for n in range(20):
+            url = f"https://www.linkedin.com/in/daily-profile-{n}/"
+            provider.records = [{
+                "id": str(10000 + n*10 + k),
+                "url": f"https://www.linkedin.com/posts/activity-{10000+n*10+k}-x",
+                "user_id": f"daily-profile-{n}" if k < 3 else "original-author",
+                "post_type": "post" if k < 3 else "repost",
+                **({"reposted_by": url} if k >= 3 else {}),
+                "post_text": "Daily update", "date_posted": f"{day}T12:00:00Z",
+            } for k in range(5)]
+            sid = await source(sessions, url=url)
+            assert await check(sessions, sid) == "started"
+            assert await check(sessions, sid) == "completed"
+        async with sessions() as db:
+            runs = list(await db.scalars(select(BrightDataExecution)))
+            items = list(await db.scalars(select(NewsItem)))
+            assert len(runs) == 20 and all(r.state == "completed" and r.returned_records == 5 for r in runs)
+            assert all(r.start_date == r.end_date == day for r in runs)
+            assert len(items) == 100
+            assert Counter(i.linkedin_data["kind"] for i in items) == {"POST": 60, "REPOST": 40}
+            totals = await budget_status(db)
+            assert totals["dailyRecords"] == 120 and totals["effectiveRecords"] == 120
+            assert not totals["pausedReason"]
+        assert len(provider.triggers) == 20
+        assert all(json.loads(r.content)[0]["start_date"] == json.loads(r.content)[0]["end_date"] == day.isoformat() for r in provider.triggers)
+    asyncio.run(run())
 
 
 def test_repeated_results_deduplicate_and_preserve_read_state(database, monkeypatch):
@@ -132,10 +219,14 @@ def test_repeated_results_deduplicate_and_preserve_read_state(database, monkeypa
         async with sessions() as db:
             item = (await db.scalars(select(NewsItem))).one()
             db.add(NewsUserState(user_id=uuid4(), news_item_id=item.id, saved_at=datetime.now(timezone.utc)))
-            row = await db.get(NewsSource, sid)
-            row.last_started_at -= timedelta(days=1)
             await db.commit()
-        assert await check(sessions, sid) == "started"
+        # A deliberate operator backfill may revisit stored posts; routine daily
+        # collection must not buy the same already completed date again.
+        async with sessions() as db:
+            row = await db.get(NewsSource, sid)
+            day = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+            assert await collection.protected_linkedin_check(db, row, datetime.now(timezone.utc),
+                reason="backfill:TEST-READ-STATE", backfill=(day, day, 6)) == "started"
         assert await check(sessions, sid) == "completed"
         async with sessions() as db:
             assert len((await db.scalars(select(NewsItem))).all()) == 1
@@ -179,6 +270,8 @@ def test_zero_results_keep_usage_reservation(database, monkeypatch):
             run = (await db.scalars(select(BrightDataExecution))).one()
             row = await db.get(NewsSource, sid)
             assert run.returned_records == 0 and run.estimated_billable_usage == 6
+            assert run.state == "completed" and run.trigger_reason == "scheduled-day"
+            assert run.start_date == run.end_date == (run.started_at - timedelta(days=1)).date()
             assert row.last_successful_fetch_at == run.started_at and row.empty_fetch_streak == 1
     asyncio.run(run())
 
@@ -587,8 +680,8 @@ def test_additive_migration_on_legacy_source_schema(database):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("provider_used,expected", [(0, "started"), (3990, "paused")])
-def test_high_priority_extra_requires_monthly_headroom(database, monkeypatch, provider_used, expected):
+@pytest.mark.parametrize("provider_used", [0, 3990])
+def test_priority_flag_cannot_purchase_a_second_daily_check(database, monkeypatch, provider_used):
     _, sessions = database
     monkeypatch.setattr(settings, "NEWS_LINKEDIN_HIGH_PRIORITY_EXTRA", True)
     provider = Provider(monkeypatch)
@@ -599,10 +692,6 @@ def test_high_priority_extra_requires_monthly_headroom(database, monkeypatch, pr
             account = await db.get(BrightDataAccount, 1)
             account.provider_billable_records = provider_used
             await db.commit()
-        assert await check(sessions, sid) == expected
-        assert len(provider.triggers) == int(expected == "started")
-        if expected == "started":
-            async with sessions() as db:
-                execution = (await db.scalars(select(BrightDataExecution))).one()
-                assert execution.trigger_reason == "scheduled-extra"
+        assert await check(sessions, sid) == "pending"
+        assert provider.triggers == []
     asyncio.run(run())

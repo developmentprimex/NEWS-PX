@@ -120,7 +120,7 @@ async def reserve_execution(db, source, now, start_date, end_date, *, reason="sc
         estimated_billable_usage=limit, state="reserved", newly_saved_posts=0,
         duplicate_posts=0, ignored_records=0, retry_count=0,
         coverage_warning=(f"Routine window starts {start_date}; older dates require an authorized backfill."
-            if reason.startswith("scheduled") and source.last_successful_fetch_at
+            if reason.startswith("scheduled") and reason != "scheduled-day" and source.last_successful_fetch_at
             and start_date > source.last_successful_fetch_at.date() - timedelta(days=1) else None),
     )
     db.add(execution)

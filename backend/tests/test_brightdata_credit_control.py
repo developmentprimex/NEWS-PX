@@ -24,16 +24,16 @@ def execution(usage=6, **kwargs):
     return NS(**{**data, **kwargs})
 
 
-def test_default_interval_and_adaptive_backoff(monkeypatch):
+def test_daily_interval_ignores_empty_streak_and_extra_flag(monkeypatch):
     source = NS(empty_fetch_streak=0, priority="HIGH", last_new_posts=2, fetch_interval_minutes=5)
     assert interval_minutes(source) == 1440
     source.empty_fetch_streak = 7
-    assert interval_minutes(source) == 4320
+    assert interval_minutes(source) == 1440
     source.empty_fetch_streak = 14
-    assert interval_minutes(source) == 10080
+    assert interval_minutes(source) == 1440
     source.empty_fetch_streak = 0
     monkeypatch.setattr(credit.settings, "NEWS_LINKEDIN_HIGH_PRIORITY_EXTRA", True)
-    assert interval_minutes(source, extra=True) == 720
+    assert interval_minutes(source, extra=True) == 1440
     source.last_new_posts = 0
     assert interval_minutes(source, extra=True) == 1440
 
