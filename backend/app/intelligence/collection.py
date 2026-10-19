@@ -181,7 +181,7 @@ async def _check_rss_source(db: AsyncSession, source: NewsSource, now: datetime,
     return "completed"
 
 
-async def check_source(db: AsyncSession, source_id: uuid.UUID, *, force: bool = False) -> str:
+async def check_source(db: AsyncSession, source_id: uuid.UUID, *, force: bool = False, now: datetime | None = None) -> str:
     source = (await db.execute(
         select(NewsSource).where(NewsSource.id == source_id).with_for_update(skip_locked=True)
     )).scalar_one_or_none()
@@ -192,7 +192,7 @@ async def check_source(db: AsyncSession, source_id: uuid.UUID, *, force: bool = 
     if source.status != "ACTIVE":
         raise LinkedInCollectionError("Activate this source before checking it.")
 
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     try:
         if source.type == "WEBSITE":
             return await _check_website_source(db, source, now, force)

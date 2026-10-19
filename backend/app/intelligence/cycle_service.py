@@ -154,7 +154,7 @@ async def dispatch_cycle_source(db, row_id, now):
         elif result in {'paused', 'unavailable'} and row.state not in TERMINAL:
             row.state, row.coverage_warning = 'blocked', source.linkedin_paused_reason or source.last_error or 'Collection is unavailable.'
     else:
-        result = await check_source(db, source.id, force=True)
+        result = await check_source(db, source.id, force=True, now=now)
         if result == 'completed':
             row.state, row.coverage_confirmed, row.completed_at = 'completed', True, now
         elif result in {'error', 'paused', 'unavailable'}:
