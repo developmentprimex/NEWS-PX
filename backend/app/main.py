@@ -12,6 +12,7 @@ from app.config import settings
 from app.db import AppMetadata, Base, SessionLocal, engine
 from app.import_primeflow import import_export
 from app.intelligence import models  # noqa: F401 - registers isolated tables
+from app.intelligence import collection_cycles  # noqa: F401 - additive trial tables
 from app.intelligence.collection import check_due_sources
 from app.intelligence.credit_migration import migrate_credit_controls
 from app.intelligence.company_sources import ensure_company_sources, ensure_personal_activity_source
