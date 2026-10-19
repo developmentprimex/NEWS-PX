@@ -90,13 +90,26 @@ def record_alerts(account, totals):
     account.alert_levels = sorted(levels)
 
 
-async def reserve_execution(db, source, now, start_date, end_date, *, reason="scheduled", limit=None, cycle_source_id=None):
+async def reserve_execution(db, source, now, start_date, end_date, *, reason="scheduled", limit=None, cycle_source_id=None, dataset_id=None):
     limit = limit or settings.NEWS_LINKEDIN_RECORD_LIMIT
     account = await locked_account(db)
     executions = await executions_for_budget(db)
     totals = usage_totals(account, executions, now)
     record_alerts(account, totals)
     denial = denial_reason(account, totals, now, limit)
+    if source.type == 'FACEBOOK':
+        from app.intelligence.facebook_adapter import dataset_for
+        from app.intelligence.facebook_identity import source_approved
+        from app.intelligence.facebook_adapter import PAGE_DATASET, GROUP_DATASET
+        facebook = [e for e in executions if e.dataset_id in {PAGE_DATASET, GROUP_DATASET}]
+        if not settings.NEWS_FACEBOOK_FETCH_ENABLED or not source_approved(source):
+            denial = 'Facebook source is outside the activated pilot.'
+        elif sum(e.estimated_billable_usage for e in facebook if e.started_at.date() == now.date()) + limit > settings.NEWS_FACEBOOK_DAILY_TARGET:
+            denial = 'Facebook daily reservation budget reached.'
+        elif sum(e.estimated_billable_usage for e in facebook if e.budget_month == month_key(now)) + limit > settings.NEWS_FACEBOOK_MONTHLY_BUDGET:
+            denial = 'Facebook monthly reservation budget reached.'
+        if dataset_id != dataset_for(source):
+            raise ValueError('Facebook dataset does not match the approved source kind.')
     if denial:
         source.last_error = denial
         await db.commit()
@@ -115,7 +128,7 @@ async def reserve_execution(db, source, now, start_date, end_date, *, reason="sc
     execution = BrightDataExecution(
         source_id=source.id, started_at=now, budget_month=month_key(now), trigger_reason=reason,
         endpoint="https://api.brightdata.com/datasets/v3/trigger",
-        dataset_id=settings.BRIGHTDATA_LINKEDIN_POSTS_DATASET_ID,
+        dataset_id=dataset_id or settings.BRIGHTDATA_LINKEDIN_POSTS_DATASET_ID,
         start_date=start_date, end_date=end_date, record_limit=limit,
         estimated_billable_usage=limit, state="reserved", newly_saved_posts=0,
         duplicate_posts=0, ignored_records=0, retry_count=0,

@@ -53,6 +53,12 @@ class NewsSourceCreate(BaseModel):
         if self.type == "LINKEDIN":
             self.fetch_interval_minutes = max(1440, self.fetch_interval_minutes)
             self.url = canonical_linkedin_url(self.url)
+        if self.type == 'FACEBOOK':
+            from app.intelligence.facebook_identity import identity_or_none,HOSTS
+            parsed=urlparse(self.url)
+            if parsed.hostname not in HOSTS:raise ValueError('Use a Facebook source URL.')
+            self.url=identity_or_none(self.url) or self.url
+            self.fetch_interval_minutes=max(1440,self.fetch_interval_minutes)
         return self
 
 
@@ -80,6 +86,7 @@ class NewsSourceOut(BaseModel):
     last_error: str | None
     collection_supported: bool = False
     collection_enabled: bool = False
+    collection_note: str | None = None
     email_enabled: bool = False
     created_at: datetime
     updated_at: datetime

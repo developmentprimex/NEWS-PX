@@ -103,6 +103,7 @@ export interface NewsSource {
   last_error: string | null
   collection_supported: boolean
   collection_enabled?: boolean
+  collection_note?: string | null
   email_enabled: boolean
   repost_groups: RepostGroup[]
   repost_guidance: Partial<Record<RepostGroup, string>>

@@ -40,6 +40,16 @@ def finish(execution, now, state, error=None):
 async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", backfill=None,
                            adapter=None, validate_records=None, cycle_source_id=None, clock=None):
     now = clock() if clock else now
+    facebook = source.type == 'FACEBOOK'
+    record_limit = settings.NEWS_FACEBOOK_RECORD_LIMIT if facebook else settings.NEWS_LINKEDIN_RECORD_LIMIT
+    parser = parse_posts
+    if facebook:
+        from app.intelligence.facebook_adapter import BrightDataFacebookAdapter, dataset_for, parse_posts as facebook_posts
+        from app.intelligence.facebook_identity import source_approved
+        from app.intelligence.collection_cycles import confirmed_activity_time
+        if not settings.NEWS_FACEBOOK_FETCH_ENABLED or not source_approved(source):
+            return 'paused'
+        parser = facebook_posts
     source_id = source.id
     execution_id = None
     if reason == 'trial-poll' and not source.pending_execution_id:
@@ -48,11 +58,11 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
     if cycle_source_id:
         from app.intelligence.collection_cycles import CollectionCycleSource, CollectionCycle, TemporalWindow, provider_dates, confirmed_activity_time
         from app.intelligence.cycle_service import trial_configuration, trial_active, TERMINAL
-        from app.intelligence.linkedin_identity import identity_or_none
+        from app.intelligence.cycle_service import source_identity
         cycle_row = await db.get(CollectionCycleSource, cycle_source_id)
         cycle = await db.get(CollectionCycle, cycle_row.cycle_id) if cycle_row else None
         if (not cycle or cycle_row.source_id != source.id or cycle_row.type != source.type
-                or identity_or_none(source.url) != cycle_row.canonical_url):
+                or source_identity(source) != cycle_row.canonical_url):
             return 'paused'
         if cycle_row.state in TERMINAL:
             return 'completed'
@@ -87,7 +97,8 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
         await db.commit()
         return "paused"
     await db.commit()
-    adapter = adapter or BrightDataLinkedInAdapter(settings.BRIGHTDATA_API_TOKEN, settings.BRIGHTDATA_LINKEDIN_POSTS_DATASET_ID)
+    adapter = adapter or (BrightDataFacebookAdapter(settings.BRIGHTDATA_API_TOKEN, dataset_for(source)) if facebook
+                          else BrightDataLinkedInAdapter(settings.BRIGHTDATA_API_TOKEN, settings.BRIGHTDATA_LINKEDIN_POSTS_DATASET_ID))
     execution = await db.get(BrightDataExecution, source.pending_execution_id) if source.pending_execution_id else None
     execution_id = execution.id if execution else None
     if source.pending_snapshot_id and not execution:
@@ -117,6 +128,8 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
             if progress == "failed":
                 finish(execution, now, "failed", "Provider snapshot failed; reservation retained.")
                 source.pending_snapshot_id = source.pending_execution_id = None
+                if facebook:
+                    source.linkedin_paused_reason = 'Facebook snapshot failed. Reconcile the existing reservation before resuming.'
                 source.last_error = execution.api_errors
                 await db.commit()
                 return "error"
@@ -140,11 +153,21 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
             # Error-only and partial snapshots must not advance the watermark.
             from app.intelligence.linkedin_adapter import LinkedInCollectionError
             try:
-                posts = parse_posts(records, source)
+                posts = parser(records, source)
             except LinkedInCollectionError:
                 posts = []
             invalid = len(records) - len(posts)
             uncertain_dates = any(not post.published_at or not execution.start_date <= post.published_at.date() <= execution.end_date for post in posts)
+            if facebook:
+                uncertain_dates = any(confirmed_activity_time(post) is None for post in posts)
+                def in_window(post):
+                    stamp=confirmed_activity_time(post)
+                    if stamp is None:return True
+                    if cycle_row:return cycle_row.window_start < stamp <= cycle_row.window_end
+                    return execution.start_date <= stamp.date() <= execution.end_date
+                posts_in_window = [post for post in posts if in_window(post)]
+                execution.ignored_records += len(posts) - len(posts_in_window)
+                posts = posts_in_window
             if invalid or uncertain_dates:
                 execution.coverage_warning = "Snapshot contains invalid, unattributed or out-of-window activity; review coverage before resuming."
                 source.linkedin_paused_reason = execution.coverage_warning
@@ -164,7 +187,7 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
                         execution.duplicate_posts += 1
                     else:
                         execution.ignored_records += 1
-            execution.ignored_records += len(records) - len(posts)
+            execution.ignored_records += invalid
             saturated = len(records) >= execution.record_limit
             if saturated:
                 source.linkedin_paused_reason = "Record limit reached; completeness is unknown. Authorize a separate backfill or reconcile the window."
@@ -194,7 +217,7 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
         execution_reason = reason
         if cycle_row:
             start, end = provider_dates(TemporalWindow(cycle_row.window_start, cycle_row.window_end, cycle_row.verified_start))
-            limit = settings.NEWS_LINKEDIN_RECORD_LIMIT
+            limit = record_limit
         elif backfill:
             start, end, limit = backfill
         elif reason.startswith("scheduled"):
@@ -207,15 +230,16 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
             if window is None:
                 return "pending"
             start, end = window
-            limit = settings.NEWS_LINKEDIN_RECORD_LIMIT
+            limit = record_limit
             execution_reason = DAILY_REASON
         else:
-            start, end, limit = incremental_start(source.last_successful_fetch_at, now), now.date(), settings.NEWS_LINKEDIN_RECORD_LIMIT
+            start, end, limit = incremental_start(source.last_successful_fetch_at, now), now.date(), record_limit
         now = clock() if clock else now
         if cycle_row and not trial_active(await trial_configuration(db), now):
             return 'paused'
         execution = await reserve_execution(db, source, now, start, end,
-            reason=execution_reason, limit=limit, cycle_source_id=cycle_source_id)
+            reason=execution_reason, limit=limit, cycle_source_id=cycle_source_id,
+            **({'dataset_id': dataset_for(source)} if facebook else {}))
         if not execution:
             return "paused"
         execution_id = execution.id

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import smtplib
 import asyncio
+import httpx
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal
@@ -73,6 +74,12 @@ def _source_out(source: NewsSource, email_enabled: bool = False) -> NewsSourceOu
     output.collection_supported = source.type == "LINKEDIN" or (source.type in {"WEBSITE", "RSS"} and rss_url_is_supported(source.url))
     output.email_enabled = email_enabled
     output.collection_enabled = source.type == "LINKEDIN" and source.status == "ACTIVE" and settings.NEWS_ENABLE_COLLECTION and settings.NEWS_LINKEDIN_FETCH_ENABLED and not settings.NEWS_BRIGHTDATA_CANARY_LIVE_ENABLED and not source.linkedin_paused_reason
+    if source.type == 'FACEBOOK':
+        from app.intelligence.facebook_identity import identity_or_none as facebook_identity, setup_note, source_approved
+        output.collection_supported = bool(facebook_identity(source.url))
+        output.collection_enabled = bool(source.status == 'ACTIVE' and settings.NEWS_ENABLE_COLLECTION
+            and settings.NEWS_FACEBOOK_FETCH_ENABLED and source_approved(source) and not source.linkedin_paused_reason)
+        output.collection_note = setup_note(source)
     return output
 
 
@@ -418,6 +425,12 @@ async def check_all_sources_now(db: AsyncSession = Depends(get_db), _: User = De
 
 @router.post("/sources", response_model=NewsSourceOut, status_code=status.HTTP_201_CREATED)
 async def create_source(payload: NewsSourceCreate, db: AsyncSession = Depends(get_db), user: User = Depends(require_admin)) -> NewsSourceOut:
+    if payload.type == 'FACEBOOK':
+        from app.intelligence.facebook_identity import identity_or_none as facebook_identity, lock_identity_change as fb_lock, matching_sources as fb_matches
+        identity=facebook_identity(payload.url)
+        if identity:
+            await fb_lock(db,'',payload.url)
+            if await fb_matches(db,identity):raise HTTPException(status_code=409,detail='This Facebook source already exists.')
     if payload.type in {"RSS", "WEBSITE"} and not rss_url_is_supported(payload.url):
         raise HTTPException(status_code=422, detail="Use a public HTTP or HTTPS URL without credentials or a custom port.")
     if payload.type == "LINKEDIN":
@@ -466,6 +479,8 @@ async def update_source(source_id: uuid.UUID, payload: NewsSourceUpdate, db: Asy
         raise HTTPException(status_code=422, detail="Use a public HTTP or HTTPS URL without credentials or a custom port.")
     initial = await _get_source(db, source_id)
     initial_identity = (initial.type, initial.url)
+    from app.intelligence.facebook_identity import lock_identity_change as fb_lock, identity_or_none as facebook_identity, matching_sources as fb_matches
+    await fb_lock(db,initial.url if initial.type=='FACEBOOK' else '',payload.url if payload.type=='FACEBOOK' else '')
     await lock_identity_change(db, initial.url if initial.type == "LINKEDIN" else "", payload.url if payload.type == "LINKEDIN" else "")
     source = await db.scalar(select(NewsSource).where(NewsSource.id == source_id).with_for_update().execution_options(populate_existing=True))
     if source is None:
@@ -475,10 +490,13 @@ async def update_source(source_id: uuid.UUID, payload: NewsSourceUpdate, db: Asy
     url_changed = source.type != payload.type or (identity_or_none(source.url) != identity_or_none(payload.url) if payload.type == "LINKEDIN" else source.url != payload.url)
     if url_changed and (source.pending_execution_id or source.pending_snapshot_id):
         raise HTTPException(status_code=409, detail="Reconcile the pending collection before changing this source URL or type.")
-    if url_changed and "LINKEDIN" in {source.type, payload.type}:
+    if url_changed and {source.type, payload.type}.intersection({'LINKEDIN','FACEBOOK'}):
         history = source.last_started_at or source.last_successful_fetch_at or await db.scalar(select(NewsItem.id).where(NewsItem.source_id == source_id).limit(1)) or await db.scalar(select(BrightDataExecution.id).where(BrightDataExecution.source_id == source_id).limit(1))
         if history:
             raise HTTPException(status_code=409, detail="A collected LinkedIn identity cannot be changed. Pause it and add a separate source to preserve history and daily limits.")
+    if payload.type=='FACEBOOK' and (identity:=facebook_identity(payload.url)):
+        if any(s.id!=source_id for s in await fb_matches(db,identity)):
+            raise HTTPException(status_code=409,detail='This Facebook source already exists.')
     if payload.type == "LINKEDIN":
         identity = await lock_source_identity(db, payload.url)
         if any(row.id != source_id for row in await matching_sources(db, identity)):
@@ -533,15 +551,33 @@ async def set_source_email(source_id: uuid.UUID, payload: NewsSourceEmailInput, 
 async def delete_source(source_id: uuid.UUID, db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)) -> Response:
     source = await _get_source(db, source_id)
     identity = (source.type, source.url)
+    from app.intelligence.facebook_identity import lock_identity_change as fb_lock
+    await fb_lock(db,source.url if source.type=='FACEBOOK' else '','')
     await lock_identity_change(db, source.url if source.type == "LINKEDIN" else "", "")
     source = await db.scalar(select(NewsSource).where(NewsSource.id == source_id).with_for_update().execution_options(populate_existing=True))
     if source is None:
         raise HTTPException(status_code=404, detail="Source not found")
     if (source.type, source.url) != identity:
         raise HTTPException(status_code=409, detail="Source changed. Refresh before deleting.")
-    if source.type == "LINKEDIN":
+    if source.type in {'LINKEDIN','FACEBOOK'}:
         if source.pending_execution_id or source.pending_snapshot_id or source.last_started_at or source.last_successful_fetch_at or await db.scalar(select(NewsItem.id).where(NewsItem.source_id == source_id).limit(1)) or await db.scalar(select(BrightDataExecution.id).where(BrightDataExecution.source_id == source_id).limit(1)):
             raise HTTPException(status_code=409, detail="This LinkedIn source has history or a pending collection. Pause it to preserve posts and saved state.")
     await db.delete(source)
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post('/sources/{source_id}/resolve-facebook',response_model=NewsSourceOut)
+async def resolve_facebook_source(source_id: uuid.UUID,db: AsyncSession=Depends(get_db),user: User=Depends(require_admin)):
+    from app.intelligence.facebook_resolution import resolve_facebook_url
+    source=await _get_source(db,source_id)
+    if source.type!='FACEBOOK':raise HTTPException(status_code=422,detail='Select a Facebook source.')
+    initial=source.url
+    try:resolved=await resolve_facebook_url(initial)
+    except (ValueError,httpx.HTTPError) as exc:
+        raise HTTPException(status_code=422,detail='Facebook link could not be resolved publicly. Enter the direct page or public group URL.') from exc
+    await db.refresh(source)
+    if source.url!=initial:raise HTTPException(status_code=409,detail='Source changed; refresh before resolving.')
+    subscription=await db.get(NewsSourceEmailSubscription,source.id)
+    fields={key:getattr(source,key) for key in NewsSourceCreate.model_fields if key!='email_enabled'}
+    return await update_source(source_id,NewsSourceUpdate(**{**fields,**resolved,'email_enabled':bool(subscription)}),db,user)

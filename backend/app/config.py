@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     NEWS_LINKEDIN_OPERATIONAL_BUDGET: int = 4000
     NEWS_LINKEDIN_RESERVED_ALLOWANCE: int = 1000
     NEWS_LINKEDIN_MAX_MONTHLY_RECORDS: int = 5000
+    NEWS_FACEBOOK_FETCH_ENABLED: bool = False
+    NEWS_FACEBOOK_APPROVED_SOURCE_URLS: list[str] = []
+    NEWS_FACEBOOK_RECORD_LIMIT: int = 3
+    NEWS_FACEBOOK_DAILY_TARGET: int = 12
+    NEWS_FACEBOOK_MONTHLY_BUDGET: int = 300
     EMAIL_HOST: str = "smtp.gmail.com"
     EMAIL_PORT: int = 587
     EMAIL_USER: str | None = None
@@ -41,6 +46,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def database_connection(self) -> "Settings":
+        if not (1 <= self.NEWS_FACEBOOK_RECORD_LIMIT <= 6 and 1 <= self.NEWS_FACEBOOK_DAILY_TARGET <= 130
+                and 1 <= self.NEWS_FACEBOOK_MONTHLY_BUDGET <= 4000):
+            raise ValueError('Facebook limits must remain within the shared protected budget.')
         if not (1 <= self.NEWS_LINKEDIN_RECORD_LIMIT <= 6
                 and 1 <= self.NEWS_LINKEDIN_DAILY_TARGET <= 130
                 and 1 <= self.NEWS_LINKEDIN_OPERATIONAL_BUDGET <= 4000
