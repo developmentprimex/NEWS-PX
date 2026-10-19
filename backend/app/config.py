@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     EMAIL_PORT: int = 587
     EMAIL_USER: str | None = None
     EMAIL_PASSWORD: str | None = None
+    NEWS_TRIAL_EMAIL_USER: str | None = None
+    NEWS_TRIAL_EMAIL_PASSWORD: str | None = None
+    NEWS_TRIAL_BILLING_BINDING_FILE: str | None = None
 
     @model_validator(mode="after")
     def database_connection(self) -> "Settings":

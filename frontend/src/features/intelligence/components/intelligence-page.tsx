@@ -17,13 +17,13 @@ import { RepostWatchPanel } from "./repost-watch-panel"
 import { filters } from "./news-filters"
 import { intelligenceFeedService, type ReadState } from "../data/news.service"
 import { eligibleLinkedInSources, selectLinkedInSources, sourceFilterKey, feedScopes, type LinkedInMonitoringSource } from "../linkedin-monitoring"
+import { startCollectionCheck, loadCollectionStatus, type SourceCheckStatus } from "../collection-check"
 import type { DailyBrief, IntelligenceView, NewsEntry, NewsFilter, NewsSource, StrategicBrief } from "../types"
 
 const DEMO_READ_PREFIX = "news-intelligence-demo-read:"
 const DEMO_SAVED_PREFIX = "news-intelligence-demo-saved:"
 const opportunityCategories = new Set(["GRANT", "TENDER", "BUSINESS", "PARTNERSHIP"])
 type FeedMode = ReadState | "dueSoon" | "saved"
-type SourceCheckStatus = { state: "idle" | "running" | "finished"; total: number; processed: number; failed: number; started: number; pending: number }
 
 function matchFilter(item: NewsEntry, filter: NewsFilter) {
   const { category, relevanceScore, tags } = item.analysis
@@ -164,6 +164,15 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
   }, [apiFetch, isDemo])
 
   React.useEffect(() => {
+    if (!user || isDemo) return
+    let active = true
+    void loadCollectionStatus(apiFetch).then((status) => {
+      if (active && status.cycle_id) setCheckStatus(status)
+    }).catch(() => {})
+    return () => { active = false }
+  }, [apiFetch, user, isDemo])
+
+  React.useEffect(() => {
     if (checkStatus?.state !== "running") return
     let polling = false
     const timer = window.setInterval(() => {
@@ -179,6 +188,7 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
           if (status.state === "finished") {
             void loadFeed()
             if (status.failed) toast.error(`${status.failed} source ${status.failed === 1 ? "check failed" : "checks failed"}. See Sources for details.`)
+            else if (status.partial || status.blocked) toast.info("Check finished with incomplete results. See Sources for details.")
             else if (status.pending === status.total) toast.info("Sources were checked recently or are already being checked. Try again in a few minutes.")
             else toast.success(status.started ? "Source checks finished. LinkedIn results may arrive shortly." : "Source checks finished. Feed updated.")
           }
@@ -190,19 +200,15 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
   }, [apiFetch, checkStatus?.state, loadFeed])
 
   const checkForUpdates = async () => {
-    if (activityView) {
-      await loadFeed(true)
-      toast.info("Feed refreshed. LinkedIn sources are checked automatically each day when collection is available.")
-      return
-    }
     if (startingCheck || checkStatus?.state === "running") return
     setStartingCheck(true)
     try {
-      if (primexView && !selectedSources.length) throw new Error("Add the selected LinkedIn company page in Sources first.")
-      const response = await apiFetch("/intelligence/sources/check-all", { method: "POST" })
-      const payload = await response.json().catch(() => null)
-      if (!response.ok) throw new Error(typeof payload?.detail === "string" ? payload.detail : "Could not start source checks.")
-      setCheckStatus(payload as SourceCheckStatus)
+      const status = await startCollectionCheck(apiFetch)
+      setCheckStatus(status)
+      if (status.state === "finished") {
+        await loadFeed()
+        toast.info("This check has already finished. Feed refreshed.")
+      }
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : "Could not start source checks.")
     } finally { setStartingCheck(false) }

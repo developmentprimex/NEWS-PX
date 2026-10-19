@@ -13,7 +13,7 @@ import feedparser
 import httpx
 from bs4 import BeautifulSoup
 
-from app.intelligence.services import CollectedNewsItem
+from app.intelligence.services import CollectedNewsItem, publication_has_precise_time
 
 MAX_FEED_BYTES = 2_000_000
 MAX_ENTRIES = 50
@@ -104,6 +104,7 @@ def parse_feed(payload: bytes, feed_url: str) -> list[CollectedNewsItem]:
             url=link, title=title,
             original_text=(f"{title}. {description}" if description else title)[:20_000],
             published_at=_published(entry),
+            publication_time_verified=publication_has_precise_time(entry.get('published') or entry.get('updated')),
         ))
     return posts
 

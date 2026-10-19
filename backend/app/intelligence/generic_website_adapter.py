@@ -20,7 +20,7 @@ os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
 from playwright.async_api import async_playwright
 
 from app.intelligence.rss_adapter import _check_public_dns, parse_feed, rss_url_is_supported
-from app.intelligence.services import CollectedNewsItem
+from app.intelligence.services import CollectedNewsItem, publication_has_precise_time
 
 MAX_BODY = 4_000_000
 MAX_LINKS = 35
@@ -118,7 +118,11 @@ def parse_html_article(page: Page, fallback_title: str) -> CollectedNewsItem | N
     body = _text(main)[:20_000]
     if len(title) < 8 or len(body) < 60:
         return None
-    return CollectedNewsItem(page.url[:500], page.url, title[:500], body, parse_publication_date(soup))
+    raw_time = next((str(node.get(attr)) for selector, attr in (
+        ("meta[property='article:published_time']", 'content'), ("meta[name='date']", 'content'), ('time[datetime]', 'datetime'))
+        if (node := soup.select_one(selector)) is not None and node.get(attr)), None)
+    return CollectedNewsItem(page.url[:500], page.url, title[:500], body, parse_publication_date(soup),
+                             publication_time_verified=publication_has_precise_time(raw_time))
 
 
 def parse_pdf_article(page: Page, fallback_title: str) -> CollectedNewsItem | None:

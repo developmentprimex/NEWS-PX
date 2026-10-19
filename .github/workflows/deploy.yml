@@ -72,7 +72,7 @@ jobs:
       - name: Check frontend source selection and TypeScript
         working-directory: frontend
         run: |
-          node --test test/linkedin-monitoring.test.cjs
+          node --test test/linkedin-monitoring.test.cjs test/collection-check.test.cjs
           npx tsc --noEmit
       - name: Check backend Python syntax
         run: python -m compileall -q backend

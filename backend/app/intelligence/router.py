@@ -374,13 +374,28 @@ async def linkedin_monitoring_sources(db: AsyncSession = Depends(get_db), _: Use
 
 
 @router.get("/sources/check-all/status")
-async def check_all_sources_status(_: User = Depends(require_admin)) -> dict[str, object]:
+async def check_all_sources_status(db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)) -> dict[str, object]:
+    from app.intelligence.cycle_service import cycle_status, trial_configuration, trial_active
+    config = await trial_configuration(db)
+    if config:
+        current = await cycle_status(db)
+        if current['cycle_id'] and (current['state'] == 'running' or trial_active(config, datetime.now(timezone.utc))):
+            return current
     return _check_all_status.copy()
 
 
 @router.post("/sources/check-all")
 async def check_all_sources_now(db: AsyncSession = Depends(get_db), _: User = Depends(require_admin), repost_group: Literal["CEO", "COMPANY"] | None = None, source_id: uuid.UUID | None = None, source_ids: Annotated[list[uuid.UUID] | None, Query(max_length=20)] = None) -> dict[str, object]:
     global _check_all_task, _check_all_status
+    from app.intelligence.cycle_service import trial_configuration, trial_active, accept_manual_cycle, run_collection_trial_cycle
+    now = datetime.now(timezone.utc)
+    if trial_active(await trial_configuration(db), now):
+        try:
+            accepted = await accept_manual_cycle(db, user_id=_.id, now=now)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        asyncio.create_task(run_collection_trial_cycle())
+        return accepted
     async with _check_all_lock:
         if _check_all_task and not _check_all_task.done():
             return _check_all_status.copy()

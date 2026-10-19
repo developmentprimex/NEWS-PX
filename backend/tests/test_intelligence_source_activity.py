@@ -52,7 +52,8 @@ def test_linkedin_refresh_endpoints_do_not_schedule_scraping(monkeypatch):
     from fastapi import HTTPException
     from unittest.mock import AsyncMock
     source = SimpleNamespace(id=uuid4(), type="LINKEDIN", status="ACTIVE")
-    db = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [source]))))
+    db = SimpleNamespace(get=AsyncMock(return_value=None),
+        execute=AsyncMock(return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [source]))))
     checker = AsyncMock()
     monkeypatch.setattr(news_router, "check_source", checker)
     monkeypatch.setattr(news_router, "_check_all_task", None)

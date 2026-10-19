@@ -90,7 +90,7 @@ def record_alerts(account, totals):
     account.alert_levels = sorted(levels)
 
 
-async def reserve_execution(db, source, now, start_date, end_date, *, reason="scheduled", limit=None):
+async def reserve_execution(db, source, now, start_date, end_date, *, reason="scheduled", limit=None, cycle_source_id=None):
     limit = limit or settings.NEWS_LINKEDIN_RECORD_LIMIT
     account = await locked_account(db)
     executions = await executions_for_budget(db)
@@ -125,6 +125,12 @@ async def reserve_execution(db, source, now, start_date, end_date, *, reason="sc
     )
     db.add(execution)
     await db.flush()
+    if cycle_source_id:
+        from app.intelligence.collection_cycles import CollectionCycleSource
+        row = await db.get(CollectionCycleSource, cycle_source_id)
+        if row is None or row.source_id != source.id or row.execution_id:
+            raise ValueError('Trial source already reserved or identity changed.')
+        row.execution_id, row.state = execution.id, 'reserved'
     source.pending_execution_id = execution.id
     source.last_started_at = now
     record_alerts(account, usage_totals(account, [*executions, execution], now))

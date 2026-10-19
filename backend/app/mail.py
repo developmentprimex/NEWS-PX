@@ -9,11 +9,12 @@ from app.config import settings
 
 
 class GmailService:
-    def __init__(self) -> None:
-        if not settings.EMAIL_USER or not settings.EMAIL_PASSWORD:
+    def __init__(self, *, credentials: tuple[str, str] | None = None) -> None:
+        sender, password = credentials if credentials is not None else (settings.EMAIL_USER, settings.EMAIL_PASSWORD)
+        if not sender or not password:
             raise ValueError("Email credentials are not configured")
-        self.sender = settings.EMAIL_USER
-        self.password = settings.EMAIL_PASSWORD.replace(" ", "")
+        self.sender = sender
+        self.password = password.replace(" ", "")
         self.host = settings.EMAIL_HOST
         self.port = settings.EMAIL_PORT
 

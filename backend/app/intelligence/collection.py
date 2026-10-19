@@ -88,10 +88,13 @@ async def _store_post(db: AsyncSession, source: NewsSource, post: CollectedNewsI
             existing.title = post.title
             existing.original_text = post.original_text
         existing.linkedin_data = merge_linkedin_activity(existing.linkedin_data, post.linkedin_data)
-        if post.published_at:
+        if post.published_at and (post.publication_time_verified or not existing.publication_time_verified):
             existing.published_at = post.published_at
+            existing.publication_time_verified = post.publication_time_verified
         return False
     if existing:
+        if post.publication_time_verified and post.published_at:
+            existing.published_at, existing.publication_time_verified = post.published_at, True
         return False
     analysis = await analyze_news_item(post, source)
     if not category_allowed(source.categories or [], analysis.category):
@@ -105,6 +108,7 @@ async def _store_post(db: AsyncSession, source: NewsSource, post: CollectedNewsI
         source_id=source.id, external_id=post.external_id, url=post.url,
         title=post.title, original_text=post.original_text,
         published_at=post.published_at, image_url=post.image_url, content_hash=content_hash,
+        publication_time_verified=post.publication_time_verified,
         linkedin_data={**post.linkedin_data, "checkedAt": post.linkedin_data.get("checkedAt") or datetime.now(timezone.utc).isoformat()} if post.linkedin_data is not None else None,
     )
     db.add(item)
@@ -125,7 +129,7 @@ def website_entry_is_current(entry: WebsiteEntry, now: datetime) -> bool:
     return not entry.published_at or entry.published_at >= now - timedelta(days=60)
 
 
-async def _check_website_source(db: AsyncSession, source: NewsSource, now: datetime, force: bool) -> str:
+async def _check_website_source(db: AsyncSession, source: NewsSource, now: datetime, force: bool, *, strict_times=False) -> str:
     minimum_interval = 5 if force else source.fetch_interval_minutes
     if source.last_started_at and source.last_started_at > now - timedelta(minutes=minimum_interval):
         return "pending"
@@ -137,9 +141,10 @@ async def _check_website_source(db: AsyncSession, source: NewsSource, now: datet
         source.last_checked_at = now
         source.last_error = None
         await db.commit()
-        return "completed"
+        return 'partial' if strict_times and any(not post.publication_time_verified for post in posts) else 'completed'
     adapter = OfficialWebsiteAdapter(source.url)
     cutoff = now - timedelta(days=60)
+    unknown_times = False
     async with adapter._client() as client:
         entries = await adapter.discover(client)
         for entry in entries:
@@ -158,46 +163,53 @@ async def _check_website_source(db: AsyncSession, source: NewsSource, now: datet
             if post.published_at and post.published_at < cutoff and not entry.closes_at:
                 continue
             await _store_post(db, source, post)
+            unknown_times = unknown_times or not post.publication_time_verified
     source.last_started_at = now
     source.last_checked_at = now
     source.last_error = None
     await db.commit()
-    return "completed"
+    return 'partial' if strict_times and unknown_times else 'completed'
 
 
-async def _check_rss_source(db: AsyncSession, source: NewsSource, now: datetime, force: bool) -> str:
+async def _check_rss_source(db: AsyncSession, source: NewsSource, now: datetime, force: bool, *, strict_times=False) -> str:
     minimum_interval = 5 if force else source.fetch_interval_minutes
     if source.last_started_at and source.last_started_at > now - timedelta(minutes=minimum_interval):
         return "pending"
     cutoff = now - timedelta(days=60)
+    unknown_times = False
     for post in await RSSAdapter(source.url).collect():
         if post.published_at and post.published_at < cutoff:
             continue
         await _store_post(db, source, post)
+        unknown_times = unknown_times or not post.publication_time_verified
     source.last_started_at = now
     source.last_checked_at = now
     source.last_error = None
     await db.commit()
-    return "completed"
+    return 'partial' if strict_times and unknown_times else 'completed'
 
 
-async def check_source(db: AsyncSession, source_id: uuid.UUID, *, force: bool = False) -> str:
+async def check_source(db: AsyncSession, source_id: uuid.UUID, *, force: bool = False, now: datetime | None = None,
+                       expected_identity: tuple[str, str] | None = None, strict_times=False) -> str:
     source = (await db.execute(
         select(NewsSource).where(NewsSource.id == source_id).with_for_update(skip_locked=True)
+        .execution_options(populate_existing=True)
     )).scalar_one_or_none()
     if source is None:
         return "pending"
+    if expected_identity and (source.type, source.url) != expected_identity:
+        return 'identity-changed'
     if source.type not in {"LINKEDIN", "WEBSITE", "RSS"} or (source.type == "WEBSITE" and not rss_url_is_supported(source.url)) or (source.type == "RSS" and not rss_url_is_supported(source.url)):
         raise LinkedInCollectionError("No collector is available for this source URL yet.")
     if source.status != "ACTIVE":
         raise LinkedInCollectionError("Activate this source before checking it.")
 
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     try:
         if source.type == "WEBSITE":
-            return await _check_website_source(db, source, now, force)
+            return await _check_website_source(db, source, now, force, strict_times=strict_times)
         if source.type == "RSS":
-            return await _check_rss_source(db, source, now, force)
+            return await _check_rss_source(db, source, now, force, strict_times=strict_times)
         if not settings.BRIGHTDATA_API_TOKEN:
             return "unavailable"
         # Web requests cannot start or poll LinkedIn snapshots, including force=True.
@@ -233,6 +245,9 @@ async def check_due_sources() -> dict[str, int]:
     for source_id in ids:
         try:
             async with SessionLocal() as db:
+                from app.intelligence.cycle_service import trial_owns_source
+                if await trial_owns_source(db, source_id, datetime.now(timezone.utc)):
+                    continue
                 state = await check_source(db, source_id)
             if state in {"started", "completed"}:
                 checked += 1
@@ -241,7 +256,7 @@ async def check_due_sources() -> dict[str, int]:
     return {"checked": checked}
 
 
-async def protected_linkedin_check(db, source, now, *, reason="scheduled", backfill=None):
+async def protected_linkedin_check(db, source, now, *, reason="scheduled", backfill=None, cycle_source_id=None, clock=None):
     if not settings.NEWS_ENABLE_COLLECTION:
         return "paused"
     # Dedicated connection holds a session advisory lock through every commit.
@@ -258,11 +273,16 @@ async def protected_linkedin_check(db, source, now, *, reason="scheduled", backf
             # Another worker may have committed since this session loaded the
             # source. Read the pending job and schedule again under the lock.
             await db.refresh(source, with_for_update=True)
+            if not cycle_source_id and reason.startswith('scheduled'):
+                from app.intelligence.cycle_service import trial_owns_source
+                if await trial_owns_source(db, source.id, now):
+                    return 'paused'
             if source.type != "LINKEDIN" or source.status != "ACTIVE" or identity_or_none(source.url) != identity:
                 return "paused"
             if not await collection_owner(db, source):
                 await db.commit()
                 return "paused"
-            return await collect_linkedin(db, source, now, _store_post, reason=reason, backfill=backfill)
+            return await collect_linkedin(db, source, now, _store_post, reason=reason, backfill=backfill,
+                                          cycle_source_id=cycle_source_id, clock=clock)
         finally:
             await connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})

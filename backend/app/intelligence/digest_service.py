@@ -269,6 +269,8 @@ async def process_digest(db: AsyncSession, user_id: uuid.UUID, now: datetime | N
 
 
 async def run_digest_cycle() -> None:
+    if settings.NEWS_TRIAL_EMAIL_USER or settings.NEWS_TRIAL_EMAIL_PASSWORD:
+        return
     if not settings.EMAIL_USER or not settings.EMAIL_PASSWORD:
         return
     async with SessionLocal() as db:
