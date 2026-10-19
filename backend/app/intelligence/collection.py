@@ -199,7 +199,7 @@ async def check_source(db: AsyncSession, source_id: uuid.UUID, *, force: bool = 
         return "pending"
     if expected_identity and (source.type, source.url) != expected_identity:
         return 'identity-changed'
-    if source.type not in {"LINKEDIN", "WEBSITE", "RSS"} or (source.type == "WEBSITE" and not rss_url_is_supported(source.url)) or (source.type == "RSS" and not rss_url_is_supported(source.url)):
+    if source.type not in {"LINKEDIN", "FACEBOOK", "WEBSITE", "RSS"} or (source.type == "WEBSITE" and not rss_url_is_supported(source.url)) or (source.type == "RSS" and not rss_url_is_supported(source.url)):
         raise LinkedInCollectionError("No collector is available for this source URL yet.")
     if source.status != "ACTIVE":
         raise LinkedInCollectionError("Activate this source before checking it.")
@@ -210,6 +210,9 @@ async def check_source(db: AsyncSession, source_id: uuid.UUID, *, force: bool = 
             return await _check_website_source(db, source, now, force, strict_times=strict_times)
         if source.type == "RSS":
             return await _check_rss_source(db, source, now, force, strict_times=strict_times)
+        if source.type == 'FACEBOOK':
+            if force:return 'paused'
+            return await protected_facebook_check(db, source, now)
         if not settings.BRIGHTDATA_API_TOKEN:
             return "unavailable"
         # Web requests cannot start or poll LinkedIn snapshots, including force=True.
@@ -233,12 +236,13 @@ async def check_due_sources() -> dict[str, int]:
         return {"checked": 0}
     async with SessionLocal() as db:
         sources = list((await db.execute(select(NewsSource).where(
-            NewsSource.type.in_(["LINKEDIN", "WEBSITE", "RSS"]), NewsSource.status == "ACTIVE",
+            NewsSource.type.in_(["LINKEDIN", "FACEBOOK", "WEBSITE", "RSS"]), NewsSource.status == "ACTIVE",
         ).order_by(NewsSource.last_started_at.asc().nullsfirst(),
                    case((NewsSource.priority == "HIGH", 0), (NewsSource.priority == "NORMAL", 1), else_=2),
                    NewsSource.last_new_posts.desc(), NewsSource.id))).scalars().all())
     ids = [source.id for source in sources if
            (source.type == "LINKEDIN" and linkedin_configured()) or
+           (source.type == "FACEBOOK" and settings.NEWS_FACEBOOK_FETCH_ENABLED) or
            (source.type == "WEBSITE" and rss_url_is_supported(source.url)) or
            (source.type == "RSS" and rss_url_is_supported(source.url))]
     checked = 0
@@ -286,3 +290,39 @@ async def protected_linkedin_check(db, source, now, *, reason="scheduled", backf
                                           cycle_source_id=cycle_source_id, clock=clock)
         finally:
             await connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})
+
+
+async def protected_facebook_check(db, source, now, *, reason='scheduled', backfill=None, cycle_source_id=None, clock=None):
+    from app.intelligence.facebook_identity import identity_or_none as facebook_identity, source_approved
+    from app.intelligence.facebook_adapter import dataset_for
+    from app.intelligence.facebook_collection import refresh_facebook_billing
+    identity=facebook_identity(source.url)
+    source_id=source.id
+    if not settings.NEWS_ENABLE_COLLECTION or not settings.NEWS_FACEBOOK_FETCH_ENABLED or not identity or not source_approved(source):
+        return 'paused'
+    key=lock_key(identity)
+    async with engine.connect() as connection:
+        if not await connection.scalar(text('SELECT pg_try_advisory_lock(:key)'),{'key':key}):return 'pending'
+        try:
+            await db.refresh(source,with_for_update=True)
+            if source.type!='FACEBOOK' or source.status!='ACTIVE' or facebook_identity(source.url)!=identity or not source_approved(source):return 'paused'
+            if not cycle_source_id and reason.startswith('scheduled'):
+                from app.intelligence.cycle_service import trial_owns_source
+                if await trial_owns_source(db,source.id,now):return 'paused'
+            candidates=list(await db.scalars(select(NewsSource).where(NewsSource.type=='FACEBOOK').order_by(NewsSource.created_at,NewsSource.id)))
+            owners=[s for s in candidates if facebook_identity(s.url)==identity]
+            if not owners or owners[0].id!=source.id:return 'paused'
+            if source.linkedin_paused_reason:return 'paused'
+            if not source.pending_execution_id and not cycle_source_id and not backfill:
+                from app.intelligence.linkedin_schedule import is_due
+                if not is_due(source,now):return 'pending'
+            if not source.pending_execution_id:
+                try:await refresh_facebook_billing(db,now,dataset_for(source))
+                except Exception:
+                    await db.rollback()
+                    source=await db.get(NewsSource,source_id)
+                    source.last_error='Fresh shared-account billing proof for Facebook is required; no request sent.'
+                    await db.commit()
+                    return 'paused'
+            return await collect_linkedin(db,source,now,_store_post,reason=reason,backfill=backfill,cycle_source_id=cycle_source_id,clock=clock)
+        finally:await connection.execute(text('SELECT pg_advisory_unlock(:key)'),{'key':key})

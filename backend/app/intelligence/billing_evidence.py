@@ -17,6 +17,10 @@ def parse_billing_proof(proof,binding,now):
     ACCOUNT = binding['accountId']
     RESOURCE = binding['usageResource']
     require(isinstance(ACCOUNT,str) and bool(ACCOUNT) and isinstance(RESOURCE,str) and bool(RESOURCE) and binding['monthlyAllowance']==5000,'Unreviewed account binding')
+    resources = binding.get('usageResources', [RESOURCE])
+    require(isinstance(resources, list) and 1 <= len(resources) <= 3 and all(isinstance(r,str) and r for r in resources)
+            and len(set(resources)) == len(resources) and RESOURCE in resources, 'Unreviewed shared account resources')
+    resources = set(resources)
     require(proof['credentialSha256']==binding['credentialSha256'],'Credential binding changed')
     responses=proof['responses']
     for name in ('status','balance','pricing','usage'):
@@ -37,36 +41,38 @@ def parse_billing_proof(proof,binding,now):
     require(cutoff.tzinfo is not None and timedelta(0)<=now-cutoff<=timedelta(hours=2),'Provider rollup is stale or future-dated')
     require(cutoff.strftime('%Y-%m')==now.strftime('%Y-%m'),'Wrong usage month')
     records=0
+    resource_records={}
     for resource,metrics in usage['data'].items():
         for key,values in metrics.items():
             require(isinstance(values,list) and len(values)==now.day,'Incomplete daily provider rollup')
             total=sum(units(v) for v in values)
-            if resource!=RESOURCE or key not in {'rows_initial_billable','sets_initial_billable'}:
+            if resource not in resources or key not in {'rows_initial_billable','sets_initial_billable'}:
                 require(total==0,'Unsupported shared-credit consumption detected')
         daily=sum(metrics.get('rows_initial_billable',[]))
-        if resource==RESOURCE:
+        if resource in resources:
             summaries=usage['sums'].get(resource,{})
             for window in ('back_m0','custom'):
                 require(units(summaries.get(window,{}).get('rows_initial_billable',0))==daily,'Provider daily/month totals disagree')
             records+=daily
+            resource_records[resource]=daily
     # Check every totals-only resource too: the daily array cannot omit usage.
     for resource,windows in usage['sums'].items():
         for window,metrics in windows.items():
             for key,value in metrics.items():
                 number(value)
-                if resource!=RESOURCE or key not in {'rows_initial_billable','sets_initial_billable'}:
+                if resource not in resources or key not in {'rows_initial_billable','sets_initial_billable'}:
                     require(value==0,'Unsupported billed product/meter detected')
-                if resource==RESOURCE and key=='rows_initial_billable' and window in {'back_m0','custom'}:
-                    require(units(value)==records,'Provider totals missing daily rows')
+                if resource in resources and key=='rows_initial_billable' and window in {'back_m0','custom'}:
+                    require(units(value)==resource_records.get(resource,0),'Provider totals missing daily rows')
     for resource,metrics in usage['snapshots'].items():
         for key,samples in metrics.items():
             require(isinstance(samples,list),'Invalid live usage series')
             for sample in samples:
                 require(isinstance(sample,list) and len(sample)==2,'Invalid live usage sample')
                 value=number(sample[1])
-                if resource==RESOURCE and key=='rows_initial_billable':
+                if resource in resources and key=='rows_initial_billable':
                     units(value)
-                    require(value<=records,'Live usage is ahead of the settled rollup')
+                    require(value<=resource_records.get(resource,0),'Live usage is ahead of the settled rollup')
                 else:
                     require(value==0,'Unsupported live product consumption detected')
     return {'account_ref':ACCOUNT,'credential_sha256':binding['credentialSha256'],'consumers_isolated':binding.get('consumersIsolated') is True,'month':cutoff.strftime('%Y-%m'),'usage_as_of':cutoff.isoformat(),

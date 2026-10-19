@@ -54,6 +54,8 @@ def _utc(value: datetime) -> datetime:
 
 
 def activity_kind(item: NewsItem, source: NewsSource) -> str:
+    if source.type == 'FACEBOOK':
+        return 'POST'
     if source.type == "LINKEDIN":
         return str((item.linkedin_data or {}).get("kind") or "POST").upper()
     return "NEWS" if source.type in {"RSS", "WEBSITE"} else "ACTIVITY"

@@ -77,6 +77,9 @@ def source_identity(source):
     if source.type == 'LINKEDIN':
         from app.intelligence.linkedin_identity import identity_or_none
         return identity_or_none(source.url)
+    if source.type == 'FACEBOOK':
+        from app.intelligence.facebook_identity import identity_or_none
+        return identity_or_none(source.url)
     return source.url
 
 
@@ -87,7 +90,9 @@ async def freeze_inventory(db, cycle):
     if not cycle.inventory_frozen:
         sources = list(await db.scalars(select(NewsSource).where(NewsSource.status == 'ACTIVE').order_by(NewsSource.id)))
         for source in sources:
-            supported = source.type == 'LINKEDIN' or source.type in {'RSS', 'WEBSITE'} and rss_url_is_supported(source.url)
+            from app.intelligence.facebook_identity import source_approved
+            supported = (source.type == 'LINKEDIN' or source.type in {'RSS', 'WEBSITE'} and rss_url_is_supported(source.url)
+                         or source.type == 'FACEBOOK' and settings.NEWS_FACEBOOK_FETCH_ENABLED and source_approved(source))
             identity = source_identity(source)
             if not supported or not identity:
                 continue
@@ -124,7 +129,7 @@ async def trial_owns_source(db, source_id, now):
 
 
 async def dispatch_cycle_source(db, row_id, now, *, allow_new_requests=True, clock=None):
-    from app.intelligence.collection import check_source, protected_linkedin_check
+    from app.intelligence.collection import check_source, protected_linkedin_check, protected_facebook_check
     row = await db.get(CollectionCycleSource, row_id)
     now = clock() if clock else now
     if row.state in TERMINAL:
@@ -141,7 +146,8 @@ async def dispatch_cycle_source(db, row_id, now, *, allow_new_requests=True, clo
     if source.pending_execution_id and source.pending_execution_id != row.execution_id:
         owner = await db.scalar(select(CollectionCycleSource).where(
             CollectionCycleSource.execution_id == source.pending_execution_id).limit(1))
-        await protected_linkedin_check(db, source, now, reason='trial-poll',
+        protected_check = protected_facebook_check if source.type == 'FACEBOOK' else protected_linkedin_check
+        await protected_check(db, source, now, reason='trial-poll',
                                        cycle_source_id=owner.id if owner else None, clock=clock)
         return 'pending'
     if not row.execution_id and not allow_new_requests:
@@ -153,8 +159,9 @@ async def dispatch_cycle_source(db, row_id, now, *, allow_new_requests=True, clo
         if point and row.window_start < point <= row.window_end:
             row.window_start, row.verified_start = point, True
         await db.commit()
-    if row.type == 'LINKEDIN':
-        result = await protected_linkedin_check(db, source, now, cycle_source_id=row.id, clock=clock)
+    if row.type in {'LINKEDIN','FACEBOOK'}:
+        protected_check = protected_facebook_check if row.type == 'FACEBOOK' else protected_linkedin_check
+        result = await protected_check(db, source, now, cycle_source_id=row.id, clock=clock)
         await db.refresh(row)
         execution = await db.get(BrightDataExecution, row.execution_id) if row.execution_id else None
         if execution and execution.state in {'failed', 'uncertain'}:
