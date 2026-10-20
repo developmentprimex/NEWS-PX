@@ -356,8 +356,8 @@ def test_empty_reports_and_unsubscribed_updates_do_not_send(database, monkeypatc
         pytest.fail('No email authorized without new subscribed updates')
     monkeypatch.setattr(service, '_send_digest', send)
     original = service.scheduled_entries
-    async def select_then_unsubscribe(db, user, *args):
-        entries = await original(db, user, *args)
+    async def select_then_unsubscribe(db, user, *args, **kwargs):
+        entries = await original(db, user, *args, **kwargs)
         async with sessions() as other:
             await other.execute(delete(NewsSourceEmailSubscription))
             await other.commit()

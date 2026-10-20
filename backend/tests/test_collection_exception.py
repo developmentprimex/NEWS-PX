@@ -14,7 +14,7 @@ from app.intelligence.collection_exception import applies, observe, SATURATION_P
 from app.intelligence.collection_cycles import CollectionCycle, CollectionCycleSource
 from app.intelligence.facebook_adapter import request_spec
 from app.intelligence.linkedin_adapter import LinkedInCollectionError
-from app.intelligence.models import BrightDataAccount, BrightDataExecution, NewsSource, NewsItem
+from app.intelligence.models import BrightDataAccount, BrightDataExecution, NewsSource, NewsItem, NewsSourceEmailSubscription, NewsDigestSettings
 from test_brightdata_postgres_integration import Provider, database, private_postgres, source
 
 PM = datetime(2026, 10, 20, 19, tzinfo=timezone.utc)
@@ -202,4 +202,50 @@ def test_larger_linkedin_result_saves_only_the_last_exact_interval(database, mon
             execution = await db.scalar(select(BrightDataExecution))
             assert execution.returned_records == 8 and execution.ignored_records == 6
             assert execution.state == 'completed'
+    asyncio.run(run())
+
+
+def test_evening_email_only_contains_confirmed_activity_in_the_last_slot_for_every_type(database, monkeypatch):
+    from uuid import uuid4
+    from app.intelligence.collection_cycles import ScheduledDigestReport
+    _, sessions = database
+    monkeypatch.setattr(settings, 'EMAIL_USER', 'sender@example.org')
+    monkeypatch.setattr(settings, 'EMAIL_PASSWORD', 'test-only')
+    sent = []
+    async def smtp(subject, body, html):
+        sent.append(body)
+    monkeypatch.setattr(schedule, '_send_digest', smtp)
+    async def run():
+        user_id = uuid4()
+        async with sessions() as db:
+            await fresh(db, PM)
+            db.add(NewsDigestSettings(user_id=user_id, times=['07:00','21:00'],
+                last_slot_at=PM-timedelta(days=2)))
+            keep = set()
+            for kind in ('LINKEDIN','FACEBOOK','WEBSITE','RSS'):
+                src = NewsSource(name=kind, type=kind, status='ACTIVE', url='https://example.org/'+kind)
+                db.add(src)
+                await db.flush()
+                db.add(NewsSourceEmailSubscription(user_id=user_id, source_id=src.id, enabled_at=PM-timedelta(days=4)))
+                for label, stamp, verified in [('old',PM-timedelta(days=1),True),
+                    ('at-seven',PM-timedelta(hours=14),True),('inside',PM-timedelta(hours=1),True),
+                    ('at-cutoff',PM,True),('after',PM+timedelta(seconds=1),True),('undated',None,False)]:
+                    item=NewsItem(source_id=src.id,title=kind+' '+label,url='https://example.org/'+kind+'/'+label,
+                        published_at=stamp,publication_time_verified=verified,created_at=PM+timedelta(minutes=1))
+                    db.add(item)
+                    await db.flush()
+                    if label in {'inside','at-cutoff'}:keep.add(str(item.id))
+                if kind=='LINKEDIN':
+                    db.add(NewsItem(source_id=src.id,title='Unverified repost',url='https://example.org/repost',
+                        published_at=PM-timedelta(hours=1),publication_time_verified=False,
+                        linkedin_data={'kind':'REPOST'},created_at=PM+timedelta(minutes=1)))
+            cycle=CollectionCycle(trial_date=PM.date(),phase='scheduled-pm',cutoff_at=PM,
+                deadline_at=PM+timedelta(minutes=30),state='finished',inventory_frozen=True)
+            db.add(cycle)
+            await db.commit()
+            assert await schedule.process_scheduled_digest(db,cycle,user_id,PM+timedelta(minutes=2))==8
+            report=await db.scalar(select(ScheduledDigestReport))
+            assert set(report.content['item_ids'])==keep
+            assert len(sent)==1
+            assert await schedule.process_scheduled_digest(db,cycle,user_id,PM+timedelta(minutes=3))==0
     asyncio.run(run())

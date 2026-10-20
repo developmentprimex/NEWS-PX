@@ -128,7 +128,7 @@ async def run_social_collection(now=None, *, clock=None):
             await lock.execute(text('SELECT pg_advisory_unlock(:key)'), {'key': key})
 
 
-async def scheduled_entries(db, user_id, start, cutoff, now):
+async def scheduled_entries(db, user_id, start, cutoff, now, *, strict_interval=False):
     """Include late inserts from the completed social job, plus periodic website/RSS updates."""
     activity = func.coalesce(NewsItem.published_at, NewsItem.created_at)
     rows = (await db.execute(select(NewsItem, NewsAnalysis, NewsSource)
@@ -143,6 +143,10 @@ async def scheduled_entries(db, user_id, start, cutoff, now):
         .order_by(NewsSource.name, activity.desc(), NewsItem.id))).all()
     entries = {}
     for item, analysis, source in rows:
+        if strict_interval:
+            stamp = confirmed_activity_time(item)
+            if stamp is None or not start < stamp <= cutoff:
+                continue
         if source.type in {'LINKEDIN', 'FACEBOOK'}:
             stamp = confirmed_activity_time(item)
             if stamp is None or stamp > cutoff:
@@ -181,8 +185,11 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         return 0
     if digest.last_slot_at >= cycle.cutoff_at:
         return 0
-    start = digest.last_slot_at
-    entries = await scheduled_entries(db, user_id, start, cycle.cutoff_at, now)
+    from app.intelligence.collection_exception import applies
+    strict_interval = applies(cycle, cycle.cutoff_at)
+    start = previous_slot(cycle.cutoff_at) if strict_interval else digest.last_slot_at
+    entries = await scheduled_entries(db, user_id, start, cycle.cutoff_at, now,
+        strict_interval=strict_interval)
     # Honor source edits, pauses and unsubscribe that occurred during selection.
     source_ids = sorted({e['source'].id for e in entries})
     identities = {e['source'].id: source_identity(e['source']) for e in entries}
