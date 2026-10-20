@@ -91,9 +91,7 @@ def test_digest_groups_sources_and_sends_only_new_items(monkeypatch):
         assert "https://example.org/one" not in sent[1][1]
         count = await digest_service.process_digest(db, user_id, datetime(2026, 10, 1, 10, 31, tzinfo=timezone.utc))
         assert count == 0
-        assert len(sent) == 3
-        assert "0 aktivitete të reja" in sent[2][0]
-        assert "https://example.org/one" not in sent[2][1]
+        assert len(sent) == 2
         assert len(db.deliveries) == 4
 
     asyncio.run(run())
@@ -105,7 +103,7 @@ def test_digest_times_are_unique_and_sorted():
         DigestSettingsInput(times=["12:30", "12:30"])
 
 
-def test_empty_report_is_sent_once_per_slot_and_lists_selected_sources(monkeypatch):
+def test_empty_report_advances_slot_without_sending(monkeypatch):
     sent = []
 
     async def fake_send(subject, body, html):
@@ -119,17 +117,14 @@ def test_empty_report_is_sent_once_per_slot_and_lists_selected_sources(monkeypat
     async def run():
         now = datetime(2026, 9, 30, 15, 1, tzinfo=timezone.utc)
         assert await digest_service.process_digest(db, user_id, now) == 0
-        assert len(sent) == 1
-        assert "0 aktivitete të reja" in sent[0][0]
-        assert "KIESA & Lajme" in sent[0][1] and "EU Digital" in sent[0][1]
-        assert "KIESA &amp; Lajme" in sent[0][2]
-        assert "17:00" in sent[0][1]
-        assert digest.last_sent_at == now
+        assert sent == []
+        assert digest.last_slot_at == datetime(2026, 9, 30, 15, tzinfo=timezone.utc)
+        assert digest.last_sent_at is None
         assert not db.deliveries
         await digest_service.process_digest(db, user_id, now)
-        assert len(sent) == 1
         await digest_service.process_digest(db, user_id, datetime(2026, 9, 30, 19, 1, tzinfo=timezone.utc))
-        assert len(sent) == 2
+        assert sent == []
+        assert digest.last_slot_at == datetime(2026, 9, 30, 19, tzinfo=timezone.utc)
 
     asyncio.run(run())
 
@@ -145,7 +140,7 @@ def test_no_report_when_no_active_email_sources(monkeypatch):
     assert digest.last_sent_at is None
 
 
-def test_failed_empty_report_retries_without_advancing_slot(monkeypatch):
+def test_failed_report_with_updates_retries_without_advancing_slot(monkeypatch):
     calls = []
 
     async def fake_send(*args):
@@ -156,7 +151,7 @@ def test_failed_empty_report_retries_without_advancing_slot(monkeypatch):
     monkeypatch.setattr(digest_service, "_send_digest", fake_send)
     previous = datetime(2026, 9, 30, 10, 30, tzinfo=timezone.utc)
     digest = SimpleNamespace(times=["17:00"], last_slot_at=previous, last_sent_at=None, last_error=None)
-    db = FakeSession(digest, [], sources=[source_fixture("KIESA")])
+    db = FakeSession(digest, [row("KIESA", "https://example.org/new", datetime(2026, 9, 30, 12, tzinfo=timezone.utc))])
     user_id = uuid4()
     now = datetime(2026, 9, 30, 15, 1, tzinfo=timezone.utc)
 
@@ -171,3 +166,37 @@ def test_failed_empty_report_retries_without_advancing_slot(monkeypatch):
         assert digest.last_error is None
 
     asyncio.run(run())
+
+
+def test_report_omits_sources_without_new_updates_and_zero_categories():
+    now = datetime(2026, 10, 20, 15, tzinfo=timezone.utc)
+    item, analysis, active = row("Active source", "https://example.org/new", now)
+    idle = source_fixture("Idle source")
+    failed = source_fixture("Failed source")
+    failed.last_error = "Provider failed"
+    _, body, html = digest_service.digest_content(
+        [{"item": item, "analysis": analysis, "source": active}], now,
+        sources=[idle, failed, active], source_names=[idle.name, failed.name, active.name])
+    for content in (body, html):
+        assert active.name in content
+        assert "1 lajme" in content
+        assert idle.name not in content and failed.name not in content
+        assert "0 postime" not in content
+        assert "0 repostime" not in content
+        assert "0 artikuj" not in content
+        assert "Burimet e zgjedhura" not in content
+        assert "Kontroll" not in content
+
+
+@pytest.mark.parametrize("kind", ["NEWS", "POST", "REPOST", "ARTICLE"])
+def test_report_summary_includes_only_nonempty_activity_types(kind):
+    now = datetime(2026, 10, 20, 15, tzinfo=timezone.utc)
+    item, analysis, source = row("Source", "https://example.org/new", now)
+    if kind != "NEWS":
+        source.type = "LINKEDIN"
+        item.linkedin_data = {"kind": kind}
+    _, body, html = digest_service.digest_content(
+        [{"item": item, "analysis": analysis, "source": source}], now)
+    for content in (body, html):
+        for zero in ("0 lajme", "0 postime", "0 repostime", "0 artikuj"):
+            assert zero not in content

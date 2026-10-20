@@ -118,7 +118,7 @@ def test_structured_email_escapes_content_and_rejects_unsafe_links():
     assert "1 aktivitet i ri" in subject
     assert "Intervali:" in body and "REPOST" not in body and "Repostim" in body
     assert "Provider failed" not in html
-    assert "paplot" in html
+    assert "Kontrolli" not in html
     assert "GA &amp; team" in html and "&lt;script&gt;" in html
     assert "javascript:" not in html and '<script>' not in html
     assert 'href="https://example.com/original"' in html

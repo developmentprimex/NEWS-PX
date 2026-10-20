@@ -1,7 +1,5 @@
 """Strict evening intervals and a durable, non-retryable SMTP claim."""
 import hashlib
-from html import escape
-from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
@@ -10,7 +8,7 @@ from sqlalchemy.dialects.postgresql import insert
 from app.config import settings
 from app.intelligence.collection_cycles import CollectionCycle, CollectionCycleSource, CollectionCycleReport, confirmed_activity_time
 from app.intelligence.cycle_service import trial_configuration, source_identity, TERMINAL
-from app.intelligence.digest_service import activity_delivery_key, activity_kind, digest_content, _stamp
+from app.intelligence.digest_service import activity_delivery_key, activity_kind, digest_content
 from app.intelligence.models import NewsItem, NewsAnalysis, NewsSource, NewsSourceEmailSubscription, NewsDigestDelivery
 from app.mail import GmailService
 
@@ -52,23 +50,12 @@ async def trial_digest_entries(db, cycle_id, user_id):
 
 
 def trial_digest_content(entries, source_windows, cutoff):
-    sources, interval_lines = [], []
-    for window in source_windows:
-        row = window['row']
-        status = None if row.state == 'completed' else 'Interval coverage is incomplete.'
-        sources.append(SimpleNamespace(id=row.source_id, name=row.name, type=row.type,
-            last_checked_at=row.completed_at, last_error=status,
-            pending_snapshot_id='pending' if row.state not in TERMINAL else None))
-        interval_lines.append(f'{row.name}: ({_stamp(row.window_start)}, {_stamp(row.window_end)}]'
-            + ('' if row.verified_start else ' · Historiku para intervalit është i paverifikuar')
-            + f" · Orë të paverifikuara në feed: {window.get('unknown', 0)}")
-    start = min((w['row'].window_start for w in source_windows), default=cutoff)
-    subject, body, html = digest_content(entries, cutoff, interval_start=start, sources=sources)
+    active_ids = {entry['source'].id for entry in entries}
+    start = min((w['row'].window_start for w in source_windows
+                 if w['row'].source_id in active_ids), default=cutoff)
+    subject, body, html = digest_content(entries, cutoff, interval_start=start)
     legacy_copy = 'Aktivitetet e marra me vonesë përfshihen në raportin pasues dhe shënohen veçmas.'
     html = html.replace(legacy_copy, 'Përzgjedhja përdor vetëm orën e konfirmuar të aktivitetit brenda intervalit për burimin.')
-    body += '\n\nIntervalet sipas burimit:\n' + '\n'.join(interval_lines)
-    html = html.replace('</body>', '<div style="max-width:700px;margin:auto;font-family:Arial;font-size:12px">'
-        + '<br>'.join(escape(line) for line in interval_lines) + '</div></body>')
     return subject, body, html
 
 
@@ -136,11 +123,14 @@ async def process_trial_digest(db, cycle_id, now):
     for row, _ in await subscribed_windows(db, cycle_id, user_id):
         if row.source_id not in authorized or source_identity(sources_by_id[row.source_id]) != row.canonical_url:
             continue
-        items = list(await db.scalars(select(NewsItem).where(NewsItem.source_id == row.source_id)))
-        windows.append({'row': row, 'unknown': sum(confirmed_activity_time(item) is None for item in items)})
+        windows.append({'row': row})
     valid_ids = {window['row'].source_id for window in windows}
     entries = [entry for entry in entries if entry['source'].id in valid_ids]
     if not windows:
+        await db.commit()
+        return 0
+    if not entries:
+        report.state, report.content = 'empty', {'item_ids': []}
         await db.commit()
         return 0
     subject, body, html = trial_digest_content(entries, windows, cycle.cutoff_at)

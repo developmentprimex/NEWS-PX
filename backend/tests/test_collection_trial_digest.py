@@ -4,7 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.config import settings
 from app.db import AppMetadata
@@ -88,7 +88,9 @@ def test_report_waits_for_collection_but_deadline_reports_pending(database, monk
         async with sessions() as db:
             await service.process_trial_digest(db, cid, END+timedelta(minutes=30))
         assert len(sent) == 1
-        assert 'paplot' in sent[0][1] or 'proces' in sent[0][1]
+        assert 'Afternoon post' in sent[0][1]
+        assert 'Kontrolli' not in sent[0][1]
+        assert 'Intervalet sipas burimit' not in sent[0][1]
     asyncio.run(run())
 
 
@@ -206,3 +208,44 @@ def test_report_deadline_runs_while_collection_worker_lock_is_held(database, mon
                 await worker_lock.execute(text('SELECT pg_advisory_unlock(7302192100)'))
         assert len(sent) == 1
     asyncio.run(run())
+
+
+
+def test_empty_trial_report_is_recorded_without_smtp(database, monkeypatch):
+    _, sessions = database
+    credentials(monkeypatch)
+    async def fail_send(*content):
+        pytest.fail("An empty digest must not send email")
+    monkeypatch.setattr(service, '_send_trial_report', fail_send)
+    async def run():
+        async with sessions() as db:
+            cid, _, _ = await prepare(db)
+            await db.execute(delete(NewsItem))
+            await db.commit()
+            assert await service.process_trial_digest(db, cid, END+timedelta(minutes=2)) == 0
+            report = (await db.scalars(select(CollectionCycleReport))).one()
+            assert report.state == 'empty'
+            assert report.sent_at is None and report.claimed_at is None
+            assert report.content == {'item_ids': []}
+        async with sessions() as db:
+            assert await service.process_trial_digest(db, cid, END+timedelta(minutes=3)) == 0
+    asyncio.run(run())
+
+
+def test_trial_email_contains_only_updates_without_source_diagnostics():
+    from types import SimpleNamespace
+    from test_intelligence_digest import row, source_fixture
+    item, analysis, active = row('Active source', 'https://example.org/new', END)
+    idle = source_fixture('Idle source')
+    windows = [{'row': SimpleNamespace(source_id=source.id, window_start=START, window_end=END,
+                name=source.name, type=source.type, state='failed', completed_at=None,
+                verified_start=False), 'unknown': 42} for source in (idle, active)]
+    _, body, html = service.trial_digest_content(
+        [{'item': item, 'analysis': analysis, 'source': active}], windows, END)
+    for content in (body, html):
+        assert 'Active source' in content and item.title in content
+        assert 'Idle source' not in content
+        assert 'Intervalet sipas burimit' not in content
+        assert 'feed: 42' not in content
+        assert 'Kontrolli' not in content
+        assert '0 postime' not in content
