@@ -89,6 +89,12 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
     ...companySources.map(source => ({ key: sourceFilterKey(source)!, name: source.name }))]
     .filter((entry, index, all) => all.findIndex(other => other.key === entry.key) === index)
   const companyLabel = companyFilter === "all" ? primexView ? "Mendex, PrimexEU and GA" : "LISTA GA" : selectedSources[0]?.name || "Selected account"
+  function accountHref(value: string) {
+    const params = new URLSearchParams(searchParams.toString())
+    if (value === "all") params.delete("company")
+    else params.set("company", value)
+    return `/intelligence/primex-linkedin${params.size ? `?${params}` : ""}`
+  }
   const [collectionEnabled, setCollectionEnabled] = React.useState<boolean | null>(null)
   const [selectedActivityKind, setActivityKind] = React.useState<"ALL" | "POST" | "REPOST">("ALL")
   const activityKind = selectedActivityKind
@@ -344,14 +350,14 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
         <div className="flex flex-wrap items-center justify-between gap-3"><h2 className="font-semibold text-[#214a31]">LinkedIn activity</h2><Link href="/intelligence/sources" className="text-xs text-[#64746a] hover:underline">Manage sources</Link></div>
         <p className="mt-2 text-sm text-[#758179]">{primexView ? "Mendex, PrimexEU and GA, newest first." : "All other LinkedIn accounts, newest first."} Refreshing reads stored posts; it does not start collection.</p>
         <p role="status" className="mt-2 text-sm text-[#68776b]">{collectionEnabled === true ? "Collection is enabled subject to source eligibility, billing verification and available budget." : "Collection is paused or not enabled. Existing posts remain available."}</p>
-        <div className="mt-4 w-full sm:max-w-sm">
+        {primexView ? <div className="mt-4">
+          <p className="mb-2 text-sm font-medium text-[#214a31]">Account</p>
+          <nav aria-label="LinkedIn accounts" className="flex flex-wrap gap-2">
+            {accountOptions.map(account => <Link key={account.key} href={accountHref(account.key)} aria-current={companyFilter === account.key ? "page" : undefined} className={cn("rounded-lg px-4 py-2 text-sm font-medium", companyFilter === account.key ? "bg-[#eaf1e9] text-[#214a31]" : "text-[#64746a] hover:bg-[#f5f7f3]")}>{account.name}</Link>)}
+          </nav>
+        </div> : <div className="mt-4 w-full sm:max-w-sm">
           <label htmlFor="linkedin-account-filter" className="mb-2 block text-sm font-medium text-[#214a31]">Account</label>
-          <Select value={companyFilter} onValueChange={(value) => {
-            const params = new URLSearchParams(searchParams.toString())
-            if (value === "all") params.delete("company")
-            else params.set("company", value)
-            router.push(`/intelligence/primex-linkedin${params.size ? `?${params}` : ""}`)
-          }}>
+          <Select value={companyFilter} onValueChange={(value) => router.push(accountHref(value))}>
             <SelectTrigger id="linkedin-account-filter" className="w-full border-[#e5eae4] bg-white shadow-none">
               <SelectValue placeholder="Select an account" />
             </SelectTrigger>
@@ -359,7 +365,7 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
               {accountOptions.map(account => <SelectItem key={account.key} value={account.key}>{account.name}</SelectItem>)}
             </SelectContent>
           </Select>
-        </div>
+        </div>}
         {companyFilter !== "all" && selectedSources.length > 0 ? <div className="mt-4 space-y-3">{selectedSources.map(source => { const presentation = sourceCollectionStatus(source); return <div key={source.id} className="rounded-lg border border-[#e5eae4] p-3">
           <a href={source.url} target="_blank" rel="noopener noreferrer" className="text-sm font-semibold text-[#214a31] hover:underline">{source.name} on LinkedIn</a>
           <p className="mt-2 text-xs text-[#68776b]">{source.status === "PAUSED" ? "Monitoring paused" : source.pending_snapshot_id ? "Collection pending" : "07:00 / 21:00, subject to budget"}{source.last_checked_at ? ` · Last checked ${new Date(source.last_checked_at).toLocaleString("en-GB")}` : " · No completed check yet"}</p>
