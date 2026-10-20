@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.db import SessionLocal, engine
 from app.intelligence.ai_service import analyze_news_item
-from app.intelligence.generic_website_adapter import GenericWebsiteAdapter
+from app.intelligence.generic_website_adapter import GenericWebsiteAdapter, GenericWebsiteError
 from app.intelligence.linkedin_adapter import LinkedInCollectionError
 from app.intelligence.linkedin_identity import identity_or_none, lock_key, collection_owner
 from app.intelligence.linkedin_collection import collect_linkedin, incremental_start
@@ -219,7 +219,7 @@ async def check_source(db: AsyncSession, source_id: uuid.UUID, *, force: bool = 
         if force:
             return "paused"
         return await protected_linkedin_check(db, source, now)
-    except (LinkedInCollectionError, WebsiteCollectionError, RSSCollectionError, httpx.HTTPError) as exc:
+    except (LinkedInCollectionError, WebsiteCollectionError, GenericWebsiteError, RSSCollectionError, httpx.HTTPError) as exc:
         await db.rollback()
         source = await db.get(NewsSource, source_id)
         if source is None:

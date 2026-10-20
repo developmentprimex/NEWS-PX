@@ -2,6 +2,7 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import httpx
+import pytest
 
 from app.intelligence.generic_website_adapter import (
     GenericWebsiteAdapter, GenericWebsiteError, Page, discover_links,
@@ -54,3 +55,57 @@ def test_grant_only_source_rejects_other_news():
     assert not category_allowed(["Grants"], "TENDER")
     assert not category_allowed(["Grants"], "NEWS")
     assert category_allowed([], "NEWS")
+
+
+def test_transient_server_error_is_retried_before_reading_page(monkeypatch):
+    monkeypatch.setattr("app.intelligence.generic_website_adapter._check_public_dns", AsyncMock())
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(503 if len(requests) == 1 else 200,
+                              headers={"content-type": "text/html"}, content=b"<html>Recovered</html>")
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            page = await GenericWebsiteAdapter("https://example.org/news")._get(client, "https://example.org/news")
+            assert page.body == b"<html>Recovered</html>"
+
+    asyncio.run(run())
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize("status,attempts", [(403, 1), (500, 2), (526, 1)])
+def test_persistent_http_errors_have_bounded_attempts(monkeypatch, status, attempts):
+    monkeypatch.setattr("app.intelligence.generic_website_adapter._check_public_dns", AsyncMock())
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(status)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            with pytest.raises(httpx.HTTPStatusError) as error:
+                await GenericWebsiteAdapter("https://example.org/")._get(client, "https://example.org/")
+            assert error.value.response.status_code == status
+
+    asyncio.run(run())
+    assert len(requests) == attempts
+
+
+def test_generic_failure_is_saved_without_leaving_stale_source_status(monkeypatch):
+    from types import SimpleNamespace
+    from uuid import uuid4
+    from app.intelligence import collection
+
+    source = SimpleNamespace(id=uuid4(), type="WEBSITE", status="ACTIVE", url="https://example.org/",
+                             last_started_at=None, last_checked_at=None, last_error="Old failure", fetch_interval_minutes=60)
+    db = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: source)),
+                         rollback=AsyncMock(), get=AsyncMock(return_value=source), commit=AsyncMock())
+    monkeypatch.setattr(GenericWebsiteAdapter, "collect", AsyncMock(side_effect=GenericWebsiteError("No public announcement links were found.")))
+
+    assert asyncio.run(collection.check_source(db, source.id)) == "error"
+    assert source.last_error == "No public announcement links were found."
+    assert source.last_started_at is not None
+    assert source.last_checked_at is None

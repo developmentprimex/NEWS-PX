@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import os
 import re
@@ -163,6 +164,17 @@ class GenericWebsiteAdapter:
         self.source_url = source_url
 
     async def _get(self, client: httpx.AsyncClient, url: str) -> Page:
+        try:
+            return await self._get_once(client, url)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in {500, 502, 503, 504}:
+                raise
+        # Retry one transient read failure; access denials and certificate
+        # problems need operator/site-owner action, not repeated requests.
+        await asyncio.sleep(1)
+        return await self._get_once(client, url)
+
+    async def _get_once(self, client: httpx.AsyncClient, url: str) -> Page:
         for _ in range(4):
             if not _same_site(url, self.source_url):
                 raise GenericWebsiteError("The page redirected outside the monitored website.")

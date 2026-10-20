@@ -33,7 +33,7 @@ async def main(args):
     try:
         async with conn.transaction(readonly=True):
             queries = {
-                "identity": "SELECT current_database() database,current_user role,current_setting('server_version') version,current_setting('TimeZone') timezone,current_setting('ssl') ssl,current_setting('transaction_read_only') readonly,inet_server_port() port,current_setting('search_path') search_path",
+                "identity": "SELECT current_database() database,current_user role,current_setting('server_version') version,current_setting('server_version_num')::int version_num,pg_is_in_recovery() in_recovery,current_setting('TimeZone') timezone,current_setting('ssl') ssl,current_setting('transaction_read_only') readonly,inet_server_port() port,current_setting('search_path') search_path",
                 "databases": "SELECT datname,pg_get_userbyid(datdba) owner,has_database_privilege(current_user,oid,'CONNECT') can_connect FROM pg_database WHERE NOT datistemplate",
                 "tables": "SELECT schemaname,tablename,tableowner FROM pg_tables WHERE tablename LIKE 'intelligence_%'",
                 "permissions": "SELECT has_schema_privilege(current_user,'public','USAGE') schema_usage,has_schema_privilege(current_user,'public','CREATE') schema_create",

@@ -24,3 +24,24 @@ test('development push allowed; protected branches, deletion and tags blocked', 
     assert.equal(result.status,code,ref);
   }
 });
+
+test('explicit main approval is bound to both exact commit and remote base', () => {
+  const {deniedRefs} = require('./check-push.cjs');
+  const sha = 'a'.repeat(40), base = 'b'.repeat(40);
+  const input = `refs/heads/reviewed ${sha} refs/heads/main ${base}\n`;
+  assert.deepEqual(deniedRefs(input, {sha, base}), []);
+  for (const approval of [{sha}, {base}, {sha: 'c'.repeat(40), base}, {sha, base: 'c'.repeat(40)}]) {
+    assert.deepEqual(deniedRefs(input, approval), ['refs/heads/main']);
+  }
+  assert.deepEqual(deniedRefs(`(delete) ${'0'.repeat(40)} refs/heads/main ${base}\n`, {sha, base}), ['refs/heads/main']);
+  assert.deepEqual(deniedRefs(`refs/heads/x ${sha} refs/tags/v1 ${base}\n`, {sha, base}), ['refs/tags/v1']);
+});
+
+test('matching main approval still refuses a non-fast-forward history', () => {
+  const result = spawnSync(process.execPath, [script], {
+    input: `refs/heads/reviewed ${'a'.repeat(40)} refs/heads/main ${'b'.repeat(40)}\n`,
+    env: {...process.env, NEWS_APPROVED_MAIN_SHA: 'a'.repeat(40), NEWS_APPROVED_MAIN_BASE: 'b'.repeat(40)},
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr.toString(), /fast-forward/);
+});
