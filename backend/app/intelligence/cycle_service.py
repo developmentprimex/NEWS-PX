@@ -99,7 +99,9 @@ async def freeze_inventory(db, cycle):
         for source in sources:
             from app.intelligence.social_schedule import SCHEDULE_PHASES
             if cycle.phase in SCHEDULE_PHASES:
-                if not settings.NEWS_ENABLE_COLLECTION or source.type not in {'LINKEDIN', 'FACEBOOK'}:
+                from app.intelligence.collection_exception import applies
+                experiment = applies(cycle, cycle.cutoff_at)
+                if not settings.NEWS_ENABLE_COLLECTION or (source.type not in {'LINKEDIN', 'FACEBOOK'} and not experiment):
                     continue
                 if source.type == 'LINKEDIN' and not settings.NEWS_LINKEDIN_FETCH_ENABLED:
                     continue
@@ -116,6 +118,11 @@ async def freeze_inventory(db, cycle):
             if cycle.phase in SCHEDULE_PHASES:
                 from app.intelligence.social_schedule import previous_slot
                 bootstrap = previous_slot(cycle.cutoff_at)
+                from app.intelligence.collection_exception import applies
+                if applies(cycle, cycle.cutoff_at):
+                    # This owner-authorized experiment measures the last slot;
+                    # it does not silently buy a historical backfill.
+                    point = bootstrap
             db.add(CollectionCycleSource(cycle_id=cycle.id, source_id=source.id, name=source.name,
                 type=source.type, canonical_url=identity, window_start=point or bootstrap,
                 window_end=cycle.cutoff_at, verified_start=point is not None))

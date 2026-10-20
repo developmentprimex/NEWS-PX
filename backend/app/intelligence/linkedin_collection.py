@@ -55,6 +55,8 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
     if reason == 'trial-poll' and not source.pending_execution_id:
         return 'pending'
     cycle_row = None
+    exception = False
+    experiment_cycle = False
     if cycle_source_id:
         from app.intelligence.collection_cycles import CollectionCycleSource, CollectionCycle, TemporalWindow, provider_dates, confirmed_activity_time
         from app.intelligence.cycle_service import cycle_authorized, TERMINAL
@@ -81,6 +83,11 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
             return 'pending'
         prefix = 'scheduled-cycle' if cycle.phase.startswith('scheduled-') else 'trial'
         reason = f'{prefix}:{cycle.phase}:{cycle.id}'
+        from app.intelligence.collection_exception import applies, RECORD_LIMIT
+        exception = applies(cycle, now)
+        experiment_cycle = applies(cycle, cycle.cutoff_at)
+        if exception:
+            record_limit = RECORD_LIMIT
     if (settings.NEWS_SOCIAL_SCHEDULE_ENABLED and not cycle_row and not backfill
             and not source.pending_execution_id and not reason.startswith("canary:")):
         return "paused"
@@ -92,7 +99,9 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
     if settings.NEWS_BRIGHTDATA_CANARY_LIVE_ENABLED != reason.startswith("canary:"):
         return "paused"
     if source.linkedin_paused_reason:
-        return "paused"
+        from app.intelligence.collection_exception import allows_saturation_retry
+        if not await allows_saturation_retry(db, source, cycle_source_id, now):
+            return "paused"
     # Recover a known snapshot even when the monthly budget blocks new triggers.
     # The account latch blocks all automatic provider traffic after credit errors.
     account = await locked_account(db)
@@ -101,7 +110,7 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
         await db.commit()
         return "paused"
     await db.commit()
-    adapter = adapter or (BrightDataFacebookAdapter(settings.BRIGHTDATA_API_TOKEN, dataset_for(source)) if facebook
+    adapter = adapter or (BrightDataFacebookAdapter(settings.BRIGHTDATA_API_TOKEN, dataset_for(source), expanded=exception) if facebook
                           else BrightDataLinkedInAdapter(settings.BRIGHTDATA_API_TOKEN, settings.BRIGHTDATA_LINKEDIN_POSTS_DATASET_ID))
     execution = await db.get(BrightDataExecution, source.pending_execution_id) if source.pending_execution_id else None
     execution_id = execution.id if execution else None
@@ -162,8 +171,9 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
                 posts = []
             invalid = len(records) - len(posts)
             uncertain_dates = any(not post.published_at or not execution.start_date <= post.published_at.date() <= execution.end_date for post in posts)
-            if facebook:
-                uncertain_dates = any(confirmed_activity_time(post) is None for post in posts)
+            if facebook or experiment_cycle:
+                if facebook:
+                    uncertain_dates = any(confirmed_activity_time(post) is None for post in posts)
                 def in_window(post):
                     stamp=confirmed_activity_time(post)
                     if stamp is None:return True

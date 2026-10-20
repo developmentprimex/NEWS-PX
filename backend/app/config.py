@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import date
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -19,6 +20,7 @@ class Settings(BaseSettings):
     NEWS_EMAIL_RECIPIENT: str = "180primex.eu@gmail.com"
     NEWS_ENABLE_COLLECTION: bool = False
     NEWS_SOCIAL_SCHEDULE_ENABLED: bool = True
+    NEWS_COLLECTION_EXCEPTION_DATE: date | None = None
     NEWS_AUTO_IMPORT_SNAPSHOT: bool = False
     OPENAI_API_KEY: str | None = None
     INTELLIGENCE_AI_MODEL: str = "gpt-5.4-nano"

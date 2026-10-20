@@ -312,7 +312,9 @@ async def protected_facebook_check(db, source, now, *, reason='scheduled', backf
             candidates=list(await db.scalars(select(NewsSource).where(NewsSource.type=='FACEBOOK').order_by(NewsSource.created_at,NewsSource.id)))
             owners=[s for s in candidates if facebook_identity(s.url)==identity]
             if not owners or owners[0].id!=source.id:return 'paused'
-            if source.linkedin_paused_reason:return 'paused'
+            if source.linkedin_paused_reason:
+                from app.intelligence.collection_exception import allows_saturation_retry
+                if not await allows_saturation_retry(db,source,cycle_source_id,now):return 'paused'
             if not source.pending_execution_id and not cycle_source_id and not backfill:
                 from app.intelligence.linkedin_schedule import is_due
                 if not is_due(source,now):return 'pending'
