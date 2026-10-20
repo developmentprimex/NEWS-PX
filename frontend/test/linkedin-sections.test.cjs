@@ -65,6 +65,20 @@ for (const [view,wanted,unwanted] of [
   for (const name of unwanted) assert(!html.includes(`Activity from ${name}`));
   assert(html.includes('LISTA GA'));
   assert(!html.includes('SMM LIST ACTIVITY'));
-  assert(html.includes('linkedin-account-filter'));
+  if (view==='primex-linkedin') {
+    assert(!html.includes('linkedin-account-filter'),'primary accounts must be visible outside the dropdown');
+    const accountNav=html.match(/<nav aria-label="LinkedIn accounts"[^>]*>([\s\S]*?)<\/nav>/);
+    assert(accountNav,'primary account navigation is visible');
+    const links=[...accountNav[1].matchAll(/<a[^>]*href="([^"]+)"[^>]*>([^<]+)<\/a>/g)].map(m=>({href:m[1],label:m[2]}));
+    assert.deepEqual(links,[
+      {href:'/intelligence/primex-linkedin',label:'All accounts'},
+      {href:'/intelligence/primex-linkedin?company=primex',label:'PrimexEU'},
+      {href:'/intelligence/primex-linkedin?company=mendex',label:'Mendex'},
+      {href:'/intelligence/primex-linkedin?company=ganimete',label:'GA'},
+    ]);
+  } else {
+    assert(html.includes('linkedin-account-filter'),'LISTA GA retains its account dropdown');
+    assert(!html.includes('aria-label="LinkedIn accounts"'));
+  }
   assert(html.includes('>Posts</button>') && html.includes('>Reposts</button>'));
 });
