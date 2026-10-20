@@ -24,6 +24,12 @@ export function eligibleLinkedInSources(sources: LinkedInMonitoringSource[]): Li
   return sources.filter(source => Boolean(sourceFilterKey(source)))
 }
 
+export function linkedInSectionSources(sources: LinkedInMonitoringSource[], section: "accounts" | "lista-ga"): LinkedInMonitoringSource[] {
+  const accountKeys = new Set(["primex", "mendex", "ganimete"])
+  return eligibleLinkedInSources(sources).filter(source =>
+    accountKeys.has(sourceFilterKey(source)!) === (section === "accounts"))
+}
+
 export function selectLinkedInSources(sources: LinkedInMonitoringSource[], filter: string): LinkedInMonitoringSource[] {
   return eligibleLinkedInSources(sources).filter(source => filter === "all" || sourceFilterKey(source) === filter)
 }
