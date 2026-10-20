@@ -7,6 +7,7 @@ import { toast } from "sonner"
 import { AlertCircle, CalendarDays, RefreshCw, Search, SlidersHorizontal, Sparkles } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { useAuth } from "@/lib/auth"
 import type { User } from "@/lib/types"
 import { cn } from "@/lib/utils"
@@ -85,6 +86,9 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
   const [companySources, setCompanySources] = React.useState<LinkedInMonitoringSource[]>([])
   const companyFilter = searchParams.get("company") || "all"
   const selectedSources = selectLinkedInSources(companySources, companyFilter)
+  const accountOptions = [{ key: "all", name: "All accounts" },
+    ...companySources.map(source => ({ key: sourceFilterKey(source)!, name: source.name }))]
+    .filter((entry, index, all) => all.findIndex(other => other.key === entry.key) === index)
   const companyLabel = companyFilter === "all" ? "LinkedIn accounts" : selectedSources[0]?.name || "Selected account"
   const [collectionEnabled, setCollectionEnabled] = React.useState<boolean | null>(null)
   const [selectedActivityKind, setActivityKind] = React.useState<"ALL" | "POST" | "REPOST">("ALL")
@@ -346,12 +350,27 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
         <div className="flex flex-wrap items-center justify-between gap-3"><h2 className="font-semibold text-[#214a31]">LinkedIn activity</h2><Link href="/intelligence/sources" className="text-xs text-[#64746a] hover:underline">Manage sources</Link></div>
         <p className="mt-2 text-sm text-[#758179]">All eligible LinkedIn sources, newest first. Refreshing reads stored posts; it does not start collection.</p>
         <p role="status" className="mt-2 text-sm text-[#68776b]">{collectionEnabled === true ? "Collection is enabled subject to source eligibility, billing verification and available budget." : "Collection is paused or not enabled. Existing posts remain available."}</p>
-        <div role="group" aria-label="LinkedIn source filter" className="mt-4 flex flex-wrap gap-1 text-sm">{[{key: "all", name: "All accounts"}, ...companySources.map(source => ({key: sourceFilterKey(source)!, name: source.name}))].filter((entry, index, all) => all.findIndex(other => other.key === entry.key) === index).map(entry => <button key={entry.key} type="button" aria-pressed={companyFilter === entry.key} onClick={() => { const params = new URLSearchParams(searchParams.toString()); if (entry.key === "all") params.delete("company"); else params.set("company", entry.key); router.push(`/intelligence/primex-linkedin${params.size ? `?${params}` : ""}`) }} className={cn("rounded-md px-4 py-1.5", companyFilter === entry.key ? "bg-[#eaf1e9] font-medium text-[#214a31]" : "text-[#64746a]")}>{entry.name}</button>)}</div>
-        <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{selectedSources.map(source => { const presentation = sourceCollectionStatus(source); return <div key={source.id} className="rounded-lg border border-[#e5eae4] p-3">
+        <div className="mt-4 w-full sm:max-w-sm">
+          <label htmlFor="linkedin-account-filter" className="mb-2 block text-sm font-medium text-[#214a31]">Account</label>
+          <Select value={companyFilter} onValueChange={(value) => {
+            const params = new URLSearchParams(searchParams.toString())
+            if (value === "all") params.delete("company")
+            else params.set("company", value)
+            router.push(`/intelligence/primex-linkedin${params.size ? `?${params}` : ""}`)
+          }}>
+            <SelectTrigger id="linkedin-account-filter" className="w-full border-[#e5eae4] bg-white shadow-none">
+              <SelectValue placeholder="Select an account" />
+            </SelectTrigger>
+            <SelectContent position="popper" align="start" className="max-h-80">
+              {accountOptions.map(account => <SelectItem key={account.key} value={account.key}>{account.name}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        </div>
+        {companyFilter !== "all" && selectedSources.length > 0 ? <div className="mt-4 space-y-3">{selectedSources.map(source => { const presentation = sourceCollectionStatus(source); return <div key={source.id} className="rounded-lg border border-[#e5eae4] p-3">
           <a href={source.url} target="_blank" rel="noopener noreferrer" className="text-sm font-semibold text-[#214a31] hover:underline">{source.name} on LinkedIn</a>
           <p className="mt-2 text-xs text-[#68776b]">{source.status === "PAUSED" ? "Monitoring paused" : source.pending_snapshot_id ? "Collection pending" : "Daily eligibility, subject to budget"}{source.last_checked_at ? ` · Last checked ${new Date(source.last_checked_at).toLocaleString("en-GB")}` : " · No completed check yet"}</p>
           {presentation.message ? <p role={presentation.tone === "error" ? "alert" : "status"} className="mt-2 text-xs text-[#9a6e61]">{presentation.message}</p> : null}
-        </div> })}</div>
+        </div> })}</div> : null}
         <div role="group" aria-label="LinkedIn activity type" className="mt-4 inline-flex gap-1 rounded-lg bg-[#edf1ec] p-1 text-sm">{(["ALL", "POST", "REPOST"] as const).map(kind => <button key={kind} type="button" aria-pressed={activityKind === kind} onClick={() => setActivityKind(kind)} className={cn("rounded-md px-4 py-1.5", activityKind === kind ? "bg-white font-medium text-[#214a31] shadow-sm" : "text-[#64746a]")}>{kind === "ALL" ? "All activity" : kind === "POST" ? "Posts" : "Reposts"}</button>)}</div>
       </div> : null}
       {showBrief && brief && !loading ? <div className="mt-8"><AIBrief brief={brief} items={items} /></div> : null}

@@ -90,29 +90,13 @@ def digest_content(entries: list[dict], slot: datetime, source_names: list[str] 
     subject = f"[News Intelligence] {count} {'aktivitet i ri' if count == 1 else 'aktivitete të reja'} · {slot.astimezone(DIGEST_ZONE):%H:%M}"
     counts = {kind: sum(activity_kind(e["item"], e["source"]) == kind for e in entries) for kind in ACTIVITY_LABELS}
     other = count - sum(counts.values())
-    summary = " · ".join(f"{counts[kind]} {label}" for kind, label in [("NEWS", "lajme"), ("POST", "postime"), ("REPOST", "repostime"), ("ARTICLE", "artikuj")])
+    summary = " · ".join(f"{counts[kind]} {label}" for kind, label in [("NEWS", "lajme"), ("POST", "postime"), ("REPOST", "repostime"), ("ARTICLE", "artikuj")] if counts[kind])
     if other:
         summary += f" · {other} aktivitete të tjera"
     text_lines = [title, f"Intervali: {interval} (Europe/Budapest)", summary, ""]
     sections: dict[str, list[dict]] = {}
     for entry in entries:
         sections.setdefault(str(entry["source"].id), []).append(entry)
-    names = [source.name for source in sources] if sources is not None else (source_names or [])
-    source_rows = []
-    if sources is not None:
-        for source in sources:
-            status = "Kontrolluar" if source.last_checked_at else "Ende pa kontroll të përfunduar"
-            if source.last_error:
-                status = "Kontrolli dështoi · raporti mund të jetë i paplotë"
-            elif source.pending_snapshot_id:
-                status = "Kontrolli në proces"
-            checked = f" · {_stamp(source.last_checked_at)}" if source.last_checked_at else ""
-            total = len(sections.get(str(source.id), []))
-            text_lines.append(f"Burimi: {source.name} | {total} aktivitete | {status}{checked}")
-            source_rows.append(f'<tr><td style="padding:10px 12px;border-top:1px solid #e5ebe6;font-size:13px"><strong>{escape(source.name)}</strong><br><span style="color:#687b6c;font-size:11px">{escape(status + checked)}</span></td><td style="padding:10px 12px;border-top:1px solid #e5ebe6;text-align:right;font-weight:bold">{total}</td></tr>')
-    else:
-        text_lines.append("Burimet: " + ", ".join(names))
-    text_lines.append("")
     if not entries:
         message = "Nuk u gjet aktivitet i ri në të dhënat e mbledhura nga burimet e zgjedhura për këtë interval."
         text_lines.extend([message, ""])
@@ -164,8 +148,6 @@ def digest_content(entries: list[dict], slot: datetime, source_names: list[str] 
                          f'<p style="color:#687b6c;font-size:12px;line-height:1.6;margin:9px 0">{escape(meta)}</p>'
                          f'<p style="font-size:14px;line-height:1.6;margin:0 0 14px">{escape(summary_text)}</p>{link}</td></tr>')
         html_sections.append(f'<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:22px;border:1px solid #dfe7df;border-radius:10px;background:#fff"><tr><td style="padding:15px 20px;background:#edf3ed;font-weight:bold;font-size:16px">{escape(source_name)} <span style="font-weight:normal;color:#687b6c">· {len(group)} aktivitete</span></td></tr>{"".join(cards)}</table>')
-    source_table = (f'<table width="100%" cellspacing="0" cellpadding="0" style="margin-top:20px;border:1px solid #dfe7df;background:#fff"><tr><th align="left" style="padding:12px;font-size:13px">Burimet e zgjedhura</th><th align="right" style="padding:12px;font-size:13px">Aktivitete</th></tr>{"".join(source_rows)}</table>'
-                    if source_rows else f'<p style="font-size:13px;color:#687b6c">Burimet: {escape(", ".join(names))}</p>')
     html = ('<!doctype html><html lang="sq"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>'
             '<body style="margin:0;background:#f3f6f3;font-family:Arial,sans-serif;color:#24342a">'
             f'<div style="display:none;max-height:0;overflow:hidden">{escape(summary)} · Intervali: {escape(interval)}</div>'
@@ -176,7 +158,7 @@ def digest_content(entries: list[dict], slot: datetime, source_names: list[str] 
             f'<h1 style="font-size:26px;margin:0 0 12px">{title}</h1>'
             f'<p style="font-size:13px;line-height:1.6;margin:0">Intervali: {escape(interval)}<br>Europe/Budapest</p></td></tr></table>'
             f'<p style="padding:15px;background:#fff;border:1px solid #dfe7df;border-radius:8px;font-size:14px;font-weight:bold;line-height:1.7">{escape(summary)}</p>'
-            f'<p style="font-size:13px;line-height:1.6;color:#687b6c">{escape(message)}</p>' + source_table + "".join(html_sections) +
+            f'<p style="font-size:13px;line-height:1.6;color:#687b6c">{escape(message)}</p>' + "".join(html_sections) +
             '<p style="font-size:11px;line-height:1.6;color:#687b6c;margin-top:24px">Aktivitetet raportohen vetëm një herë. Aktivitetet e marra me vonesë përfshihen në raportin pasues dhe shënohen veçmas. Numrat e reagimeve tregojnë gjendjen në kontrollin e fundit.</p>'
             '</td></tr></table></td></tr></table></body></html>')
     return subject, "\n".join(text_lines), html
@@ -252,6 +234,11 @@ async def process_digest(db: AsyncSession, user_id: uuid.UUID, now: datetime | N
         if previous and activity_kind(entry["item"], entry["source"]) != "REPOST" and _utc(previous) >= _utc(entry["item"].created_at):
             continue
         entries.append(entry)
+    if not entries:
+        digest.last_slot_at = slot
+        digest.last_error = None
+        await db.commit()
+        return 0
     subject, body, html = digest_content(entries, slot, interval_start=digest.last_slot_at, sources=sources)
     try:
         await _send_digest(subject, body, html)
