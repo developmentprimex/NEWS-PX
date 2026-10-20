@@ -45,7 +45,7 @@ def usage_totals(account, executions, now: datetime) -> dict:
             "alerts": account.alert_levels or []}
 
 
-def denial_reason(account, totals: dict, now: datetime, limit: int) -> str | None:
+def denial_reason(account, totals: dict, now: datetime, limit: int, *, daily_target=None) -> str | None:
     if not settings.NEWS_LINKEDIN_FETCH_ENABLED:
         return "LinkedIn fetching is disabled by configuration."
     if account.paused_reason:
@@ -60,7 +60,7 @@ def denial_reason(account, totals: dict, now: datetime, limit: int) -> str | Non
         return "Recent provider billing evidence is required (maximum age: 24 hours)."
     if totals["effectiveRecords"] + limit > totals["operationalBudget"]:
         return "Operational monthly record budget reached."
-    if totals["dailyRecords"] + limit > settings.NEWS_LINKEDIN_DAILY_TARGET:
+    if totals["dailyRecords"] + limit > (settings.NEWS_LINKEDIN_DAILY_TARGET if daily_target is None else daily_target):
         return "Daily record target reached."
     return None
 
@@ -96,7 +96,10 @@ async def reserve_execution(db, source, now, start_date, end_date, *, reason="sc
     executions = await executions_for_budget(db)
     totals = usage_totals(account, executions, now)
     record_alerts(account, totals)
-    denial = denial_reason(account, totals, now, limit)
+    from app.intelligence.collection_exception import for_source
+    exception = await for_source(db, cycle_source_id, source.id, now)
+    denial = denial_reason(account, totals, now, limit,
+        daily_target=totals['operationalBudget'] if exception else None)
     if source.type == 'FACEBOOK':
         from app.intelligence.facebook_adapter import dataset_for
         from app.intelligence.facebook_identity import source_approved
@@ -104,9 +107,9 @@ async def reserve_execution(db, source, now, start_date, end_date, *, reason="sc
         facebook = [e for e in executions if e.dataset_id in {PAGE_DATASET, GROUP_DATASET}]
         if not settings.NEWS_FACEBOOK_FETCH_ENABLED or not source_approved(source):
             denial = 'Facebook source is outside the activated pilot.'
-        elif sum(e.estimated_billable_usage for e in facebook if e.started_at.date() == now.date()) + limit > settings.NEWS_FACEBOOK_DAILY_TARGET:
+        elif not exception and sum(e.estimated_billable_usage for e in facebook if e.started_at.date() == now.date()) + limit > settings.NEWS_FACEBOOK_DAILY_TARGET:
             denial = 'Facebook daily reservation budget reached.'
-        elif sum(e.estimated_billable_usage for e in facebook if e.budget_month == month_key(now)) + limit > settings.NEWS_FACEBOOK_MONTHLY_BUDGET:
+        elif not exception and sum(e.estimated_billable_usage for e in facebook if e.budget_month == month_key(now)) + limit > settings.NEWS_FACEBOOK_MONTHLY_BUDGET:
             denial = 'Facebook monthly reservation budget reached.'
         if dataset_id != dataset_for(source):
             raise ValueError('Facebook dataset does not match the approved source kind.')

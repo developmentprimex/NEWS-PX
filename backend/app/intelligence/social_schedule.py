@@ -96,6 +96,9 @@ async def run_social_collection(now=None, *, clock=None):
                         try:
                             await refresh_shared_billing(db, clock())
                             await db.commit()
+                            from app.intelligence.collection_exception import applies, observe
+                            if applies(cycle, clock()):
+                                await observe(db, cycle, clock(), before=True)
                         except Exception:
                             await db.rollback()
                             allow_new = False
@@ -236,6 +239,17 @@ async def run_social_reports(now=None):
     async with collection.SessionLocal() as db:
         await ensure_scheduled_cycle(db, now)
         users = list(await db.scalars(select(NewsDigestSettings.user_id)))
+        if settings.NEWS_COLLECTION_EXCEPTION_DATE:
+            cycles = list(await db.scalars(select(CollectionCycle).where(
+                CollectionCycle.trial_date == settings.NEWS_COLLECTION_EXCEPTION_DATE,
+                CollectionCycle.phase == 'scheduled-pm', CollectionCycle.state == 'finished')))
+            for cycle in cycles:
+                try:
+                    from app.intelligence.collection_exception import observe
+                    await observe(db, cycle, now)
+                except Exception:
+                    await db.rollback()
+                    logger.warning('One-evening usage observation deferred; existing evidence retained')
     fingerprint = hashlib.sha256(settings.NEWS_EMAIL_RECIPIENT.strip().casefold().encode()).hexdigest()
     for user_id in users:
         async with collection.SessionLocal() as db:
