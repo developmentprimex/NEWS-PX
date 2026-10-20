@@ -14,11 +14,10 @@ import { cn } from "@/lib/utils"
 import { AIBrief } from "./ai-brief"
 import { NewsCard } from "./news-card"
 import { StrategicBriefPanel } from "./strategic-brief"
-import { RepostWatchPanel } from "./repost-watch-panel"
 import { sourceCollectionStatus } from "../source-status"
 import { filters } from "./news-filters"
 import { intelligenceFeedService, type ReadState } from "../data/news.service"
-import { eligibleLinkedInSources, selectLinkedInSources, sourceFilterKey, feedScopes, type LinkedInMonitoringSource } from "../linkedin-monitoring"
+import { linkedInSectionSources, selectLinkedInSources, sourceFilterKey, feedScopes, type LinkedInMonitoringSource } from "../linkedin-monitoring"
 import { startCollectionCheck, loadCollectionStatus, type SourceCheckStatus } from "../collection-check"
 import type { DailyBrief, IntelligenceView, NewsEntry, NewsFilter, NewsSource, StrategicBrief } from "../types"
 
@@ -89,16 +88,14 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
   const accountOptions = [{ key: "all", name: "All accounts" },
     ...companySources.map(source => ({ key: sourceFilterKey(source)!, name: source.name }))]
     .filter((entry, index, all) => all.findIndex(other => other.key === entry.key) === index)
-  const companyLabel = companyFilter === "all" ? "LinkedIn accounts" : selectedSources[0]?.name || "Selected account"
+  const companyLabel = companyFilter === "all" ? primexView ? "Mendex, PrimexEU and GA" : "LISTA GA" : selectedSources[0]?.name || "Selected account"
   const [collectionEnabled, setCollectionEnabled] = React.useState<boolean | null>(null)
   const [selectedActivityKind, setActivityKind] = React.useState<"ALL" | "POST" | "REPOST">("ALL")
   const activityKind = selectedActivityKind
   const category = searchParams.get("category")
-  const highPriorityOnly = !primexView && searchParams.get("priority") === "high"
-  const filter: NewsFilter = primexView ? "All" : filters.find((value) => value === category) || (view === "for-you" ? "For You" : "All")
+  const highPriorityOnly = !activityView && searchParams.get("priority") === "high"
+  const filter: NewsFilter = activityView ? "All" : filters.find((value) => value === category) || (view === "for-you" ? "For You" : "All")
   const showBrief = view === "overview" || view === "for-you"
-  const repostGroup = searchParams.get("group") === "COMPANY" ? "COMPANY" : "CEO"
-  const previousWatchItems = React.useRef<Record<string, Set<string>>>({})
   const feedRequest = React.useRef(0)
   const [query, setQuery] = React.useState("")
   const [savedIds, setSavedIds] = React.useState<string[]>([])
@@ -113,30 +110,23 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
     if (!quiet) { setLoading(true); setError(false) }
     try {
       let scopedSources: LinkedInMonitoringSource[] | undefined
-      if (primexView) {
+      if (activityView) {
         const response = await apiFetch("/intelligence/linkedin-sources")
         if (!response.ok) throw new Error("Could not load LinkedIn sources.")
         const sources = await response.json() as LinkedInMonitoringSource[]
-        const monitored = eligibleLinkedInSources(sources)
+        const monitored = linkedInSectionSources(sources, primexView ? "accounts" : "lista-ga")
         if (request !== feedRequest.current) return
         setCompanySources(monitored)
         scopedSources = selectLinkedInSources(monitored, companyFilter)
-        setCollectionEnabled(sources.some(source => source.type === "LINKEDIN" && source.collection_enabled === true))
+        setCollectionEnabled(monitored.some(source => source.collection_enabled === true))
         if (!scopedSources.length) { setItems([]); setIsDemo(false); setError(false); return }
       }
       const readState = view === "saved" || feedMode === "dueSoon" || feedMode === "saved" ? "all" : feedMode
       const feeds = scopedSources ? await Promise.all(feedScopes(scopedSources, activityKind)
         .map(scope => intelligenceFeedService.getFeed(apiFetch, readState, false, feedMode === "saved", undefined, scope))) : null
       if (feeds && !feeds.length) { setItems([]); setIsDemo(false); setError(false); return }
-      const feed = feeds ? { ...feeds[0], items: feeds.flatMap((entry) => entry.items) } : await intelligenceFeedService.getFeed(apiFetch, readState, feedMode === "dueSoon" && view !== "saved", view === "saved" || feedMode === "saved", view === "repost-watch" ? repostGroup : undefined)
+      const feed = feeds ? { ...feeds[0], items: feeds.flatMap((entry) => entry.items) } : await intelligenceFeedService.getFeed(apiFetch, readState, feedMode === "dueSoon" && view !== "saved", view === "saved" || feedMode === "saved")
       if (request !== feedRequest.current) return
-      if (view === "repost-watch") {
-        const key = `${repostGroup}:${feedMode}`
-        const previous = previousWatchItems.current[key]
-        const fresh = previous ? feed.items.filter((item) => !previous.has(item.id)) : []
-        if (quiet && fresh.length) toast.info(`${fresh.length} new ${fresh.length === 1 ? "post" : "posts"} for ${repostGroup === "CEO" ? "CEO" : "Company"} repost review.`)
-        previousWatchItems.current[key] = new Set(feed.items.map((item) => item.id))
-      }
       setItems(feed.items)
       setError(false)
       if (feed.isDemo) {
@@ -150,7 +140,7 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
       setAiConfigured(feed.aiConfigured)
     } catch { if (!quiet && request === feedRequest.current) setError(true) }
     finally { if (request === feedRequest.current) setLoading(false) }
-  }, [apiFetch, feedMode, view, user, repostGroup, primexView, activityKind, companyFilter])
+  }, [apiFetch, feedMode, view, user, activityView, primexView, activityKind, companyFilter])
   React.useEffect(() => { void loadFeed() }, [loadFeed])
   React.useEffect(() => {
     if (!activityView) return
@@ -317,9 +307,8 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
         if ((feedMode === "read" && !isRead) || (feedMode === "unread" && isRead)) return false
       }
       if (view === "opportunities" && !opportunityCategories.has(item.analysis.category)) return false
-      if (view === "repost-watch" && !item.repostGroups?.includes(repostGroup)) return false
-      if (primexView && !selectLinkedInSources(companySources, companyFilter).some(source => source.id === item.sourceId)) return false
-      if (primexView && activityKind !== "ALL" && (activityKind === "REPOST" ? item.linkedin?.kind !== "REPOST" : item.linkedin?.kind === "REPOST")) return false
+      if (activityView && !selectLinkedInSources(companySources, companyFilter).some(source => source.id === item.sourceId)) return false
+      if (activityView && activityKind !== "ALL" && (activityKind === "REPOST" ? item.linkedin?.kind !== "REPOST" : item.linkedin?.kind === "REPOST")) return false
       if (feedMode === "dueSoon" && !hasNearApplicationDeadline(item, today)) return false
       if (highPriorityOnly && item.priority !== "HIGH") return false
       if (!((feedMode === "dueSoon" || feedMode === "saved") && filter === "For You") && !matchFilter(item, filter)) return false
@@ -333,7 +322,7 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
     return view === "for-you" || view === "opportunities"
       ? matching.sort((a, b) => (b.focusScore ?? 0) - (a.focusScore ?? 0) || newestFirst(a, b))
       : matching.sort(newestFirst)
-  }, [items, view, savedIds, demoReadIds, isDemo, feedMode, highPriorityOnly, filter, query, repostGroup, primexView, companySources, companyFilter, activityKind])
+  }, [items, view, savedIds, demoReadIds, isDemo, feedMode, highPriorityOnly, filter, query, activityView, companySources, companyFilter, activityKind])
 
   const opportunities = items.filter((item) => opportunityCategories.has(item.analysis.category)).length
   const today = new Date()
@@ -344,17 +333,16 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
   return <div className="min-h-screen px-4 pb-16 pt-7 text-[#24342a] sm:px-7 lg:px-10 lg:pt-10">
     <div className="mx-auto max-w-[1370px]">
       <div className="flex flex-wrap items-start justify-between gap-5">
-        <div><div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-[#83958a]"><span className="size-1.5 rounded-full bg-[#7ca889]" /> News portal <span className="font-normal normal-case tracking-normal text-[#a0aaa2]">/ {isDemo ? "Sample data" : "Live sources"}</span></div><h1 className="mt-2 text-[32px] font-semibold tracking-[-0.045em] sm:text-[38px]">{pageHeading}</h1><p className="mt-1 text-sm text-[#758179]">{primexView ? "Original posts and supported reposts from your LinkedIn sources." : view === "repost-watch" ? "Follow your curated accounts and review new posts for reposting." : view === "for-you" ? "Selected updates and opportunities relevant to your company." : view === "overview" ? "All updates and opportunities, newest first." : "Updates and opportunities, all in one place."}</p></div>
-        {!isDemo ? <div className="flex flex-wrap gap-2"><Button size="sm" disabled={loading || (primexView && !selectedSources.some((source) => source.status === "ACTIVE")) || startingCheck || checkStatus?.state === "running"} className="bg-[#2d5b3d] text-white hover:bg-[#244b32]" onClick={() => void checkForUpdates()}><RefreshCw className={cn("size-4", (startingCheck || checkStatus?.state === "running") && "animate-spin")} /> {checkStatus?.state === "running" ? `Checking ${checkStatus.processed}/${checkStatus.total}…` : startingCheck ? "Starting…" : "Check for updates"}</Button></div> : null}
+        <div><div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-[#83958a]"><span className="size-1.5 rounded-full bg-[#7ca889]" /> News portal <span className="font-normal normal-case tracking-normal text-[#a0aaa2]">/ {isDemo ? "Sample data" : "Live sources"}</span></div><h1 className="mt-2 text-[32px] font-semibold tracking-[-0.045em] sm:text-[38px]">{pageHeading}</h1><p className="mt-1 text-sm text-[#758179]">{primexView ? "Original posts and supported reposts from your LinkedIn sources." : view === "repost-watch" ? "Posts and reposts from all other LinkedIn accounts in LISTA GA." : view === "for-you" ? "Selected updates and opportunities relevant to your company." : view === "overview" ? "All updates and opportunities, newest first." : "Updates and opportunities, all in one place."}</p></div>
+        {!isDemo ? <div className="flex flex-wrap gap-2"><Button size="sm" disabled={loading || (activityView && !selectedSources.some((source) => source.status === "ACTIVE")) || startingCheck || checkStatus?.state === "running"} className="bg-[#2d5b3d] text-white hover:bg-[#244b32]" onClick={() => void checkForUpdates()}><RefreshCw className={cn("size-4", (startingCheck || checkStatus?.state === "running") && "animate-spin")} /> {checkStatus?.state === "running" ? `Checking ${checkStatus.processed}/${checkStatus.total}…` : startingCheck ? "Starting…" : "Check for updates"}</Button></div> : null}
       </div>
 
       {activityView ? <nav aria-label="LinkedIn activity sections" className="flex flex-wrap gap-2 rounded-xl border border-[#e1e8e1] bg-white p-2">
-        {[{ label: "Account activity", href: "/intelligence/primex-linkedin", active: primexView }, { label: "SMM LIST ACTIVITY", href: "/intelligence/primex-linkedin?tab=repost-watch", active: view === "repost-watch" }].map((tab) => <Link key={tab.label} href={tab.href} aria-current={tab.active ? "page" : undefined} className={cn("rounded-lg px-4 py-2 text-sm font-medium", tab.active ? "bg-[#eaf1e9] text-[#214a31]" : "text-[#64746a] hover:bg-[#f5f7f3]")}>{tab.label}</Link>)}
+        {[{ label: "Account activity", href: "/intelligence/primex-linkedin", active: primexView }, { label: "LISTA GA", href: "/intelligence/primex-linkedin?tab=repost-watch", active: view === "repost-watch" }].map((tab) => <Link key={tab.label} href={tab.href} aria-current={tab.active ? "page" : undefined} className={cn("rounded-lg px-4 py-2 text-sm font-medium", tab.active ? "bg-[#eaf1e9] text-[#214a31]" : "text-[#64746a] hover:bg-[#f5f7f3]")}>{tab.label}</Link>)}
       </nav> : null}
-      {view === "repost-watch" ? <RepostWatchPanel group={repostGroup} apiFetch={apiFetch} /> : null}
-      {primexView ? <div className="mt-7 rounded-xl border border-[#e5eae4] bg-white p-5">
+      {activityView ? <div className="mt-7 rounded-xl border border-[#e5eae4] bg-white p-5">
         <div className="flex flex-wrap items-center justify-between gap-3"><h2 className="font-semibold text-[#214a31]">LinkedIn activity</h2><Link href="/intelligence/sources" className="text-xs text-[#64746a] hover:underline">Manage sources</Link></div>
-        <p className="mt-2 text-sm text-[#758179]">All eligible LinkedIn sources, newest first. Refreshing reads stored posts; it does not start collection.</p>
+        <p className="mt-2 text-sm text-[#758179]">{primexView ? "Mendex, PrimexEU and GA, newest first." : "All other LinkedIn accounts, newest first."} Refreshing reads stored posts; it does not start collection.</p>
         <p role="status" className="mt-2 text-sm text-[#68776b]">{collectionEnabled === true ? "Collection is enabled subject to source eligibility, billing verification and available budget." : "Collection is paused or not enabled. Existing posts remain available."}</p>
         <div className="mt-4 w-full sm:max-w-sm">
           <label htmlFor="linkedin-account-filter" className="mb-2 block text-sm font-medium text-[#214a31]">Account</label>
@@ -384,11 +372,11 @@ export function IntelligenceWorkspace({ view, user, apiFetch }: { view: Intellig
 
       <div className={cn("mt-8 grid gap-9", !activityView && "xl:grid-cols-[minmax(0,1fr)_280px] xl:gap-10")}>
         <section id="intelligence-feed" className="min-w-0">
-          <div className="flex flex-wrap items-end justify-between gap-3"><div><div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-[#83958a]"><span className="size-1.5 rounded-full bg-[#8ab397]" /> {primexView ? "Company activity" : highPriorityOnly ? "Priority feed" : filter === "All" ? "All sources" : filter}</div><h2 className="mt-1 text-xl font-semibold tracking-tight">{primexView ? (activityKind === "REPOST" ? `${companyLabel} reposts` : activityKind === "POST" ? `${companyLabel} posts` : `Latest ${companyLabel} activity`) : highPriorityOnly ? "High priority updates" : view === "saved" || feedMode === "saved" ? "Your saved updates" : feedMode === "dueSoon" ? "Application deadlines within 30 days" : feedMode === "read" ? "Read updates" : view === "opportunities" ? "Opportunity watch" : view === "for-you" ? "Relevant signals" : view === "repost-watch" ? `Latest posts for ${repostGroup === "CEO" ? "CEO" : "Company"}` : "Latest signals"}</h2></div><span className="text-xs text-[#8c978e]">{loading ? "Loading…" : `${visibleItems.length} ${visibleItems.length === 1 ? "update" : "updates"}`}</span></div>
-          {view !== "saved" ? <div role="group" aria-label="Update filters" className="mt-4 inline-flex rounded-lg bg-[#edf1ec] p-0.5 text-xs font-medium">{(primexView ? (["all", "unread", "read", "saved"] as const) : (["all", "unread", "read", "dueSoon", "saved"] as const)).map((mode) => <button key={mode} type="button" aria-pressed={feedMode === mode} title={mode === "dueSoon" ? "Application deadlines in the next 30 days" : undefined} onClick={() => setFeedMode(mode)} className={cn("rounded-md px-3.5 py-1.5 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#5e806c]", feedMode === mode ? "bg-white text-[#2c4533] shadow-sm" : "text-[#76857a] hover:text-[#2c4533]")}>{mode === "all" ? "All" : mode === "unread" ? "Unread" : mode === "read" ? "Read" : mode === "dueSoon" ? "Due soon" : primexView ? "Saved posts" : "Saved news"}</button>)}</div> : null}
+          <div className="flex flex-wrap items-end justify-between gap-3"><div><div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-[#83958a]"><span className="size-1.5 rounded-full bg-[#8ab397]" /> {activityView ? primexView ? "Company activity" : "LISTA GA" : highPriorityOnly ? "Priority feed" : filter === "All" ? "All sources" : filter}</div><h2 className="mt-1 text-xl font-semibold tracking-tight">{activityView ? (activityKind === "REPOST" ? `${companyLabel} reposts` : activityKind === "POST" ? `${companyLabel} posts` : `Latest ${companyLabel} activity`) : highPriorityOnly ? "High priority updates" : view === "saved" || feedMode === "saved" ? "Your saved updates" : feedMode === "dueSoon" ? "Application deadlines within 30 days" : feedMode === "read" ? "Read updates" : view === "opportunities" ? "Opportunity watch" : view === "for-you" ? "Relevant signals" : "Latest signals"}</h2></div><span className="text-xs text-[#8c978e]">{loading ? "Loading…" : `${visibleItems.length} ${visibleItems.length === 1 ? "update" : "updates"}`}</span></div>
+          {view !== "saved" ? <div role="group" aria-label="Update filters" className="mt-4 inline-flex rounded-lg bg-[#edf1ec] p-0.5 text-xs font-medium">{(activityView ? (["all", "unread", "read", "saved"] as const) : (["all", "unread", "read", "dueSoon", "saved"] as const)).map((mode) => <button key={mode} type="button" aria-pressed={feedMode === mode} title={mode === "dueSoon" ? "Application deadlines in the next 30 days" : undefined} onClick={() => setFeedMode(mode)} className={cn("rounded-md px-3.5 py-1.5 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#5e806c]", feedMode === mode ? "bg-white text-[#2c4533] shadow-sm" : "text-[#76857a] hover:text-[#2c4533]")}>{mode === "all" ? "All" : mode === "unread" ? "Unread" : mode === "read" ? "Read" : mode === "dueSoon" ? "Due soon" : activityView ? "Saved posts" : "Saved news"}</button>)}</div> : null}
           {feedMode === "dueSoon" && view !== "saved" ? <p className="mt-2 text-xs text-[#758179]">Grants, tenders and other applications closing within 30 days, including read updates.</p> : null}
           <div className="relative mt-5"><Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-[#9ca9a0]"/><Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search topics, sources, or keywords" aria-label="Search intelligence updates" className="h-10 border-[#e4eae3] bg-white pl-9 shadow-none focus-visible:ring-[#acc7b1]/40" /></div>
-          <div className="mt-5 space-y-3">{loading ? <FeedSkeleton /> : error ? <div role="alert" className="rounded-xl border border-[#e8eae7] bg-white px-6 py-10 text-center"><AlertCircle className="mx-auto size-6 text-[#89998b]" /><h3 className="mt-3 font-semibold">Updates could not be loaded.</h3><p className="mt-1 text-sm text-[#7f8a80]">Please refresh the page and try again.</p></div> : visibleItems.length ? visibleItems.map((item) => <NewsCard key={item.id} item={item} activityView={primexView} repostGroup={view === "repost-watch" ? repostGroup : undefined} saved={savedIds.includes(item.id)} read={isDemo ? demoReadIds.includes(item.id) : Boolean(item.readAt)} canEmail={!isDemo && emailConfigured} emailRecipient={emailRecipient} canAnalyze={!isDemo && aiConfigured} apiFetch={apiFetch} emailSending={emailingId === item.id} emailBusy={Boolean(emailingId)} onEmail={(id) => void sendEmail(id)} onToggleSaved={toggleSaved} onSetRead={setRead} />) : <FeedEmptyState view={view} feedMode={feedMode} priorityOnly={highPriorityOnly} narrowed={primexView && (companyFilter !== "all" || activityKind !== "ALL") || Boolean(query.trim()) || highPriorityOnly || filter !== "All" && !(view === "for-you" && filter === "For You")} onReset={() => { router.push(view === "overview" ? "/intelligence" : view === "for-you" ? "/intelligence/for-you?category=All" : view === "repost-watch" ? `/intelligence/primex-linkedin?tab=repost-watch&group=${repostGroup}` : "/intelligence/" + view); setQuery(""); setActivityKind("ALL") }} />}</div>
+          <div className="mt-5 space-y-3">{loading ? <FeedSkeleton /> : error ? <div role="alert" className="rounded-xl border border-[#e8eae7] bg-white px-6 py-10 text-center"><AlertCircle className="mx-auto size-6 text-[#89998b]" /><h3 className="mt-3 font-semibold">Updates could not be loaded.</h3><p className="mt-1 text-sm text-[#7f8a80]">Please refresh the page and try again.</p></div> : visibleItems.length ? visibleItems.map((item) => <NewsCard key={item.id} item={item} activityView={activityView} saved={savedIds.includes(item.id)} read={isDemo ? demoReadIds.includes(item.id) : Boolean(item.readAt)} canEmail={!isDemo && emailConfigured} emailRecipient={emailRecipient} canAnalyze={!isDemo && aiConfigured} apiFetch={apiFetch} emailSending={emailingId === item.id} emailBusy={Boolean(emailingId)} onEmail={(id) => void sendEmail(id)} onToggleSaved={toggleSaved} onSetRead={setRead} />) : <FeedEmptyState view={view} feedMode={feedMode} priorityOnly={highPriorityOnly} narrowed={activityView && (companyFilter !== "all" || activityKind !== "ALL") || Boolean(query.trim()) || highPriorityOnly || filter !== "All" && !(view === "for-you" && filter === "For You")} onReset={() => { router.push(view === "overview" ? "/intelligence" : view === "for-you" ? "/intelligence/for-you?category=All" : view === "repost-watch" ? "/intelligence/primex-linkedin?tab=repost-watch" : "/intelligence/" + view); setQuery(""); setActivityKind("ALL") }} />}</div>
         </section>
         {!activityView ? <aside className="space-y-6 xl:pt-1" aria-label="Intelligence highlights">
           <div className="rounded-xl border border-[#e8ece7] bg-white p-5"><div className="flex items-center gap-2 text-[#5e8067]"><Sparkles className="size-4" /><span className="text-[11px] font-semibold uppercase tracking-[0.12em]">At a glance</span></div><div className="mt-5 grid grid-cols-2 gap-4"><Link href="/intelligence/news?priority=high" className="rounded-lg -m-2 p-2 transition-colors hover:bg-[#f2f6ef] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#54775d]" aria-label="View high priority updates"><div className="text-2xl font-semibold tracking-tight">{items.filter((item) => item.priority === "HIGH").length}</div><div className="mt-1 text-xs text-[#5e8067]">High priority →</div></Link><div><div className="text-2xl font-semibold tracking-tight">{opportunities}</div><div className="mt-1 text-xs text-[#89958a]">Opportunities</div></div></div><p className="mt-5 border-t border-[#eef1ed] pt-4 text-xs leading-5 text-[#91a096]">Priority favors current grants and tenders for a Kosovo AI company. Check eligibility at the source.</p></div>
