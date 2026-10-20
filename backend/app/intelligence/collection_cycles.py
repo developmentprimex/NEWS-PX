@@ -89,6 +89,20 @@ class TrialUsageObservation(Base):
     evidence: Mapped[dict] = mapped_column(JSONB, nullable=False)
 
 
+class ScheduledDigestReport(Base):
+    __tablename__ = 'intelligence_scheduled_digest_reports'
+    __table_args__ = (UniqueConstraint('cycle_id', 'user_id', 'recipient_fingerprint'),)
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    cycle_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False, index=True)
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False, index=True)
+    recipient_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(24), default='planned', nullable=False)
+    content: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error: Mapped[str | None] = mapped_column(String(500))
+
+
 def provider_dates(window: TemporalWindow) -> tuple[date, date]:
     return (window.start.astimezone(timezone.utc).date() - timedelta(days=1),
             window.end.astimezone(timezone.utc).date() + timedelta(days=1))

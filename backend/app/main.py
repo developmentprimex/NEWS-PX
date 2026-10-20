@@ -18,6 +18,7 @@ from app.intelligence.credit_migration import migrate_credit_controls
 from app.intelligence.company_sources import ensure_company_sources, ensure_personal_activity_source
 from app.intelligence.digest_service import run_digest_cycle
 from app.intelligence.cycle_service import run_collection_trial_cycle, run_collection_trial_reports
+from app.intelligence.social_schedule import run_social_collection, run_social_reports
 from app.intelligence.router import router as intelligence_router
 from app.intelligence.digest_router import router as digest_router
 
@@ -49,6 +50,10 @@ async def lifespan(_: FastAPI):
                       next_run_time=datetime.now(timezone.utc), coalesce=True, max_instances=1)
     scheduler.add_job(run_collection_trial_reports, "interval", minutes=1, id='collection-trial-reports',
                       next_run_time=datetime.now(timezone.utc), coalesce=True, max_instances=1)
+    scheduler.add_job(run_social_collection, "interval", minutes=1, id="social-collection",
+                      next_run_time=datetime.now(timezone.utc), coalesce=True, max_instances=1, misfire_grace_time=60)
+    scheduler.add_job(run_social_reports, "interval", minutes=1, id="social-reports",
+                      next_run_time=datetime.now(timezone.utc), coalesce=True, max_instances=1, misfire_grace_time=60)
     scheduler.start()
     try:
         yield

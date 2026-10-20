@@ -31,6 +31,13 @@ async def trial_configuration(db):
     return json.loads(record.value) if record else {}
 
 
+async def cycle_authorized(db, cycle, now):
+    from app.intelligence.social_schedule import SCHEDULE_PHASES, cycle_authorized as scheduled_authorized
+    if cycle.phase in SCHEDULE_PHASES:
+        return scheduled_authorized(cycle, now)
+    return not settings.NEWS_SOCIAL_SCHEDULE_ENABLED and trial_active(await trial_configuration(db), now)
+
+
 async def latest_verified_checkpoint(db, source_id):
     cycle_point = await db.scalar(select(func.max(CollectionCycleSource.window_end)).where(
         CollectionCycleSource.source_id == source_id,
@@ -90,6 +97,12 @@ async def freeze_inventory(db, cycle):
     if not cycle.inventory_frozen:
         sources = list(await db.scalars(select(NewsSource).where(NewsSource.status == 'ACTIVE').order_by(NewsSource.id)))
         for source in sources:
+            from app.intelligence.social_schedule import SCHEDULE_PHASES
+            if cycle.phase in SCHEDULE_PHASES:
+                if not settings.NEWS_ENABLE_COLLECTION or source.type not in {'LINKEDIN', 'FACEBOOK'}:
+                    continue
+                if source.type == 'LINKEDIN' and not settings.NEWS_LINKEDIN_FETCH_ENABLED:
+                    continue
             from app.intelligence.facebook_identity import source_approved
             supported = (source.type == 'LINKEDIN' or source.type in {'RSS', 'WEBSITE'} and rss_url_is_supported(source.url)
                          or source.type == 'FACEBOOK' and settings.NEWS_FACEBOOK_FETCH_ENABLED and source_approved(source))
@@ -100,6 +113,9 @@ async def freeze_inventory(db, cycle):
             if point and point > cycle.cutoff_at:
                 point = cycle.cutoff_at
             bootstrap = datetime.combine(cycle.cutoff_at.date()-timedelta(days=1), time(), timezone.utc)
+            if cycle.phase in SCHEDULE_PHASES:
+                from app.intelligence.social_schedule import previous_slot
+                bootstrap = previous_slot(cycle.cutoff_at)
             db.add(CollectionCycleSource(cycle_id=cycle.id, source_id=source.id, name=source.name,
                 type=source.type, canonical_url=identity, window_start=point or bootstrap,
                 window_end=cycle.cutoff_at, verified_start=point is not None))
@@ -109,6 +125,8 @@ async def freeze_inventory(db, cycle):
 
 async def accept_manual_cycle(db, *, user_id, now):
     config = await trial_configuration(db)
+    if settings.NEWS_SOCIAL_SCHEDULE_ENABLED:
+        raise ValueError("LinkedIn and Facebook checks run at 07:00 and 21:00 Europe/Budapest.")
     if not trial_active(config, now) or config.get('user_id') != str(user_id):
         raise ValueError('No collection trial is enabled for this user and date.')
     if not settings.NEWS_ENABLE_COLLECTION:
@@ -120,6 +138,8 @@ async def accept_manual_cycle(db, *, user_id, now):
 
 
 async def trial_owns_source(db, source_id, now):
+    if settings.NEWS_SOCIAL_SCHEDULE_ENABLED:
+        return await db.scalar(select(NewsSource.type).where(NewsSource.id == source_id)) in {'LINKEDIN', 'FACEBOOK'}
     if trial_active(await trial_configuration(db), now):
         return True
     return bool(await db.scalar(select(CollectionCycleSource.id).join(BrightDataExecution,
@@ -139,8 +159,9 @@ async def dispatch_cycle_source(db, row_id, now, *, allow_new_requests=True, clo
         row.state, row.coverage_warning = 'blocked', 'Source was paused, removed or changed after acceptance.'
         await db.commit()
         return row.state
-    if not row.execution_id and not trial_active(await trial_configuration(db), now):
-        row.state, row.coverage_warning = 'blocked', 'Trial expired or was stopped before collection started.'
+    cycle = await db.get(CollectionCycle, row.cycle_id)
+    if not row.execution_id and not await cycle_authorized(db, cycle, now):
+        row.state, row.coverage_warning = 'blocked', 'Collection cycle expired or was stopped before collection started.'
         await db.commit()
         return row.state
     if source.pending_execution_id and source.pending_execution_id != row.execution_id:
@@ -205,6 +226,8 @@ def utc_now():
 
 async def run_collection_trial_reports(now=None):
     """Separate scheduler job: a long source check cannot hold the report deadline."""
+    if settings.NEWS_SOCIAL_SCHEDULE_ENABLED:
+        return
     from app.intelligence import collection
     from app.intelligence.cycle_digest import process_trial_digest
     now = now or utc_now()
@@ -219,6 +242,8 @@ async def run_collection_trial_reports(now=None):
 
 
 async def run_collection_trial_cycle(now=None, *, clock=None):
+    if settings.NEWS_SOCIAL_SCHEDULE_ENABLED:
+        return
     from app.intelligence import collection
     clock = clock or ((lambda: now) if now is not None else utc_now)
     now = clock()

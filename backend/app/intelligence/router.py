@@ -396,7 +396,7 @@ async def check_all_sources_now(db: AsyncSession = Depends(get_db), _: User = De
     global _check_all_task, _check_all_status
     from app.intelligence.cycle_service import trial_configuration, trial_active, accept_manual_cycle, run_collection_trial_cycle
     now = datetime.now(timezone.utc)
-    if trial_active(await trial_configuration(db), now):
+    if not settings.NEWS_SOCIAL_SCHEDULE_ENABLED and trial_active(await trial_configuration(db), now):
         try:
             accepted = await accept_manual_cycle(db, user_id=_.id, now=now)
         except ValueError as exc:

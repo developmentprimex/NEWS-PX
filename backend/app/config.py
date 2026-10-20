@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     NEWS_PUBLIC_ORIGIN: str = "http://localhost:3101"
     NEWS_EMAIL_RECIPIENT: str = "180primex.eu@gmail.com"
     NEWS_ENABLE_COLLECTION: bool = False
+    NEWS_SOCIAL_SCHEDULE_ENABLED: bool = True
     NEWS_AUTO_IMPORT_SNAPSHOT: bool = False
     OPENAI_API_KEY: str | None = None
     INTELLIGENCE_AI_MODEL: str = "gpt-5.4-nano"

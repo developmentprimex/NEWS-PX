@@ -57,7 +57,7 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
     cycle_row = None
     if cycle_source_id:
         from app.intelligence.collection_cycles import CollectionCycleSource, CollectionCycle, TemporalWindow, provider_dates, confirmed_activity_time
-        from app.intelligence.cycle_service import trial_configuration, trial_active, TERMINAL
+        from app.intelligence.cycle_service import cycle_authorized, TERMINAL
         from app.intelligence.cycle_service import source_identity
         cycle_row = await db.get(CollectionCycleSource, cycle_source_id)
         cycle = await db.get(CollectionCycle, cycle_row.cycle_id) if cycle_row else None
@@ -75,11 +75,15 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
                 cycle_row.coverage_warning = 'Completion has no proven cycle coverage; review the original execution.'
             await db.commit()
             return 'completed'
-        if not cycle_row.execution_id and not trial_active(await trial_configuration(db), now):
+        if not cycle_row.execution_id and not await cycle_authorized(db, cycle, now):
             return 'paused'
         if source.pending_execution_id and not cycle_row.execution_id:
             return 'pending'
-        reason = f'trial:{cycle.phase}:{cycle.id}'
+        prefix = 'scheduled-cycle' if cycle.phase.startswith('scheduled-') else 'trial'
+        reason = f'{prefix}:{cycle.phase}:{cycle.id}'
+    if (settings.NEWS_SOCIAL_SCHEDULE_ENABLED and not cycle_row and not backfill
+            and not source.pending_execution_id and not reason.startswith("canary:")):
+        return "paused"
     if not settings.BRIGHTDATA_API_TOKEN:
         return "unavailable"
     if not settings.NEWS_ENABLE_COLLECTION or not settings.NEWS_LINKEDIN_FETCH_ENABLED:
@@ -235,7 +239,7 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
         else:
             start, end, limit = incremental_start(source.last_successful_fetch_at, now), now.date(), record_limit
         now = clock() if clock else now
-        if cycle_row and not trial_active(await trial_configuration(db), now):
+        if cycle_row and not await cycle_authorized(db, cycle, now):
             return 'paused'
         execution = await reserve_execution(db, source, now, start, end,
             reason=execution_reason, limit=limit, cycle_source_id=cycle_source_id,
@@ -243,7 +247,7 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
         if not execution:
             return "paused"
         execution_id = execution.id
-        if cycle_row and not trial_active(await trial_configuration(db), clock() if clock else now):
+        if cycle_row and not await cycle_authorized(db, cycle, clock() if clock else now):
             finish(execution, clock() if clock else now, 'cancelled', 'Trial expired before POST; conservative reservation retained.')
             cycle_row.state, cycle_row.coverage_warning = 'blocked', execution.api_errors
             source.pending_execution_id = None

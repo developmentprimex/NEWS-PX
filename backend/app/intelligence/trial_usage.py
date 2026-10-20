@@ -93,7 +93,8 @@ async def record_usage_observation(db, *, label, evidence, now):
     return record.id
 
 
-async def capture_trial_usage(db, *, label, now):
+async def refresh_shared_billing(db, now):
+    """Refresh the bound shared account without depending on a one-day trial date."""
     binding = load_binding()
     evidence = await read_billing_evidence(settings.BRIGHTDATA_API_TOKEN or '', binding, now)
     cutoff = datetime.fromisoformat(evidence['usage_as_of'])
@@ -107,6 +108,11 @@ async def capture_trial_usage(db, *, label, now):
     account.verified_monthly_allowance = evidence['verified_monthly_allowance']
     account.usage_as_of, account.verified_at, account.evidence = cutoff, now, evidence['evidence']
     # Existing pause latches are intentionally retained.
+    return evidence
+
+
+async def capture_trial_usage(db, *, label, now):
+    evidence = await refresh_shared_billing(db, now)
     return await record_usage_observation(db, label=label, evidence=evidence, now=now)
 
 

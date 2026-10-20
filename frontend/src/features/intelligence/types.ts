@@ -114,6 +114,7 @@ export interface NewsSource {
 export type NewsSourceInput = Pick<NewsSource, "name" | "url" | "type" | "status" | "priority" | "categories" | "ai_instructions" | "fetch_interval_minutes" | "email_enabled" | "repost_groups" | "repost_guidance">
 
 export interface DigestSettings {
+  scheduleManaged?: boolean
   times: string[]
   timezone: string
   recipient: string
