@@ -21,6 +21,7 @@ async def record_limit_for(db, source, window=None):
     # sources receive larger caps; returned duplicates count because they cost credits too.
     observed = max(e.returned_records for e in previous)
     limit = max(baseline, math.ceil(observed * 1.5) + 1)
-    if any(e.returned_records >= e.record_limit for e in previous):
-        limit = max(limit, max(e.record_limit for e in previous) * 2)
+    saturated = [e.record_limit for e in previous if e.returned_records >= e.record_limit]
+    if saturated:
+        limit = max(limit, max(saturated) * 2)
     return min(settings.NEWS_SOCIAL_MAX_RECORD_LIMIT, limit)
