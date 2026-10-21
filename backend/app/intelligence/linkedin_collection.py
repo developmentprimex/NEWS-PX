@@ -86,6 +86,9 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
         from app.intelligence.collection_exception import applies, RECORD_LIMIT
         exception = applies(cycle, now)
         experiment_cycle = applies(cycle, cycle.cutoff_at)
+        if not exception:
+            from app.intelligence.social_limits import record_limit_for
+            record_limit = await record_limit_for(db, source, cycle_row)
         if exception:
             record_limit = RECORD_LIMIT
     if (settings.NEWS_SOCIAL_SCHEDULE_ENABLED and not cycle_row and not backfill
@@ -110,7 +113,17 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
         await db.commit()
         return "paused"
     await db.commit()
-    adapter = adapter or (BrightDataFacebookAdapter(settings.BRIGHTDATA_API_TOKEN, dataset_for(source), expanded=exception) if facebook
+    if facebook and cycle_row and cycle.phase in {'scheduled-day', 'recovery-day'}:
+        from app.intelligence.models import NewsItem
+        known = list(await db.scalars(select(NewsItem.external_id).where(
+            NewsItem.source_id == source.id, NewsItem.external_id.like('facebook:%'),
+            NewsItem.published_at >= cycle_row.window_start - timedelta(days=1))
+            .order_by(NewsItem.published_at.desc()).limit(5000)))
+    else:
+        known = []
+    adapter = adapter or (BrightDataFacebookAdapter(settings.BRIGHTDATA_API_TOKEN, dataset_for(source),
+                          expanded=exception or settings.NEWS_SOCIAL_ADAPTIVE_LIMITS,
+                          exclude_posts=[value.removeprefix('facebook:') for value in known]) if facebook
                           else BrightDataLinkedInAdapter(settings.BRIGHTDATA_API_TOKEN, settings.BRIGHTDATA_LINKEDIN_POSTS_DATASET_ID))
     execution = await db.get(BrightDataExecution, source.pending_execution_id) if source.pending_execution_id else None
     execution_id = execution.id if execution else None
@@ -150,6 +163,10 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
             execution.returned_records = len(records)
             execution.estimated_billable_usage = max(execution.record_limit, len(records))
             errors = [str(record.get("error") or record.get("error_code")) for record in records if isinstance(record, dict) and (record.get("error") or record.get("error_code"))]
+            no_results = bool(records and all(isinstance(record, dict) and
+                str(record.get('error') or '').strip() in {
+                    'Posts for the specified period were not found', 'Activities are not found'
+                } for record in records))
             safe_errors = "; ".join(errors).replace(settings.BRIGHTDATA_API_TOKEN, "[redacted]")[:2000] or None
             execution.api_errors = safe_errors
             account = await locked_account(db)
@@ -169,9 +186,9 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
                 posts = parser(records, source)
             except LinkedInCollectionError:
                 posts = []
-            invalid = len(records) - len(posts)
+            invalid = 0 if no_results else len(records) - len(posts)
             uncertain_dates = any(not post.published_at or not execution.start_date <= post.published_at.date() <= execution.end_date for post in posts)
-            if facebook or experiment_cycle:
+            if facebook or cycle_row:
                 if facebook:
                     uncertain_dates = any(confirmed_activity_time(post) is None for post in posts)
                 def in_window(post):
@@ -184,7 +201,12 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
                 posts = posts_in_window
             if invalid or uncertain_dates:
                 execution.coverage_warning = "Snapshot contains invalid, unattributed or out-of-window activity; review coverage before resuming."
-                source.linkedin_paused_reason = execution.coverage_warning
+                if invalid and not (settings.NEWS_SOCIAL_ADAPTIVE_LIMITS and posts):
+                    source.linkedin_paused_reason = execution.coverage_warning
+            if no_results:
+                execution.coverage_warning = 'Provider returned no results; interval coverage remains unconfirmed.'
+            if safe_errors and 'private group' in safe_errors.casefold():
+                source.linkedin_paused_reason = 'This Facebook group is private; use an accessible public source.'
             for post in posts:
                 # Storage deduplicates identities while refreshing observations.
                 # A repeated row may contain activity missing from the first row.
@@ -205,6 +227,10 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
             saturated = len(records) >= execution.record_limit
             if saturated:
                 source.linkedin_paused_reason = "Record limit reached; completeness is unknown. Authorize a separate backfill or reconcile the window."
+            elif not errors and not invalid and not uncertain_dates:
+                from app.intelligence.collection_exception import SATURATION_PAUSE
+                if source.linkedin_paused_reason == SATURATION_PAUSE:
+                    source.linkedin_paused_reason = None
             if len(records) > execution.record_limit:
                 account = await locked_account(db)
                 account.paused_reason = "Provider exceeded the reserved record limit. Verify billing before resuming."
@@ -213,7 +239,7 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
                 source.last_checked_at = datetime.now(timezone.utc)
                 source.last_new_posts = execution.newly_saved_posts
                 source.empty_fetch_streak = 0 if execution.newly_saved_posts else source.empty_fetch_streak + 1
-            source.last_error = source.linkedin_paused_reason or safe_errors or execution.coverage_warning
+            source.last_error = source.linkedin_paused_reason or execution.coverage_warning or safe_errors
             source.pending_snapshot_id = source.pending_execution_id = None
             finish(execution, datetime.now(timezone.utc), "partial" if errors or saturated or invalid or uncertain_dates else "completed", safe_errors)
             if cycle_row:
@@ -231,6 +257,9 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
         execution_reason = reason
         if cycle_row:
             start, end = provider_dates(TemporalWindow(cycle_row.window_start, cycle_row.window_end, cycle_row.verified_start))
+            if facebook and cycle.phase in {'scheduled-day', 'recovery-day'} and cycle_row.window_end.time().isoformat() == '00:00:00':
+                # Facebook's exclusive end-date encloses the closed UTC day already.
+                end = cycle_row.window_end.date()
             limit = record_limit
         elif backfill:
             start, end, limit = backfill

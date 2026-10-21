@@ -11,6 +11,18 @@ export type CollectionPresentation = {
 function collectionIssue(source: StatusSource): CollectionPresentation | null {
   const error = source.last_error?.trim()
   if (!error) return null
+  if (error === 'Provider returned no results; interval coverage remains unconfirmed.') return {
+    label: 'No results returned', tone: 'waiting',
+    message: 'The provider returned no usable results. Coverage is unconfirmed; the next daily cycle can check again.',
+  }
+  if (error === 'Record limit reached; completeness is unknown. Authorize a separate backfill or reconcile the window.') return {
+    label: 'Partial coverage', tone: 'waiting',
+    message: 'The result limit was reached. The uncovered interval is retained; collection needs a larger request or reconciliation.',
+  }
+  if (error.startsWith('Billing observer stopped;')) return {
+    label: 'Billing verification paused', tone: 'waiting',
+    message: 'Collection is waiting for verified provider billing. Stored posts remain available.',
+  }
   if (source.type === "LINKEDIN") {
     if (error === "Daily record target reached.") return {
       label: "Daily allowance reached", tone: "waiting",

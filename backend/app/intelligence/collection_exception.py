@@ -38,7 +38,21 @@ async def allows_saturation_retry(db, source, cycle_source_id, now):
     if source.linkedin_paused_reason != SATURATION_PAUSE or not cycle_source_id:
         return False
     if not source.pending_execution_id:
-        return await for_source(db, cycle_source_id, source.id, now)
+        if await for_source(db, cycle_source_id, source.id, now):
+            return True
+        if settings.NEWS_SOCIAL_ADAPTIVE_LIMITS:
+            from app.intelligence.collection_cycles import CollectionCycle, CollectionCycleSource
+            from app.intelligence.cycle_service import cycle_authorized
+            from app.intelligence.social_limits import record_limit_for
+            row = await db.get(CollectionCycleSource, cycle_source_id)
+            cycle = await db.get(CollectionCycle, row.cycle_id) if row else None
+            previous = await db.scalar(select(BrightDataExecution).where(
+                BrightDataExecution.source_id == source.id).order_by(BrightDataExecution.started_at.desc()).limit(1))
+            if (row and row.source_id == source.id and not row.execution_id and previous
+                    and previous.completed_at and previous.completed_at < cycle.cutoff_at
+                    and await cycle_authorized(db, cycle, now)):
+                return (source.type == 'FACEBOOK' or await record_limit_for(db, source, row) > previous.record_limit)
+        return False
     # A previously saturated source must also be able to retrieve this exact
     # experiment's reserved snapshot after the start window expires.
     from app.intelligence.collection_cycles import CollectionCycle, CollectionCycleSource
@@ -46,7 +60,8 @@ async def allows_saturation_retry(db, source, cycle_source_id, now):
     if not row or row.source_id != source.id or row.execution_id != source.pending_execution_id:
         return False
     cycle = await db.get(CollectionCycle, row.cycle_id)
-    return bool(cycle and now >= cycle.cutoff_at and applies(cycle, cycle.cutoff_at))
+    return bool(cycle and now >= cycle.cutoff_at and (applies(cycle, cycle.cutoff_at)
+        or settings.NEWS_SOCIAL_ADAPTIVE_LIMITS and row.execution_id == source.pending_execution_id))
 
 
 async def observe(db, cycle, now, *, before=False):

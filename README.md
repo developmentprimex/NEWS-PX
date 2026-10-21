@@ -4,6 +4,10 @@ This folder is a standalone application. It has its own Next.js frontend, FastAP
 
 ## Email reports
 
+For once-daily social collection, adaptive source limits and verified reservation
+settlement, see [daily collection](docs/daily-collection.md). That mode collects a
+closed UTC day once at 00:05 UTC while keeping the 07:00/21:00 email reports.
+
 Each source has an Email on/off choice. With `NEWS_SOCIAL_SCHEDULE_ENABLED=true` (the default), LinkedIn and approved Facebook sources are checked in two daily cycles at **07:00 and 21:00 Europe/Budapest**, including daylight-saving changes. Website/RSS collection continues at each source's interval. Manual checks and ordinary scans cannot start extra social fetches. A delayed scheduler may start a slot within 30 minutes; missed slots are not replayed. Pending snapshots can still be retrieved after that window without starting replacement jobs.
 
 After collection finishes, a combined report includes previously undelivered updates from subscribed active sources, including periodic News/website/RSS updates. Reports wait up to 30 minutes for pending social results. No email is sent without new updates; empty categories, idle sources and collection diagnostics are omitted. Late results can enter the next report. Delivery claims and item receipts survive restarts; uncertain SMTP outcomes block automatic resending and subsequent reports for that recipient/user until verified. Collection continues under the existing account, daily/monthly, Facebook pilot and source-cap protections; these may defer sources and never guarantee complete coverage. Source inventory is frozen separately for each slot, so newly added sources enter the next slot.

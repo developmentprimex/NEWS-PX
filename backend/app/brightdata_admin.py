@@ -54,6 +54,14 @@ async def run(args):
             account.verified_monthly_allowance = payload["verified_monthly_allowance"]
             account.usage_as_of, account.verified_at = as_of, now
             account.evidence = payload["evidence"]
+            if payload.get('billing_scope') is not None:
+                from app.intelligence.credit_control import verified_scope
+                prior_scope = account.billing_scope or {}
+                if prior_scope.get('account_ref') not in {None, payload.get('account_ref')}:
+                    raise ValueError('Provider account changed; reconcile billing scope first.')
+                account.billing_scope = payload['billing_scope']
+                if account.billing_scope.get('complete') and not verified_scope(account, now):
+                    raise ValueError('Billing dataset scope is inconsistent with account totals.')
             if not payload["active"] or balance < 0:
                 account.paused_reason = "Provider billing evidence reports an inactive account or negative balance."
             if args.clear_pause:

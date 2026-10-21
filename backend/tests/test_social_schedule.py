@@ -141,7 +141,7 @@ def test_recurring_billing_refresh_does_not_require_a_trial_date(database, monke
         reads.append(now)
         if not billing_ok:
             raise ValueError('Billing cannot be verified')
-        return {'month': now.strftime('%Y-%m'), 'billable_records': 0,
+        return {'account_ref': 'test-account', 'month': now.strftime('%Y-%m'), 'billable_records': 0,
                 'usage_as_of': (now - timedelta(seconds=1)).isoformat(), 'balance': 0,
                 'active': True, 'verified_monthly_allowance': 5000, 'evidence': 'Bound test account'}
     monkeypatch.setattr(trial_usage, 'read_billing_evidence', evidence)
@@ -152,7 +152,7 @@ def test_recurring_billing_refresh_does_not_require_a_trial_date(database, monke
         for cutoff in (AM, PM):
             await service.run_social_collection(cutoff)
             await service.run_social_collection(cutoff + timedelta(minutes=1))
-        assert len(reads) == 2
+        assert len(reads) == (2 if billing_ok else 4)
         assert len(provider.triggers) == (2 if billing_ok else 0)
         async with sessions() as db:
             account = await db.get(BrightDataAccount, 1)

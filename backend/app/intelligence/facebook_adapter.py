@@ -13,7 +13,9 @@ def dataset_for(source):return GROUP_DATASET if source_kind(source.url)=='group'
 def request_spec(source,start,end,limit,*,expanded=False):
     identity=identity_or_none(source.url)
     from app.intelligence.collection_exception import RECORD_LIMIT
-    if not identity or not 1<=limit<=(RECORD_LIMIT if expanded else 6):raise LinkedInCollectionError('Unverified Facebook URL or invalid record limit.')
+    from app.config import settings
+    ceiling = max(RECORD_LIMIT, settings.NEWS_SOCIAL_MAX_RECORD_LIMIT) if settings.NEWS_SOCIAL_ADAPTIVE_LIMITS else RECORD_LIMIT
+    if not identity or not 1<=limit<=(ceiling if expanded else 6):raise LinkedInCollectionError('Unverified Facebook URL or invalid record limit.')
     first,last=date.fromisoformat(start),date.fromisoformat(end)
     if first>last:raise LinkedInCollectionError('Invalid Facebook date interval.')
     # Ordinary daily executions retain their logical day in the ledger. The
@@ -77,12 +79,15 @@ def parse_posts(records,source):
     return posts
 
 class BrightDataFacebookAdapter(BrightDataLinkedInAdapter):
-    def __init__(self,token,dataset_id,*,expanded=False):
+    def __init__(self,token,dataset_id,*,expanded=False,exclude_posts=None):
         super().__init__(token,dataset_id)
         self.expanded=expanded
+        self.exclude_posts=list(dict.fromkeys(exclude_posts or []))
 
     async def trigger(self,source,*,start_date,end_date,limit=3):
         query,body=request_spec(source,start_date,end_date,limit,expanded=self.expanded)
+        if self.exclude_posts:
+            body[0]['posts_to_not_include']=self.exclude_posts
         async with self._client() as client:response=await client.post('trigger',params=query,json=body)
         payload=self._json(response)
         snapshot=payload.get('snapshot_id') if isinstance(payload,dict) else None

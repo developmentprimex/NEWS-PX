@@ -34,6 +34,8 @@ async def _report_credentials(db: AsyncSession, user_id) -> tuple[str, str] | No
 def _settings_out(digest, credentials: tuple[str, str] | None) -> dict:
     return {"times": SCHEDULE_TIMES if settings.NEWS_SOCIAL_SCHEDULE_ENABLED else digest.times,
             "scheduleManaged": settings.NEWS_SOCIAL_SCHEDULE_ENABLED, "timezone": "Europe/Budapest", "recipient": settings.NEWS_EMAIL_RECIPIENT,
+            "socialDailyFetch": settings.NEWS_SOCIAL_DAILY_FETCH,
+            "socialFetchSchedule": 'Once daily, 00:05 UTC; previous closed UTC day' if settings.NEWS_SOCIAL_DAILY_FETCH else '07:00 / 21:00 Europe/Budapest',
             "lastSentAt": digest.last_sent_at, "lastError": digest.last_error,
             "emailConfigured": credentials is not None}
 

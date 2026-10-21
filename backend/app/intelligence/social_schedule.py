@@ -19,7 +19,26 @@ from app.intelligence.digest_service import DIGEST_ZONE, activity_delivery_key, 
 logger = logging.getLogger(__name__)
 SCHEDULE_TIMES = ['07:00', '21:00']
 SCHEDULE_PHASES = {'scheduled-am': 7, 'scheduled-pm': 21}
+COLLECTION_PHASES = [*SCHEDULE_PHASES, 'scheduled-day']
 START_GRACE = timedelta(minutes=30)
+
+
+def social_fetch_slot(cycle):
+    return cycle.phase == 'scheduled-day' if settings.NEWS_SOCIAL_DAILY_FETCH else cycle.phase in SCHEDULE_PHASES
+
+
+def previous_fetch_slot(cutoff):
+    if not settings.NEWS_SOCIAL_DAILY_FETCH:
+        return previous_slot(cutoff)
+    return cutoff - timedelta(days=1)
+
+
+def due_daily_slot(now):
+    if not settings.NEWS_SOCIAL_DAILY_FETCH:
+        return None
+    cutoff = datetime.combine(now.astimezone(timezone.utc).date(), time(), timezone.utc)
+    # Allow the provider five minutes to close its UTC day; DST cannot create gaps.
+    return ('scheduled-day', cutoff) if cutoff + timedelta(minutes=5) <= now < cutoff + START_GRACE else None
 
 
 def utc_now():
@@ -43,7 +62,7 @@ def previous_slot(cutoff):
 
 
 def cycle_authorized(cycle, now):
-    slot = due_slot(now)
+    slot = due_daily_slot(now) if cycle.phase == 'scheduled-day' else due_slot(now)
     return bool(settings.NEWS_SOCIAL_SCHEDULE_ENABLED and settings.NEWS_ENABLE_COLLECTION
                 and slot and cycle.phase == slot[0] and cycle.cutoff_at == slot[1]
                 and cycle.trial_date == now.astimezone(DIGEST_ZONE).date())
@@ -51,7 +70,7 @@ def cycle_authorized(cycle, now):
 
 async def ensure_scheduled_cycle(db, now):
     from app.intelligence.cycle_service import freeze_inventory
-    slot = due_slot(now)
+    slot = due_slot(now) or due_daily_slot(now)
     if not settings.NEWS_SOCIAL_SCHEDULE_ENABLED or not slot:
         return None
     phase, cutoff = slot
@@ -69,7 +88,7 @@ async def ensure_scheduled_cycle(db, now):
 
 async def run_social_collection(now=None, *, clock=None):
     from app.intelligence import collection
-    from app.intelligence.cycle_service import TERMINAL, dispatch_cycle_source, cycle_status
+    from app.intelligence.cycle_service import TERMINAL, dispatch_cycle_source, cycle_status, cycle_authorized as authorized
     clock = clock or ((lambda: now) if now is not None else utc_now)
     if not settings.NEWS_SOCIAL_SCHEDULE_ENABLED or not settings.NEWS_ENABLE_COLLECTION:
         return
@@ -82,16 +101,19 @@ async def run_social_collection(now=None, *, clock=None):
             async with collection.SessionLocal() as db:
                 await ensure_scheduled_cycle(db, clock())
                 cycles = list(await db.scalars(select(CollectionCycle).where(
-                    CollectionCycle.phase.in_(SCHEDULE_PHASES), CollectionCycle.state != 'finished'
+                    CollectionCycle.phase.in_([*COLLECTION_PHASES, 'recovery-day']), CollectionCycle.state != 'finished'
                 ).order_by(CollectionCycle.cutoff_at)))
             for cycle in cycles:
                 async with collection.SessionLocal() as db:
                     allow_new = True
                     has_new = await db.scalar(select(CollectionCycleSource.id).where(
                         CollectionCycleSource.cycle_id == cycle.id,
+                        CollectionCycleSource.type.in_(['LINKEDIN', 'FACEBOOK']),
                         CollectionCycleSource.execution_id.is_(None),
                         CollectionCycleSource.state.not_in(TERMINAL)).limit(1))
-                    if has_new and settings.NEWS_TRIAL_BILLING_BINDING_FILE:
+                    if has_new and not await authorized(db, cycle, clock()):
+                        allow_new = False
+                    elif has_new and settings.NEWS_TRIAL_BILLING_BINDING_FILE:
                         from app.intelligence.trial_usage import refresh_shared_billing
                         try:
                             await refresh_shared_billing(db, clock())
@@ -190,6 +212,9 @@ async def process_scheduled_digest(db, cycle, user_id, now):
     start = previous_slot(cycle.cutoff_at) if strict_interval else digest.last_slot_at
     entries = await scheduled_entries(db, user_id, start, cycle.cutoff_at, now,
         strict_interval=strict_interval)
+    if settings.NEWS_SOCIAL_DAILY_FETCH:
+        # Late, verified updates remain deliverable; insertion time never certifies publication.
+        entries = [e for e in entries if confirmed_activity_time(e['item']) is not None]
     # Honor source edits, pauses and unsubscribe that occurred during selection.
     source_ids = sorted({e['source'].id for e in entries})
     identities = {e['source'].id: source_identity(e['source']) for e in entries}

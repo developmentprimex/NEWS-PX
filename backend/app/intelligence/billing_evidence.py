@@ -75,7 +75,18 @@ def parse_billing_proof(proof,binding,now):
                     require(value<=resource_records.get(resource,0),'Live usage is ahead of the settled rollup')
                 else:
                     require(value==0,'Unsupported live product consumption detected')
+    datasets = binding.get('datasetUsageResources', {})
+    require(isinstance(datasets, dict) and all(isinstance(k, str) and v in resources for k, v in datasets.items()), 'Invalid dataset meter binding')
+    require(len(set(datasets.values())) == len(datasets), 'Dataset meters must not be counted twice')
+    scope = {'account_ref': ACCOUNT, 'month': cutoff.strftime('%Y-%m'),
+        'usage_as_of': cutoff.isoformat(), 'datasets': {dataset: {
+            'month': resource_records.get(resource, 0),
+            'daily': usage['data'].get(resource, {}).get('rows_initial_billable', [0] * now.day),
+        } for dataset, resource in datasets.items()}}
+    # Missing dataset bindings can never settle historical dataset reservations.
+    scope['complete'] = bool(datasets and set(datasets.values()) == resources)
     return {'account_ref':ACCOUNT,'credential_sha256':binding['credentialSha256'],'consumers_isolated':binding.get('consumersIsolated') is True,'month':cutoff.strftime('%Y-%m'),'usage_as_of':cutoff.isoformat(),
+        'billing_scope': scope,
         'billable_records':records,'verified_monthly_allowance':5000,'balance':balance['balance'],'active':True,
         'evidence':f'Bound account {ACCOUNT}; GET /customer/bw daily rows agree with current-month/custom totals; plan {binding["pricingPlanId"]}; shared/unsupported meters zero; initial allowance verified in owner panel. Conservative reservations across the previous account remain in the ledger.'}
 

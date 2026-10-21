@@ -130,9 +130,11 @@ async def capture(connection):
 
 async def migrate_all(connection,base,migrate):
     from sqlalchemy import text
+    from app.intelligence.collection_cycles import migrate_trial_schema
     # Exact schema-migration order in app.main.lifespan. Never run lifespan,
     # ensure_* installers, snapshot import, digest or collection schedulers.
     await connection.run_sync(base.metadata.create_all)
+    await migrate_trial_schema(connection)
     await connection.execute(text('ALTER TABLE intelligence_items ADD COLUMN IF NOT EXISTS linkedin_data JSONB'))
     await connection.execute(text("ALTER TABLE intelligence_sources ADD COLUMN IF NOT EXISTS repost_groups JSONB NOT NULL DEFAULT '[]'::jsonb"))
     await connection.execute(text("ALTER TABLE intelligence_sources ADD COLUMN IF NOT EXISTS repost_guidance JSONB NOT NULL DEFAULT '{}'::jsonb"))

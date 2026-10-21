@@ -1,7 +1,7 @@
 """A Facebook trigger requires fresh proof covering all enabled account meters."""
-from datetime import datetime
+from datetime import datetime,timedelta
 from app.config import settings
-from app.intelligence.credit_control import locked_account
+from app.intelligence.credit_control import locked_account,verified_scope
 from app.intelligence.trial_usage import load_binding,read_billing_evidence
 
 async def refresh_facebook_billing(db,now,dataset_id):
@@ -12,6 +12,13 @@ async def refresh_facebook_billing(db,now,dataset_id):
     resource=mapping.get(dataset_id)
     if not resource or resource not in binding.get('usageResources',[]):
         raise ValueError('Facebook billing resource is not explicitly bound.')
+    account=await locked_account(db)
+    if account.paused_reason:raise ValueError('Account billing is paused.')
+    scope=verified_scope(account,now)
+    if (scope and scope['account_ref']==binding['accountId'] and dataset_id in scope['datasets']
+            and timedelta(0)<=now-account.verified_at<timedelta(minutes=5)):
+        await db.commit()
+        return
     proof=await read_billing_evidence(settings.BRIGHTDATA_API_TOKEN,binding,now)
     cutoff=datetime.fromisoformat(proof['usage_as_of'])
     account=await locked_account(db)
@@ -23,4 +30,5 @@ async def refresh_facebook_billing(db,now,dataset_id):
     account.provider_balance=proof['balance'];account.provider_active=proof['active']
     account.verified_monthly_allowance=proof['verified_monthly_allowance']
     account.usage_as_of=cutoff;account.verified_at=now;account.evidence=proof['evidence']
+    account.billing_scope=proof.get('billing_scope')
     await db.commit()
