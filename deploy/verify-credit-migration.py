@@ -116,7 +116,12 @@ async def capture(connection):
     names=(await connection.execute(text("SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename"))).scalars()
     for name in names:
         quoted='"'+name.replace('"','""')+'"'
-        result=await connection.execute(text('SELECT * FROM public.'+quoted))
+        fields=(await connection.execute(text("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=:name ORDER BY ordinal_position"),{'name':name})).scalars().all()
+        # An ALTER changes SELECT *'s result shape while asyncpg still holds the
+        # old prepared statement. An explicit projection changes its SQL/cache key
+        # with the schema, so both snapshots remain valid on this same transaction.
+        projection=','.join('"'+field.replace('"','""')+'"' for field in fields)
+        result=await connection.execute(text('SELECT '+projection+' FROM public.'+quoted))
         tables[name]={'columns':list(result.keys()),'rows':[dict(row) for row in result.mappings()]}
     columns=[dict(r) for r in (await connection.execute(text("""SELECT table_name,column_name,ordinal_position,data_type,udt_name,is_nullable,column_default
         FROM information_schema.columns WHERE table_schema='public' ORDER BY table_name,ordinal_position"""))).mappings()]
