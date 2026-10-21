@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace as NS
 
 import httpx
+import pytest
 from sqlalchemy import select
 
 from app.config import settings
@@ -90,9 +91,14 @@ def test_one_daily_social_fetch_and_two_website_checks(database, monkeypatch):
     asyncio.run(run())
 
 
-def test_no_results_retries_next_cycle_without_permanent_pause_or_checkpoint(database, monkeypatch):
+@pytest.mark.parametrize('error',[
+    'Activities are not found',
+    'Total posts on page: 21. Posts with parseable dates: 21. Posts matching requested period (Mon Oct 19 2026 - Thu Oct 22 2026): 0. Note: not all posts contain dates, so they will be filtered out if the date is specified in the input.',
+    'Crawler error: Minimal layout detected, retrying',
+])
+def test_no_results_retries_next_cycle_without_permanent_pause_or_checkpoint(database, monkeypatch, error):
     _, sessions = database
-    provider = Provider(monkeypatch, records=[{'error':'Activities are not found'}])
+    provider = Provider(monkeypatch, records=[{'error':error}])
     from app.intelligence import collection
     now=datetime.now(timezone.utc)
     async def run():
@@ -103,7 +109,7 @@ def test_no_results_retries_next_cycle_without_permanent_pause_or_checkpoint(dat
             s=await db.get(NewsSource,sid)
             e=(await db.scalars(select(BrightDataExecution))).one()
             assert s.linkedin_paused_reason is None and s.last_successful_fetch_at is None
-            assert e.state=='partial' and e.coverage_warning.startswith('Provider returned no results')
+            assert e.state=='partial' and 'coverage remains unconfirmed' in e.coverage_warning
         assert len(provider.triggers)==1
     asyncio.run(run())
 
@@ -145,7 +151,12 @@ def test_billing_retries_transport_reads_without_retrying_post(monkeypatch):
     assert all(r.method=='GET' for r in calls)
 
 
-def test_repair_preserves_owner_pauses_and_never_advances_coverage(database):
+@pytest.mark.parametrize('error',[
+    'Activities are not found',
+    'Total posts on page: 21. Posts with parseable dates: 21. Posts matching requested period (Mon Oct 19 2026 - Thu Oct 22 2026): 0.',
+    'Crawler error: Minimal layout detected, retrying',
+])
+def test_repair_preserves_owner_pauses_and_never_advances_coverage(database, error):
     from app.collection_repair_admin import repair_sources, GENERIC_WARNING
     _,sessions=database
     now=datetime.now(timezone.utc)
@@ -157,7 +168,7 @@ def test_repair_preserves_owner_pauses_and_never_advances_coverage(database):
             for s in [active,paused]:
                 db.add(BrightDataExecution(source_id=s.id,started_at=now,completed_at=now,budget_month=now.strftime('%Y-%m'),
                     trigger_reason='test',endpoint='mock',dataset_id='test',start_date=now.date(),end_date=now.date(),
-                    record_limit=6,estimated_billable_usage=6,state='partial',api_errors='Activities are not found'))
+                    record_limit=6,estimated_billable_usage=6,state='partial',api_errors=error))
             await db.commit()
             changes=await repair_sources(db)
             assert len(changes)==1 and changes[0]['name']=='Empty'
@@ -199,4 +210,42 @@ def test_recovery_preview_is_inert_and_apply_is_one_use_with_expiring_permit(dat
         await schedule.run_social_collection(datetime.now(timezone.utc)+timedelta(seconds=1))
         await schedule.run_social_collection(datetime.now(timezone.utc)+timedelta(seconds=2))
         assert len(provider.triggers)==1
+        # Explicit supplement cannot replay the original inventory and remains one use.
+        second=await source(sessions,url='https://www.linkedin.com/company/second/')
+        args.supplement=True;args.source_ids=[second];args.approval_ref='test-owner-extra'
+        result=await recovery.run(args)
+        assert result['state']=='authorized' and result['sourceCount']==1
+        again=await recovery.run(args)
+        assert again['state']=='already-authorized' and again['cycle_id']==result['cycle_id']
+        await schedule.run_social_collection(datetime.now(timezone.utc))
+        await schedule.run_social_collection(datetime.now(timezone.utc)+timedelta(seconds=1))
+        assert len(provider.triggers)==2
     asyncio.run(run())
+
+
+def test_small_saturated_adaptive_request_retains_gap_and_can_grow(database,monkeypatch):
+    from test_brightdata_postgres_integration import records,check
+    from app.intelligence.social_limits import record_limit_for
+    _,sessions=database
+    monkeypatch.setattr(settings,'NEWS_SOCIAL_ADAPTIVE_LIMITS',True)
+    monkeypatch.setattr(settings,'NEWS_LINKEDIN_RECORD_LIMIT',3)
+    provider=Provider(monkeypatch,records=records(3))
+    async def run():
+        sid=await source(sessions)
+        await check(sessions,sid);await check(sessions,sid)
+        async with sessions() as db:
+            s=await db.get(NewsSource,sid)
+            e=(await db.scalars(select(BrightDataExecution))).one()
+            assert e.state=='partial' and e.record_limit==3
+            assert s.linkedin_paused_reason is None and s.last_successful_fetch_at is None
+            assert 'larger cap' in s.last_error
+            assert await record_limit_for(db,s)>3
+        assert len(provider.triggers)==1
+    asyncio.run(run())
+
+
+def test_retryable_provider_messages_never_mask_private_credit_or_other_errors():
+    from app.intelligence.provider_outcomes import retryable_read_error
+    for error in ['private group','Insufficient credit','Total posts on page: 2. Posts matching requested period (test): 0.',
+                  'Activities are not found; Insufficient credit']:
+        assert not retryable_read_error(error)

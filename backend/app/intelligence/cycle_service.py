@@ -35,7 +35,7 @@ async def cycle_authorized(db, cycle, now):
     from app.intelligence.social_schedule import COLLECTION_PHASES, cycle_authorized as scheduled_authorized
     if cycle.phase in COLLECTION_PHASES:
         return scheduled_authorized(cycle, now)
-    if cycle.phase == 'recovery-day':
+    if cycle.phase in {'recovery-day', 'recovery-extra'}:
         record = await db.get(AppMetadata, 'collection-recovery:' + str(cycle.id))
         try:
             permit = json.loads(record.value) if record else {}
