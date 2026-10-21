@@ -17,6 +17,8 @@ from app.intelligence.collection_exception import SATURATION_PAUSE
 from app.intelligence.credit_control import budget_status, verified_scope
 from app.intelligence.models import BrightDataAccount, BrightDataExecution, NewsSource
 from app.intelligence.trial_usage import refresh_shared_billing
+from app.intelligence.provider_outcomes import retryable_read_error
+from app.config import settings
 
 GENERIC_WARNING = 'Snapshot contains invalid, unattributed or out-of-window activity; review coverage before resuming.'
 NO_RESULTS = {'Posts for the specified period were not found', 'Activities are not found'}
@@ -37,9 +39,15 @@ async def repair_sources(db):
             continue
         if latest.api_errors and 'private group' in latest.api_errors.casefold():
             source.linkedin_paused_reason='This Facebook group is private; use an accessible public source.'
-        elif latest.api_errors in NO_RESULTS:
+        elif latest.api_errors and retryable_read_error(latest.api_errors):
             source.linkedin_paused_reason=None
-            source.last_error='Provider returned no results; interval coverage remains unconfirmed.'
+            source.last_error='Provider returned no confirmed results; interval coverage remains unconfirmed.'
+        elif (prior==SATURATION_PAUSE and settings.NEWS_SOCIAL_ADAPTIVE_LIMITS
+                and latest.returned_records==latest.record_limit
+                and latest.record_limit<settings.NEWS_SOCIAL_MAX_RECORD_LIMIT
+                and not latest.api_errors and not latest.coverage_warning):
+            source.linkedin_paused_reason=None
+            source.last_error='Record limit reached; interval remains unconfirmed. The next daily request will use a larger cap.'
         elif latest.state=='completed' and (latest.returned_records or 0)<latest.record_limit:
             proven=await db.scalar(select(CollectionCycleSource.id).where(
                 CollectionCycleSource.execution_id==latest.id,CollectionCycleSource.coverage_confirmed.is_(True)))

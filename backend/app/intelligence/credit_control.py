@@ -158,7 +158,7 @@ async def reserve_execution(db, source, now, start_date, end_date, *, reason="sc
         from app.intelligence.collection_cycles import CollectionCycle, CollectionCycleSource
         row = await db.get(CollectionCycleSource, cycle_source_id)
         cycle = await db.get(CollectionCycle, row.cycle_id) if row else None
-        if cycle and cycle.phase == 'recovery-day':
+        if cycle and cycle.phase in {'recovery-day', 'recovery-extra'}:
             import json
             from app.db import AppMetadata
             from app.intelligence.cycle_service import cycle_authorized

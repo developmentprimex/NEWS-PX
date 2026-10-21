@@ -7,7 +7,7 @@ import argparse
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
 
@@ -24,6 +24,11 @@ from app.intelligence.trial_usage import refresh_shared_billing
 
 async def run(args):
     now=datetime.now(timezone.utc)
+    source_ids=set(getattr(args,'source_ids',None) or [])
+    supplement=bool(getattr(args,'supplement',False))
+    if supplement and not source_ids:
+        raise ValueError('A supplemental recovery requires an explicitly selected source inventory.')
+    phase='recovery-extra' if supplement else 'recovery-day'
     cutoff=datetime.fromisoformat(args.through.replace('Z','+00:00'))
     if (not cutoff.tzinfo or cutoff.utcoffset()!=timedelta(0) or cutoff.time().isoformat()!='00:00:00'
             or not cutoff<=now<cutoff+timedelta(days=7)):
@@ -32,7 +37,7 @@ async def run(args):
         raise ValueError('Recovery requires explicit owner authorization.')
     async with SessionLocal() as db:
         previous=await db.scalar(select(CollectionCycle).where(CollectionCycle.trial_date==cutoff.date(),
-            CollectionCycle.phase=='recovery-day'))
+            CollectionCycle.phase==phase))
         if previous:
             return {'state':'already-authorized','cycle_id':str(previous.id),'providerTriggers':0}
         await refresh_shared_billing(db,now)
@@ -42,6 +47,10 @@ async def run(args):
         rows=[];reserved=0;source_limits={}
         sources=list(await db.scalars(select(NewsSource).where(NewsSource.status=='ACTIVE',
             NewsSource.type.in_(['LINKEDIN','FACEBOOK'])).order_by(NewsSource.id)))
+        if source_ids:
+            if source_ids-{source.id for source in sources}:
+                raise ValueError('Recovery selection includes an inactive or missing social source.')
+            sources=[source for source in sources if source.id in source_ids]
         for source in sources:
             if (source.type=='FACEBOOK' and (not settings.NEWS_FACEBOOK_FETCH_ENABLED or not source_approved(source))
                     or source.pending_execution_id or source.pending_snapshot_id):
@@ -73,7 +82,7 @@ async def run(args):
             'providerTriggers':0,'smtpSends':0}
         if args.apply:
             expiry=now+timedelta(minutes=30)
-            db.add(CollectionCycle(id=cycle_id,trial_date=cutoff.date(),phase='recovery-day',
+            db.add(CollectionCycle(id=cycle_id,trial_date=cutoff.date(),phase=phase,
                 cutoff_at=cutoff,deadline_at=expiry,state='running',inventory_frozen=True))
             for row in rows:
                 row.cycle_id=cycle_id;db.add(row)
@@ -94,6 +103,8 @@ def main():
     parser.add_argument('--max-reserved',type=int,default=800)
     parser.add_argument('--approval-ref',default='')
     parser.add_argument('--apply',action='store_true')
+    parser.add_argument('--source-id',dest='source_ids',action='append',type=UUID)
+    parser.add_argument('--supplement',action='store_true',help='One additional, explicitly selected recovery inventory.')
     args=parser.parse_args()
     async def invoke():
         try:print(json.dumps(await run(args),default=str,indent=2))

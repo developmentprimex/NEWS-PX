@@ -14,6 +14,11 @@ an assertion that quiet sources publish at most two posts. Saturation retains
 the uncovered interval. Facebook daily requests send known post IDs through the
 provider-supported `posts_to_not_include` input. The LinkedIn discovery contract
 does not offer that exclusion field; duplicate discoveries may consume credits.
+Below the maximum cap, an otherwise valid saturated result retries discovery in
+the next daily cycle with a larger limit. It never certifies that interval or
+repeats a billable submission automatically in the same cycle. Recognized empty
+period summaries and temporary minimal-layout read errors remain unconfirmed
+without permanently pausing the source.
 
 `NEWS_SOCIAL_FLEXIBLE_DAILY_BUDGET=true` shares the existing protected monthly pool
 across Facebook/LinkedIn instead of imposing the legacy 130/day and Facebook
@@ -47,6 +52,10 @@ reservation and enough monthly allowance. It freezes eligible active identities
 once, creates a durable 30-minute permit and delegates collection to the existing
 coordinator. A repeated command returns the same cycle. It cannot replace jobs
 whose outcome is uncertain, or collect paused/private/unapproved identities.
+One separately authorized `--supplement --source-id <uuid>` batch can cover
+explicitly selected newly enabled or previously capped sources. Its own durable
+permit, inventory, monthly checks and one-use cycle prevent replaying the first
+recovery batch.
 
 Provider specifications: [asynchronous limits](https://docs.brightdata.com/api-reference/rest-api/scraper/asynchronous-requests)
 and the [Facebook input example](https://brightdata.com/products/web-scraper/social-media-scrape).

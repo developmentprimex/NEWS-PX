@@ -101,7 +101,7 @@ async def run_social_collection(now=None, *, clock=None):
             async with collection.SessionLocal() as db:
                 await ensure_scheduled_cycle(db, clock())
                 cycles = list(await db.scalars(select(CollectionCycle).where(
-                    CollectionCycle.phase.in_([*COLLECTION_PHASES, 'recovery-day']), CollectionCycle.state != 'finished'
+                    CollectionCycle.phase.in_([*COLLECTION_PHASES, 'recovery-day', 'recovery-extra']), CollectionCycle.state != 'finished'
                 ).order_by(CollectionCycle.cutoff_at)))
             for cycle in cycles:
                 async with collection.SessionLocal() as db:
