@@ -21,6 +21,7 @@ from app.intelligence.cycle_service import run_collection_trial_cycle, run_colle
 from app.intelligence.social_schedule import run_social_collection, run_social_reports
 from app.intelligence.router import router as intelligence_router
 from app.intelligence.digest_router import router as digest_router
+from app.intelligence.linkedin_publishing_router import router as linkedin_publishing_router
 
 
 @asynccontextmanager
@@ -74,6 +75,7 @@ app.add_middleware(
 app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(intelligence_router, prefix="/api/intelligence", tags=["intelligence"])
 app.include_router(digest_router, prefix="/api/intelligence", tags=["email"])
+app.include_router(linkedin_publishing_router, prefix="/api/intelligence", tags=["linkedin-publishing"])
 
 
 @app.get("/api/health")

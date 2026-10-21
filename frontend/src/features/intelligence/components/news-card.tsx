@@ -4,6 +4,7 @@ import { cn } from "@/lib/utils"
 import type { NewsEntry, RepostGroup } from "../types"
 import { DeepInsightAction } from "./deep-insight"
 import { LinkedInActivity } from "./linkedin-activity"
+import { LinkedInRepostAction } from "./linkedin-publishing"
 
 const dateFormat = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", year: "numeric" })
 const publishedDateFormat = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Europe/Budapest" })
@@ -18,7 +19,7 @@ const categoryLabels: Record<NewsEntry["analysis"]["category"], string> = {
   GRANT: "Grant", TENDER: "Tender", BUSINESS: "Business", TECHNOLOGY: "AI & Tech", EVENT: "Event", REGULATION: "Regulation", PARTNERSHIP: "Partnership", NEWS: "News",
 }
 
-export function NewsCard({ item, activityView = false, repostGroup, saved, read, canEmail, emailRecipient, canAnalyze, apiFetch, emailSending, emailBusy, onToggleSaved, onSetRead, onEmail }: { item: NewsEntry; activityView?: boolean; repostGroup?: RepostGroup; saved: boolean; read: boolean; canEmail: boolean; emailRecipient: string; canAnalyze: boolean; apiFetch: (path: string, init?: RequestInit) => Promise<Response>; emailSending: boolean; emailBusy: boolean; onToggleSaved: (id: string) => void; onSetRead: (id: string, read: boolean) => void; onEmail: (id: string) => void }) {
+export function NewsCard({ item, activityView = false, repostGroup, saved, read, canEmail, emailRecipient, canAnalyze, canRepost = false, apiFetch, emailSending, emailBusy, onToggleSaved, onSetRead, onEmail }: { item: NewsEntry; activityView?: boolean; repostGroup?: RepostGroup; saved: boolean; read: boolean; canEmail: boolean; emailRecipient: string; canAnalyze: boolean; canRepost?: boolean; apiFetch: (path: string, init?: RequestInit) => Promise<Response>; emailSending: boolean; emailBusy: boolean; onToggleSaved: (id: string) => void; onSetRead: (id: string, read: boolean) => void; onEmail: (id: string) => void }) {
   const analysis = item.analysis
   const SourceIcon = sourceTypeIcons[item.sourceType as keyof typeof sourceTypeIcons] ?? Radio
   const isOpportunity = analysis.category === "GRANT" || analysis.category === "TENDER"
@@ -60,6 +61,7 @@ export function NewsCard({ item, activityView = false, repostGroup, saved, read,
       <div className="mt-5 flex flex-wrap items-center justify-between gap-x-4 gap-y-3 border-t border-[#eef0ed] pt-4">
         <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-[#858e88]"><span className="font-medium text-[#55645a]">{item.sourceName}</span><span>·</span><time dateTime={item.publishedAt} title="Publication time (Europe/Budapest)">{publishedDateFormat.format(new Date(item.publishedAt))}</time><span className="hidden sm:inline">·</span><span className="hidden sm:inline">{analysis.tags.slice(0, 2).join(" · ")}</span></div>
         <div className="flex max-w-full flex-wrap items-center gap-1">
+          {canRepost && item.sourceType === "LINKEDIN" ? <LinkedInRepostAction item={item} apiFetch={apiFetch} /> : null}
           {canAnalyze ? <DeepInsightAction item={item} apiFetch={apiFetch} /> : null}
           {canEmail ? <Button variant="ghost" size="sm" className="h-7 gap-1 px-2 text-xs text-[#68776b] hover:bg-[#f0f4ef]" disabled={emailBusy || Boolean(item.emailedAt)} onClick={() => onEmail(item.id)} title={item.emailedAt ? `Already sent to ${emailRecipient}` : `Send to ${emailRecipient}`} aria-label={item.emailedAt ? `${item.title} sent to ${emailRecipient}` : `Email ${item.title} to ${emailRecipient}`}>{emailSending ? <LoaderCircle className="size-3.5 animate-spin" /> : item.emailedAt ? <Check className="size-3.5" /> : <Mail className="size-3.5" />}{emailSending ? "Sending" : item.emailedAt ? "Sent" : "Email"}</Button> : null}
           <Button variant="ghost" size="sm" className="h-7 gap-1 px-2 text-xs text-[#68776b] hover:bg-[#f0f4ef]" onClick={() => onSetRead(item.id, !read)}>{read ? <RotateCcw className="size-3.5" /> : <Check className="size-3.5" />}{read ? "Mark unread" : "Mark read"}</Button>

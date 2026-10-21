@@ -179,7 +179,11 @@ def _activity(record: dict) -> dict:
         published = _published(comment.get("comment_date") or comment.get("date_posted") or comment.get("date") or comment.get("published_at"))
         comments.append({"author": author, "text": body, "url": url, "publishedAt": published.isoformat() if published else None})
     checked = _published(record.get("timestamp"))
+    from app.intelligence.linkedin_publishing import native_post_urn
+    post_urn = next((urn for value in (record.get("id"), record.get("post_id"), record.get("url"), record.get("post_url"))
+                     if (urn := native_post_urn(value))), None)
     return {
+        "postUrn": post_urn,
         "kind": kind,
         "authorName": _text(record.get("user_name") or record.get("company_name"), 200),
         "authorUrl": _linkedin_url(record.get("use_url") or record.get("user_url") or record.get("company_url")),
