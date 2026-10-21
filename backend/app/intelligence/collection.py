@@ -12,7 +12,8 @@ from sqlalchemy import case, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.db import SessionLocal, engine
+from app.db import AppMetadata, SessionLocal, engine
+import json
 from app.intelligence.ai_service import analyze_news_item
 from app.intelligence.generic_website_adapter import GenericWebsiteAdapter, GenericWebsiteError
 from app.intelligence.linkedin_adapter import LinkedInCollectionError
@@ -21,6 +22,7 @@ from app.intelligence.linkedin_collection import collect_linkedin, incremental_s
 from app.intelligence.models import NewsAnalysis, NewsItem, NewsSource, NewsSourceEmailSubscription
 from app.intelligence.rss_adapter import RSSAdapter, RSSCollectionError, rss_url_is_supported
 from app.intelligence.services import CollectedNewsItem
+from app.intelligence.opportunities_adapter import OpportunitiesWebsiteAdapter, OpportunitiesCollectionError, supports as opportunities_site
 from app.intelligence.website_adapter import OfficialWebsiteAdapter, WebsiteCollectionError, WebsiteEntry, source_kind
 
 logger = logging.getLogger(__name__)
@@ -67,7 +69,8 @@ async def _store_post(db: AsyncSession, source: NewsSource, post: CollectedNewsI
         NewsItem.source_id == source.id,
         or_(NewsItem.external_id == post.external_id, NewsItem.content_hash == content_hash, NewsItem.url == post.url),
     ).limit(1))
-    if existing and source.type == "LINKEDIN" and post.linkedin_data is not None:
+    if existing and ((source.type == "LINKEDIN" and post.linkedin_data is not None)
+                     or source.type == 'WEBSITE' and opportunities_site(source.url)):
         # A sparse engagement-only response must not replace stored text with a
         # generated title and an empty body.
         content_changed = (post.original_text is not None or not existing.original_text) and (
@@ -87,7 +90,8 @@ async def _store_post(db: AsyncSession, source: NewsSource, post: CollectedNewsI
                 saved_analysis.analyzed_at = datetime.now(timezone.utc)
             existing.title = post.title
             existing.original_text = post.original_text
-        existing.linkedin_data = merge_linkedin_activity(existing.linkedin_data, post.linkedin_data)
+        if post.linkedin_data is not None:
+            existing.linkedin_data = merge_linkedin_activity(existing.linkedin_data, post.linkedin_data)
         if post.published_at and (post.publication_time_verified or not existing.publication_time_verified):
             existing.published_at = post.published_at
             existing.publication_time_verified = post.publication_time_verified
@@ -97,7 +101,8 @@ async def _store_post(db: AsyncSession, source: NewsSource, post: CollectedNewsI
             existing.published_at, existing.publication_time_verified = post.published_at, True
         return False
     analysis = await analyze_news_item(post, source)
-    if not category_allowed(source.categories or [], analysis.category):
+    retain_all = source.type in {'FACEBOOK', 'LINKEDIN'} or source.type == 'WEBSITE' and opportunities_site(source.url)
+    if not retain_all and not category_allowed(source.categories or [], analysis.category):
         # An email subscription requests all activity from this source.
         subscribed = await db.scalar(select(NewsSourceEmailSubscription.source_id).where(
             NewsSourceEmailSubscription.source_id == source.id,
@@ -133,6 +138,27 @@ async def _check_website_source(db: AsyncSession, source: NewsSource, now: datet
     minimum_interval = 5 if force else source.fetch_interval_minutes
     if source.last_started_at and source.last_started_at > now - timedelta(minutes=minimum_interval):
         return "pending"
+    if opportunities_site(source.url):
+        key = 'ofy-website-checkpoint:' + str(source.id)
+        point = await db.get(AppMetadata, key)
+        try:
+            since = datetime.fromisoformat(json.loads(point.value)['covered_through']) if point else now - timedelta(days=2)
+        except (ValueError, KeyError, TypeError):
+            raise OpportunitiesCollectionError('The saved OFY checkpoint is invalid; the interval needs review.') from None
+        posts = await OpportunitiesWebsiteAdapter(source.url).collect(since=since, until=now)
+        saved = 0
+        for post in posts:
+            saved += bool(await _store_post(db, source, post))
+        value = json.dumps({'version': 1, 'covered_through': now.isoformat(), 'window_start': since.isoformat(),
+                            'returned': len(posts), 'newly_saved': saved, 'all_pages_read': True})
+        if point:
+            point.value = value
+        else:
+            db.add(AppMetadata(key=key, value=value))
+        source.last_started_at = source.last_checked_at = now
+        source.last_new_posts, source.last_error = saved, None
+        await db.commit()
+        return 'completed'
     if source_kind(source.url) is None:
         posts = await GenericWebsiteAdapter(source.url).collect()
         for post in posts:
@@ -219,7 +245,7 @@ async def check_source(db: AsyncSession, source_id: uuid.UUID, *, force: bool = 
         if force:
             return "paused"
         return await protected_linkedin_check(db, source, now)
-    except (LinkedInCollectionError, WebsiteCollectionError, GenericWebsiteError, RSSCollectionError, httpx.HTTPError) as exc:
+    except (LinkedInCollectionError, WebsiteCollectionError, GenericWebsiteError, RSSCollectionError, OpportunitiesCollectionError, httpx.HTTPError) as exc:
         await db.rollback()
         source = await db.get(NewsSource, source_id)
         if source is None:
