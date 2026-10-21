@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     NEWS_EMAIL_RECIPIENT: str = "180primex.eu@gmail.com"
     NEWS_ENABLE_COLLECTION: bool = False
     NEWS_SOCIAL_SCHEDULE_ENABLED: bool = True
+    NEWS_SOCIAL_DAILY_FETCH: bool = False
+    NEWS_SOCIAL_ADAPTIVE_LIMITS: bool = False
+    NEWS_SOCIAL_MAX_RECORD_LIMIT: int = 130
+    NEWS_SOCIAL_FLEXIBLE_DAILY_BUDGET: bool = False
     NEWS_COLLECTION_EXCEPTION_DATE: date | None = None
     NEWS_AUTO_IMPORT_SNAPSHOT: bool = False
     OPENAI_API_KEY: str | None = None
@@ -49,6 +53,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def database_connection(self) -> "Settings":
+        if not 6 <= self.NEWS_SOCIAL_MAX_RECORD_LIMIT <= 130:
+            raise ValueError('Adaptive social requests must remain within 6–130 records.')
         if not (1 <= self.NEWS_FACEBOOK_RECORD_LIMIT <= 6 and 1 <= self.NEWS_FACEBOOK_DAILY_TARGET <= 130
                 and 1 <= self.NEWS_FACEBOOK_MONTHLY_BUDGET <= 4000):
             raise ValueError('Facebook limits must remain within the shared protected budget.')

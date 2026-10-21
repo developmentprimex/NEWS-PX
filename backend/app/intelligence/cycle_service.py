@@ -32,9 +32,21 @@ async def trial_configuration(db):
 
 
 async def cycle_authorized(db, cycle, now):
-    from app.intelligence.social_schedule import SCHEDULE_PHASES, cycle_authorized as scheduled_authorized
-    if cycle.phase in SCHEDULE_PHASES:
+    from app.intelligence.social_schedule import COLLECTION_PHASES, cycle_authorized as scheduled_authorized
+    if cycle.phase in COLLECTION_PHASES:
         return scheduled_authorized(cycle, now)
+    if cycle.phase == 'recovery-day':
+        record = await db.get(AppMetadata, 'collection-recovery:' + str(cycle.id))
+        try:
+            permit = json.loads(record.value) if record else {}
+            created = datetime.fromisoformat(permit['created_at'])
+            expiry = datetime.fromisoformat(permit['expires_at'])
+            return bool(settings.NEWS_ENABLE_COLLECTION and settings.NEWS_SOCIAL_SCHEDULE_ENABLED
+                and permit['approval_ref'] and permit['cutoff_at'] == cycle.cutoff_at.isoformat()
+                and created <= now < expiry <= created + timedelta(minutes=30)
+                and cycle.cutoff_at <= now < cycle.cutoff_at + timedelta(days=7))
+        except (KeyError, ValueError, TypeError):
+            return False
     return not settings.NEWS_SOCIAL_SCHEDULE_ENABLED and trial_active(await trial_configuration(db), now)
 
 
@@ -97,11 +109,17 @@ async def freeze_inventory(db, cycle):
     if not cycle.inventory_frozen:
         sources = list(await db.scalars(select(NewsSource).where(NewsSource.status == 'ACTIVE').order_by(NewsSource.id)))
         for source in sources:
-            from app.intelligence.social_schedule import SCHEDULE_PHASES
-            if cycle.phase in SCHEDULE_PHASES:
+            from app.intelligence.social_schedule import COLLECTION_PHASES
+            if cycle.phase in COLLECTION_PHASES:
                 from app.intelligence.collection_exception import applies
                 experiment = applies(cycle, cycle.cutoff_at)
-                if not settings.NEWS_ENABLE_COLLECTION or (source.type not in {'LINKEDIN', 'FACEBOOK'} and not experiment):
+                if not settings.NEWS_ENABLE_COLLECTION or (source.type not in {'LINKEDIN', 'FACEBOOK'}
+                        and not experiment and not settings.NEWS_SOCIAL_DAILY_FETCH):
+                    continue
+                from app.intelligence.social_schedule import social_fetch_slot
+                if source.type in {'LINKEDIN', 'FACEBOOK'} and not social_fetch_slot(cycle):
+                    continue
+                if source.type not in {'LINKEDIN', 'FACEBOOK'} and cycle.phase == 'scheduled-day':
                     continue
                 if source.type == 'LINKEDIN' and not settings.NEWS_LINKEDIN_FETCH_ENABLED:
                     continue
@@ -115,14 +133,25 @@ async def freeze_inventory(db, cycle):
             if point and point > cycle.cutoff_at:
                 point = cycle.cutoff_at
             bootstrap = datetime.combine(cycle.cutoff_at.date()-timedelta(days=1), time(), timezone.utc)
-            if cycle.phase in SCHEDULE_PHASES:
-                from app.intelligence.social_schedule import previous_slot
-                bootstrap = previous_slot(cycle.cutoff_at)
+            if cycle.phase in COLLECTION_PHASES:
+                from app.intelligence.social_schedule import previous_slot, previous_fetch_slot
+                bootstrap = (previous_fetch_slot(cycle.cutoff_at) if source.type in {'LINKEDIN', 'FACEBOOK'}
+                    else previous_slot(cycle.cutoff_at))
                 from app.intelligence.collection_exception import applies
                 if applies(cycle, cycle.cutoff_at):
                     # This owner-authorized experiment measures the last slot;
                     # it does not silently buy a historical backfill.
                     point = bootstrap
+                if settings.NEWS_SOCIAL_DAILY_FETCH and source.type in {'LINKEDIN', 'FACEBOOK'} and not point:
+                    # Never forget a missed daily interval simply because no checkpoint exists yet.
+                    unresolved = await db.scalar(select(func.min(CollectionCycleSource.window_start))
+                        .join(CollectionCycle, CollectionCycle.id == CollectionCycleSource.cycle_id).where(
+                            CollectionCycleSource.source_id == source.id,
+                            CollectionCycle.phase.in_(COLLECTION_PHASES),
+                            CollectionCycleSource.coverage_confirmed.is_(False),
+                            CollectionCycle.cutoff_at < cycle.cutoff_at))
+                    if unresolved:
+                        bootstrap = min(bootstrap, unresolved)
             db.add(CollectionCycleSource(cycle_id=cycle.id, source_id=source.id, name=source.name,
                 type=source.type, canonical_url=identity, window_start=point or bootstrap,
                 window_end=cycle.cutoff_at, verified_start=point is not None))
@@ -178,10 +207,10 @@ async def dispatch_cycle_source(db, row_id, now, *, allow_new_requests=True, clo
         await protected_check(db, source, now, reason='trial-poll',
                                        cycle_source_id=owner.id if owner else None, clock=clock)
         return 'pending'
-    if not row.execution_id and not allow_new_requests:
-        row.state, row.coverage_warning = 'blocked', 'Fresh billing verification failed; no new request was authorized.'
+    if row.type in {'LINKEDIN', 'FACEBOOK'} and not row.execution_id and not allow_new_requests:
+        row.coverage_warning = 'Fresh billing verification failed; waiting within the authorized collection window.'
         await db.commit()
-        return row.state
+        return 'pending'
     if not row.execution_id:
         point = await latest_verified_checkpoint(db, source.id)
         if point and row.window_start < point <= row.window_end:

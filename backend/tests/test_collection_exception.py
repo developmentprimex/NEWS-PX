@@ -90,7 +90,7 @@ def test_every_approved_source_gets_one_larger_request_and_restart_never_repeats
             windows = list(await db.scalars(select(CollectionCycleSource)))
             assert all(w.window_start == PM - timedelta(hours=14) for w in windows)
             assert sum(w.state == 'blocked' for w in windows) == 1
-            assert sum(s.linkedin_paused_reason == SATURATION_PAUSE for s in await db.scalars(select(NewsSource))) == 2
+            assert sum(s.linkedin_paused_reason == SATURATION_PAUSE for s in await db.scalars(select(NewsSource))) == 0
         # Tomorrow the original 3-record Facebook requests and 12/day cap resume.
         # Isolate daily expiry from this test's 400 reserved Facebook records.
         monkeypatch.setattr(settings, 'NEWS_FACEBOOK_MONTHLY_BUDGET', 1000)

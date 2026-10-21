@@ -82,6 +82,7 @@ class BrightDataAccount(Base):
     paused_reason: Mapped[str | None] = mapped_column(String(500))
     alert_month: Mapped[str | None] = mapped_column(String(7))
     alert_levels: Mapped[list[int]] = mapped_column(JSONB, nullable=False, default=list)
+    billing_scope: Mapped[dict | None] = mapped_column(JSONB)
 
 
 class BrightDataExecution(Base):
@@ -110,6 +111,7 @@ class BrightDataExecution(Base):
     api_errors: Mapped[str | None] = mapped_column(Text)
     coverage_warning: Mapped[str | None] = mapped_column(String(500))
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    billing_account_ref: Mapped[str | None] = mapped_column(String(100))
 
 
 class BrightDataCanaryRun(Base):

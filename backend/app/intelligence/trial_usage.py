@@ -1,5 +1,7 @@
 """GET-only usage capture and conservative, explicitly provisional trial costs."""
 import hashlib
+import asyncio
+import logging
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,8 +17,11 @@ from app.intelligence.cycle_service import trial_configuration
 from app.intelligence.models import BrightDataExecution
 
 LABELS = {'baseline', 'before_manual', 'after_manual', 'before_evening', 'after_evening', 'settled'}
+logger = logging.getLogger(__name__)
+TRANSIENT_BILLING_PAUSES = {'Billing observer stopped; operator review required: ' + name
+    for name in ('URLError', 'TimeoutError', 'ReadTimeout', 'ConnectTimeout', 'ConnectError')}
 EVIDENCE_KEYS = {'account_ref', 'credential_sha256', 'consumers_isolated', 'month', 'usage_as_of',
-                 'billable_records', 'verified_monthly_allowance', 'balance', 'active', 'evidence'}
+                 'billable_records', 'verified_monthly_allowance', 'balance', 'active', 'evidence', 'billing_scope'}
 
 
 def projected_reservation(profiles, phases=2):
@@ -47,8 +52,18 @@ async def read_billing_evidence(token, binding, now):
              ('usage', f'/customer/bw?from={start}&to={end}')]
     async with billing_client() as client:
         for name, path in paths:
-            response = await client.get('https://api.brightdata.com'+path,
-                headers={'Authorization': 'Bearer '+token, 'Accept': 'application/json'})
+            for attempt in range(3):
+                try:
+                    response = await client.get('https://api.brightdata.com'+path,
+                        headers={'Authorization': 'Bearer '+token, 'Accept': 'application/json'})
+                    if response.status_code not in {429, 500, 502, 503, 504} or attempt == 2:
+                        break
+                    logger.warning('Billing GET %s deferred: HTTP %s, attempt %s', name, response.status_code, attempt + 1)
+                except httpx.TransportError as exc:
+                    logger.warning('Billing GET %s deferred: %s, attempt %s', name, type(exc).__name__, attempt + 1)
+                    if attempt == 2:
+                        raise
+                await asyncio.sleep(0.5 * (attempt + 1))
             if response.status_code != 200:
                 raise ValueError('Provider billing read failed: '+name)
             proof['responses'][name] = {'status': 200, 'data': response.json()}
@@ -107,7 +122,15 @@ async def refresh_shared_billing(db, now):
     account.provider_balance, account.provider_active = evidence['balance'], evidence['active']
     account.verified_monthly_allowance = evidence['verified_monthly_allowance']
     account.usage_as_of, account.verified_at, account.evidence = cutoff, now, evidence['evidence']
-    # Existing pause latches are intentionally retained.
+    previous_scope = getattr(account, 'billing_scope', None) or {}
+    if previous_scope.get('account_ref') not in {None, evidence['account_ref']}:
+        raise ValueError('Provider account changed; reconcile billing scope before collection.')
+    account.billing_scope = evidence.get('billing_scope')
+    if (account.paused_reason in TRANSIENT_BILLING_PAUSES and evidence.get('consumers_isolated') is True
+            and (account.billing_scope or {}).get('complete') is True
+            and evidence['active'] and evidence['balance'] >= 0):
+        account.paused_reason = None
+    # Credit, identity, manual and ambiguous-trigger pauses are never cleared here.
     return evidence
 
 

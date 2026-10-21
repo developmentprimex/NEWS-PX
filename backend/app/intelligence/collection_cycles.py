@@ -128,3 +128,5 @@ def confirmed_activity_time(item) -> datetime | None:
 async def migrate_trial_schema(connection):
     from sqlalchemy import text
     await connection.execute(text('ALTER TABLE intelligence_items ADD COLUMN IF NOT EXISTS publication_time_verified BOOLEAN NOT NULL DEFAULT false'))
+    await connection.execute(text('ALTER TABLE intelligence_brightdata_account ADD COLUMN IF NOT EXISTS billing_scope JSONB'))
+    await connection.execute(text('ALTER TABLE intelligence_brightdata_executions ADD COLUMN IF NOT EXISTS billing_account_ref VARCHAR(100)'))
