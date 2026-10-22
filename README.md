@@ -67,7 +67,7 @@ The Repost watch page separates CEO (Sheet 1, 16 accounts) and Company (Sheet 2,
 
 The curated, canonicalized source manifest is in `data/repost-watch-sources.json`, including worksheet/row provenance. Import it once, or rerun it safely, with `docker compose exec -T api python -m app.import_repost_watch /srv/news/data/repost-watch-sources.json`. Existing source records and email settings are preserved. The remaining workbook sheets are excluded from this import. Reposting is performed manually on LinkedIn.
 
-Canonical LinkedIn URL validation rejects duplicate creation and edits, including concurrent submissions. Historical duplicate rows remain intact and share one canonical collection owner. Identity changes and deletion are blocked after collection history exists; pause the source to retain its posts, analyses, saved state and daily limit.
+Canonical LinkedIn URL validation rejects duplicate creation and edits, including concurrent submissions. Historical duplicate rows remain intact and share one canonical collection owner. Identity changes are blocked after collection history exists. Administrators can delete a source after confirmation, permanently removing its collected posts, analyses, saved/read state and email subscription. Pending collections must finish or be reconciled before deletion. Provider execution and budget records are retained. Pause a source instead to retain its content.
 
 ## Release safety
 
