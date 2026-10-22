@@ -438,6 +438,8 @@ async def create_source(payload: NewsSourceCreate, db: AsyncSession = Depends(ge
         if await matching_sources(db, identity):
             raise HTTPException(status_code=409, detail="This LinkedIn source already exists. Edit or resume the existing source.")
     source = NewsSource(**payload.model_dump(exclude={"email_enabled"}))
+    from app.intelligence.source_history import restore_collection_history
+    await restore_collection_history(db, source)
     db.add(source)
     await db.flush()
     if payload.type == "LINKEDIN":
@@ -494,6 +496,11 @@ async def update_source(source_id: uuid.UUID, payload: NewsSourceUpdate, db: Asy
         history = source.last_started_at or source.last_successful_fetch_at or await db.scalar(select(NewsItem.id).where(NewsItem.source_id == source_id).limit(1)) or await db.scalar(select(BrightDataExecution.id).where(BrightDataExecution.source_id == source_id).limit(1))
         if history:
             raise HTTPException(status_code=409, detail="A collected LinkedIn identity cannot be changed. Pause it and add a separate source to preserve history and daily limits.")
+        from app.db import AppMetadata
+        from app.intelligence.source_history import history_key
+        archived_key = history_key(payload)
+        if archived_key and await db.get(AppMetadata, archived_key):
+            raise HTTPException(status_code=409, detail="This address has previous collection history. Use Add source to restore its collection identity.")
     if payload.type=='FACEBOOK' and (identity:=facebook_identity(payload.url)):
         if any(s.id!=source_id for s in await fb_matches(db,identity)):
             raise HTTPException(status_code=409,detail='This Facebook source already exists.')
@@ -559,9 +566,19 @@ async def delete_source(source_id: uuid.UUID, db: AsyncSession = Depends(get_db)
         raise HTTPException(status_code=404, detail="Source not found")
     if (source.type, source.url) != identity:
         raise HTTPException(status_code=409, detail="Source changed. Refresh before deleting.")
-    if source.type in {'LINKEDIN','FACEBOOK'}:
-        if source.pending_execution_id or source.pending_snapshot_id or source.last_started_at or source.last_successful_fetch_at or await db.scalar(select(NewsItem.id).where(NewsItem.source_id == source_id).limit(1)) or await db.scalar(select(BrightDataExecution.id).where(BrightDataExecution.source_id == source_id).limit(1)):
-            raise HTTPException(status_code=409, detail="This LinkedIn source has history or a pending collection. Pause it to preserve posts and saved state.")
+    from app.intelligence.credit_control import UNSETTLED
+    pending = source.pending_execution_id or source.pending_snapshot_id or await db.scalar(
+        select(BrightDataExecution.id).where(
+            BrightDataExecution.source_id == source_id,
+            BrightDataExecution.state.in_(UNSETTLED),
+        ).limit(1)
+    )
+    if pending:
+        raise HTTPException(status_code=409, detail="This source has a pending collection. Wait for it to finish before deleting the source.")
+    # Database cascades remove owned posts, analyses, saved/read state and email
+    # subscriptions. The independent execution ledger retains all budget usage.
+    from app.intelligence.source_history import retain_collection_history
+    await retain_collection_history(db, source)
     await db.delete(source)
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
