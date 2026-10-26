@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import unicodedata
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -35,19 +37,48 @@ ANALYSIS_SCHEMA = {
 
 
 def fallback_analysis(item: CollectedNewsItem, source: NewsSource) -> StructuredNewsAnalysis:
-    title = item.title.lower()
-    result_notice = re.search(r"beneficiar|p[eë]rfitues|results?|winners?|awarded|lista", title)
+    # Social titles can be hashtags or styled Unicode, with the call in the body.
+    title = unicodedata.normalize("NFKC", item.title).casefold()
+    body = unicodedata.normalize("NFKC", item.original_text or "").casefold()
+    if getattr(source, 'type', None) not in {'LINKEDIN','FACEBOOK'}:
+        # Website bodies can contain navigation or related articles. Their
+        # funding mentions must not turn a general page into an open call.
+        body = ''
+    text = title + "\n" + body
+    result_notice = re.search(r"\b(?:beneficiar\w*|p[ëe]rfitues\w*|results?|winners?|awarded|lista|selected applicants)\b", title)
+    result_notice = result_notice or re.search(
+        r"\b(?:winners?|selected applicants|list of beneficiaries|award results|grant results|"
+        r"results (?:of|are)|lista e p[ëe]rfituesve)\b", body[:300])
     category = "NEWS"
     if not result_notice:
-        if re.search(r"grant|grante|subvenc|funding call|call for proposals|thirrje p[eë]r aplik", title):
+        grant_call = re.search(
+            r"\b(?:grant\w*|grante\w*|subvenc\w*|funding call|call for (?:proposals|funding)|"
+            r"cascade funding|thirrje p[ëe]r aplik\w*)\b", text)
+        funding_offer = re.search(r"\b(?:funding opportunities|apply for funding)\b", text)
+        actionable = re.search(r"\b(?:apply|applications?|deadline|open call|call is (?:now )?open)\b", text)
+        title_grant = re.search(r"\b(?:grant\w*|subvenc\w*|funding call|call for proposals|thirrje p[ëe]r aplik\w*)\b", title)
+        parsed_url=urlsplit(item.url)
+        official_funding=(parsed_url.hostname=='digital-strategy.ec.europa.eu'
+                          and parsed_url.path.startswith('/en/funding/')
+                          and not re.search(r'\btender\w*\b',title))
+        if official_funding or title_grant or (grant_call and actionable) or (funding_offer and actionable):
             category = "GRANT"
-        elif re.search(r"tender|procure|prokurim", title):
+        elif re.search(r"\b(?:tender\w*|procure\w*|prokurim\w*)\b", title) or (
+            re.search(r"\b(?:tender\w*|procurement|prokurim\w*)\b", body)
+            and re.search(r"\b(?:open|invitation to bid|request for|deadline|apply)\b", body)
+        ):
             category = "TENDER"
+    tags = list(source.categories or [])
+    if category in {"GRANT", "TENDER"}:
+        for label, pattern in (("AI", r"\b(?:ai|artificial intelligence|machine learning)\b"),
+                               ("Technology", r"\b(?:software|digital|cybersecurity|ict)\b")):
+            if re.search(pattern, text) and label not in tags:
+                tags.append(label)
     return StructuredNewsAnalysis(
         summary=(item.original_text or item.title)[:500], category=category,
         importanceScore={"HIGH": 80, "NORMAL": 55, "LOW": 35}.get(source.priority, 55),
         relevanceScore=70 if source.priority != "LOW" else 50,
-        tags=list(source.categories),
+        tags=tags,
     )
 
 

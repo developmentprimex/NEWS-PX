@@ -43,3 +43,12 @@ test('ordinary failures and connector readiness remain visible', () => {
   assert.equal(sourceCollectionStatus(source({type: 'FACEBOOK', collection_supported: false})).label, 'No connector');
   assert.equal(sourceCollectionStatus(source({type: 'FACEBOOK', collection_note: 'Outside approved pilot'})).label, 'Setup needed');
 });
+
+test('held sources, private groups and incomplete coverage are distinct', () => {
+  const invalid='Snapshot contains invalid, unattributed or out-of-window activity; review coverage before resuming.';
+  assert.equal(sourceCollectionStatus(source({last_error:invalid,collection_enabled:false})).label,'Review required');
+  assert.equal(sourceCollectionStatus(source({last_error:invalid,collection_enabled:true})).label,'Partial coverage');
+  assert.equal(sourceCollectionStatus(source({type:'FACEBOOK',collection_enabled:false,last_error:'This Facebook group is private; use an accessible public source.'})).label,'Private source');
+  assert.equal(sourceCollectionStatus(source({collection_enabled:false})).label,'Collection disabled');
+  assert.equal(sourceCollectionStatus(source({type:'WEBSITE',collection_enabled:true,last_error:'No current announcements found.'})).label,'No current announcements');
+});

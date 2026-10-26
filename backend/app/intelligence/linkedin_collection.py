@@ -40,6 +40,11 @@ def finish(execution, now, state, error=None):
 
 async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", backfill=None,
                            adapter=None, validate_records=None, cycle_source_id=None, clock=None):
+    from app.intelligence.source_history import collection_history_conflict
+    if await collection_history_conflict(db, source):
+        source.last_error = "The previous collection identity was deleted. Delete this duplicate and use Add source to retain its collection history."
+        await db.commit()
+        return 'paused'
     now = clock() if clock else now
     facebook = source.type == 'FACEBOOK'
     record_limit = settings.NEWS_FACEBOOK_RECORD_LIMIT if facebook else settings.NEWS_LINKEDIN_RECORD_LIMIT
@@ -114,7 +119,7 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
         await db.commit()
         return "paused"
     await db.commit()
-    if facebook and cycle_row and cycle.phase in {'scheduled-day', 'recovery-day', 'recovery-extra'}:
+    if facebook and cycle_row and (cycle.phase.startswith('scheduled-') or cycle.phase in {'recovery-day', 'recovery-extra'}):
         from app.intelligence.models import NewsItem
         known = list(await db.scalars(select(NewsItem.external_id).where(
             NewsItem.source_id == source.id, NewsItem.external_id.like('facebook:%'),

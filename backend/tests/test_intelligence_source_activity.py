@@ -47,6 +47,18 @@ def test_combined_company_feed_applies_both_sources_before_limit():
     assert str(compiled).index("WHERE") < str(compiled).index("LIMIT")
 
 
+@pytest.mark.parametrize('saved_only',[False,True])
+def test_quarantined_items_are_hidden_before_limit_but_saved_items_remain_accessible(saved_only):
+    statements=[]
+    class FakeDB:
+        async def execute(self,query):
+            statements.append(query)
+            return SimpleNamespace(all=lambda:[])
+    asyncio.run(news_router.list_items(db=FakeDB(),user=SimpleNamespace(id=uuid4()),saved_only=saved_only))
+    query=str(statements[-1].compile(dialect=postgresql.dialect()))
+    assert ('news_app_metadata' in query) is (not saved_only)
+
+
 
 def test_linkedin_refresh_endpoints_do_not_schedule_scraping(monkeypatch):
     from fastapi import HTTPException

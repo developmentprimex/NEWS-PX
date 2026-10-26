@@ -7,6 +7,7 @@ from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 
 from app.config import settings
+from app.intelligence.content_quality import excluded_item_query
 from app.intelligence.collection_cycles import (
     CollectionCycle, CollectionCycleSource, ScheduledDigestReport, confirmed_activity_time,
 )
@@ -158,6 +159,7 @@ async def scheduled_entries(db, user_id, start, cutoff, now, *, strict_interval=
         .join(NewsSource, NewsSource.id == NewsItem.source_id)
         .join(NewsSourceEmailSubscription, NewsSourceEmailSubscription.source_id == NewsSource.id)
         .where(NewsSourceEmailSubscription.user_id == user_id, NewsSource.status == 'ACTIVE',
+            ~excluded_item_query(NewsItem.id),
             NewsItem.created_at >= NewsSourceEmailSubscription.enabled_at,
             NewsItem.created_at <= now, activity <= cutoff,
             or_(activity > start, and_(NewsItem.created_at > start,

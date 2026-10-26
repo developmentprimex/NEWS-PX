@@ -22,6 +22,7 @@ from app.intelligence.linkedin_collection import collect_linkedin, incremental_s
 from app.intelligence.models import NewsAnalysis, NewsItem, NewsSource, NewsSourceEmailSubscription
 from app.intelligence.rss_adapter import RSSAdapter, RSSCollectionError, rss_url_is_supported
 from app.intelligence.services import CollectedNewsItem
+from app.intelligence.content_quality import website_content_reason, canonical_article_url
 from app.intelligence.opportunities_adapter import OpportunitiesWebsiteAdapter, OpportunitiesCollectionError, supports as opportunities_site
 from app.intelligence.website_adapter import OfficialWebsiteAdapter, WebsiteCollectionError, WebsiteEntry, source_kind
 
@@ -64,11 +65,20 @@ def merge_linkedin_activity(previous: dict | None, observed: dict) -> dict:
 
 
 async def _store_post(db: AsyncSession, source: NewsSource, post: CollectedNewsItem) -> bool:
+    if source.type in {'WEBSITE','RSS'} and website_content_reason(source.url,post.url,post.title,post.original_text):
+        return False
     content_hash = hashlib.sha256(post.url.encode("utf-8")).hexdigest()
     existing = await db.scalar(select(NewsItem).where(
         NewsItem.source_id == source.id,
         or_(NewsItem.external_id == post.external_id, NewsItem.content_hash == content_hash, NewsItem.url == post.url),
     ).limit(1))
+    if existing is None and source.type in {'WEBSITE','RSS'}:
+        canonical = canonical_article_url(post.url)
+        candidates = await db.scalars(select(NewsItem).where(
+            NewsItem.source_id == source.id,
+            NewsItem.url.startswith(canonical.split('?',1)[0],autoescape=True),
+        ).order_by(NewsItem.created_at))
+        existing = next((item for item in candidates if canonical_article_url(item.url)==canonical),None)
     if existing and ((source.type == "LINKEDIN" and post.linkedin_data is not None)
                      or source.type == 'WEBSITE' and opportunities_site(source.url)):
         # A sparse engagement-only response must not replace stored text with a
@@ -161,11 +171,13 @@ async def _check_website_source(db: AsyncSession, source: NewsSource, now: datet
         return 'completed'
     if source_kind(source.url) is None:
         posts = await GenericWebsiteAdapter(source.url).collect()
+        saved = 0
         for post in posts:
-            await _store_post(db, source, post)
+            saved += bool(await _store_post(db, source, post))
         source.last_started_at = now
         source.last_checked_at = now
-        source.last_error = None
+        source.last_new_posts = saved
+        source.last_error = None if posts else 'No current announcements found.'
         await db.commit()
         return 'partial' if strict_times and any(not post.publication_time_verified for post in posts) else 'completed'
     adapter = OfficialWebsiteAdapter(source.url)

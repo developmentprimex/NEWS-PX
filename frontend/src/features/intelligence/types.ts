@@ -28,6 +28,7 @@ export interface NewsEntry {
   title: string
   originalText: string | null
   publishedAt: string
+  publicationTimeKnown?: boolean
   imageUrl: string | null
   contentHash: string | null
   createdAt: string

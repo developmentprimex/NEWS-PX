@@ -252,12 +252,12 @@ def test_facebook_also_runs_only_in_two_slots_and_websites_keep_periodic_checks(
             await service.run_social_collection(cutoff)
             await service.run_social_collection(cutoff + timedelta(minutes=1))
         assert len(provider.triggers) == 2
-        assert not reads  # Social slots do not force extra website/RSS checks.
+        assert reads == ['https://example.com/feed'] * 2
         await collection.check_due_sources()
-        assert reads == ['https://example.com/feed']
+        assert reads == ['https://example.com/feed'] * 3
         assert len(provider.triggers) == 2
         async with sessions() as db:
-            assert set(await db.scalars(select(CollectionCycleSource.type))) == {'FACEBOOK'}
+            assert set(await db.scalars(select(CollectionCycleSource.type))) == {'FACEBOOK','RSS'}
     asyncio.run(run())
 
 

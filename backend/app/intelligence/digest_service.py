@@ -14,6 +14,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.intelligence.content_quality import excluded_item_query
 from app.db import SessionLocal
 from app.intelligence.email_service import _smtp_reachable
 from app.intelligence.models import (
@@ -211,6 +212,7 @@ async def process_digest(db: AsyncSession, user_id: uuid.UUID, now: datetime | N
         .join(NewsSource, NewsSource.id == NewsItem.source_id)
         .join(NewsSourceEmailSubscription, NewsSourceEmailSubscription.source_id == NewsSource.id)
         .where(NewsSourceEmailSubscription.user_id == user_id, NewsSource.status == "ACTIVE",
+               ~excluded_item_query(NewsItem.id),
                NewsItem.created_at >= NewsSourceEmailSubscription.enabled_at,
                NewsItem.created_at <= slot, activity_time <= slot,
                or_(activity_time > digest.last_slot_at,

@@ -54,6 +54,15 @@ def test_date_only_and_shared_original_timestamp_cannot_certify_exact_activity()
  assert not parse_posts([record(date_posted='2026-10-19')],source())[0].publication_time_verified
  assert not parse_posts([record(original_post={'url':'https://www.facebook.com/other/posts/9/'})],source())[0].publication_time_verified
 
+def test_public_profile_posts_require_exact_identity_without_claiming_share_time():
+ posts=parse_posts([record(is_page=False,user_url='https://www.facebook.com/example/',original_post={'content':'A shared original'})],source())
+ assert len(posts)==1 and not posts[0].publication_time_verified
+ with pytest.raises(Exception):parse_posts([record(page_url=None,user_url='https://www.facebook.com/other/',is_page=False)],source())
+
+def test_attributed_events_are_retained_without_certifying_announcement_time():
+ posts=parse_posts([record(url='https://www.facebook.com/events/12345/')],source())
+ assert len(posts)==1 and not posts[0].publication_time_verified
+
 def test_request_bounds_page_and_group_by_exact_dataset_date_and_limit():
  query,body=request_spec(source(),'2026-10-18','2026-10-20',3)
  assert query['dataset_id']==PAGE_DATASET and query['limit_per_input']==3

@@ -9,6 +9,8 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
 from app.intelligence import digest_service as service
+from app.db import AppMetadata
+from app.intelligence.content_quality import EXCLUSION_PREFIX
 
 
 class AsyncSessionAdapter:
@@ -31,7 +33,7 @@ class AsyncSessionAdapter:
 def test_actual_query_interval_subscriptions_and_delivery_receipts(monkeypatch):
     engine = create_engine("sqlite://")
     metadata = MetaData()
-    for model in (service.NewsSource, service.NewsItem, service.NewsAnalysis,
+    for model in (AppMetadata,service.NewsSource, service.NewsItem, service.NewsAnalysis,
                   service.NewsDigestSettings, service.NewsSourceEmailSubscription, service.NewsDigestDelivery):
         table = model.__table__.to_metadata(metadata)
         for column in table.columns:
@@ -69,6 +71,8 @@ def test_actual_query_interval_subscriptions_and_delivery_receipts(monkeypatch):
             return value
 
         item("Current post", start + timedelta(minutes=1))
+        excluded=item('Quarantined policy page',end)
+        db.add(AppMetadata(key=EXCLUSION_PREFIX+excluded.id.hex,value='Static page'))
         item("Current repost", end, kind="REPOST")
         item("Article without analysis", end, kind="ARTICLE")
         item("Unknown publication", None)
@@ -95,6 +99,7 @@ def test_actual_query_interval_subscriptions_and_delivery_receipts(monkeypatch):
         for title in ["Current post", "Current repost", "Article without analysis", "Unknown publication", "Late arrival", "New repost of legacy URL"]:
             assert title in body
         for title in ["Boundary already collected", "Historical backfill", "Future publication", "Collected after slot",
+                      "Quarantined policy page",
                       "Before subscription", "Unselected item", "Paused item", "Other user item", "Already emailed legacy post"]:
             assert title not in body
         assert "Fallback content" in body

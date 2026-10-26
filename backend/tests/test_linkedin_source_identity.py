@@ -165,7 +165,7 @@ def test_source_edit_during_reservation_cannot_deadlock_or_change_trigger(databa
     asyncio.run(run())
 
 
-def test_source_delete_preserves_posts_and_saved_state(database, monkeypatch):
+def test_source_delete_removes_posts_and_saved_state(database, monkeypatch):
     from test_brightdata_postgres_integration import records
     from app.intelligence.models import NewsUserState
     from sqlalchemy import text
@@ -184,16 +184,17 @@ def test_source_delete_preserves_posts_and_saved_state(database, monkeypatch):
                 db.add(NewsUserState(user_id=uuid4(), news_item_id=item.id, saved_at=datetime.now(timezone.utc)))
                 await db.commit()
             response = await client.delete('/intelligence/sources/'+sid)
-            assert response.status_code == 409
+            assert response.status_code == 204
             async with engine.begin() as conn:
                 from app.intelligence.credit_migration import migrate_credit_controls
                 for _ in range(2): await migrate_credit_controls(conn)
                 for table in ('intelligence_items','intelligence_analyses','intelligence_user_states','intelligence_sources'):
-                    assert await conn.scalar(text('SELECT count(*) FROM '+table)) == 1
+                    assert await conn.scalar(text('SELECT count(*) FROM '+table)) == 0
+                assert await conn.scalar(text('SELECT count(*) FROM intelligence_brightdata_executions')) == 1
     asyncio.run(run())
 
 
-def test_completed_empty_source_cannot_reset_daily_latch_by_rename_or_delete(database, monkeypatch):
+def test_completed_empty_source_rejects_identity_change_but_allows_deletion(database, monkeypatch):
     _, sessions = database
     provider = Provider(monkeypatch)
     async def run():
@@ -206,7 +207,7 @@ def test_completed_empty_source_cannot_reset_daily_latch_by_rename_or_delete(dat
                     await collection.check_source(db, UUID(sid))
             payload['url'] = 'https://linkedin.com/company/new-identity/'
             assert (await client.put('/intelligence/sources/'+sid, json=payload)).status_code == 409
-            assert (await client.delete('/intelligence/sources/'+sid)).status_code == 409
+            assert (await client.delete('/intelligence/sources/'+sid)).status_code == 204
             assert len(provider.triggers) == 1
     asyncio.run(run())
 

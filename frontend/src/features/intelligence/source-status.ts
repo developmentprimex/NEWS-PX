@@ -1,6 +1,6 @@
 import type { NewsSource } from "./types"
 
-type StatusSource = Pick<NewsSource, "type" | "status" | "last_error" | "pending_snapshot_id" | "last_checked_at"> & Partial<Pick<NewsSource, "collection_supported" | "collection_note">>
+type StatusSource = Pick<NewsSource, "type" | "status" | "last_error" | "pending_snapshot_id" | "last_checked_at"> & Partial<Pick<NewsSource, "collection_supported" | "collection_enabled" | "collection_note">>
 
 export type CollectionPresentation = {
   label: string
@@ -11,9 +11,31 @@ export type CollectionPresentation = {
 function collectionIssue(source: StatusSource): CollectionPresentation | null {
   const error = source.last_error?.trim()
   if (!error) return null
+  if (error === 'No current announcements found.') return {
+    label: 'No current announcements', tone: 'waiting',
+    message: 'The website was read successfully, but no current news articles or calls matched this source.',
+  }
+  if (error === 'Provider could not read the source; interval coverage remains unconfirmed.') return {
+    label: 'Provider read incomplete', tone: 'waiting',
+    message: 'The provider could not read this source. The next scheduled cycle can try again; coverage remains unconfirmed.',
+  }
+  if (error.startsWith('Record limit reached; interval remains unconfirmed.')) return {
+    label: 'Partial coverage', tone: 'waiting',
+    message: 'The request limit was reached. The next scheduled cycle can use a larger limit within the shared budget.',
+  }
+  if (error.startsWith('Snapshot contains invalid, unattributed or out-of-window activity;')) return {
+    label: source.collection_enabled === false ? 'Review required' : 'Partial coverage',
+    tone: source.collection_enabled === false ? 'error' : 'waiting',
+    message: source.collection_enabled === false
+      ? 'Collection is held until source identity and activity dates are verified. Stored posts remain available.'
+      : 'Some returned activity could not be verified for this source and interval. The next scheduled cycle can check again.',
+  }
+  if (error.startsWith('This Facebook group is private;')) return {
+    label: 'Private source', tone: 'error', message: 'This group is private. Choose a public source to collect its updates.',
+  }
   if (error === 'Provider returned no results; interval coverage remains unconfirmed.') return {
     label: 'No results returned', tone: 'waiting',
-    message: 'The provider returned no usable results. Coverage is unconfirmed; the next daily cycle can check again.',
+    message: 'The provider returned no usable results. Coverage is unconfirmed; the next scheduled cycle can check again.',
   }
   if (error === 'Record limit reached; completeness is unknown. Authorize a separate backfill or reconcile the window.') return {
     label: 'Partial coverage', tone: 'waiting',
@@ -54,9 +76,13 @@ function collectionIssue(source: StatusSource): CollectionPresentation | null {
 export function sourceCollectionStatus(source: StatusSource, linkedinConfigured = true): CollectionPresentation {
   const issue = collectionIssue(source)
   if (source.status === "PAUSED") return { label: "Paused", message: issue?.message ?? null, tone: "waiting" }
-  if (source.collection_supported === false) return { label: "No connector", message: issue?.message ?? null, tone: "waiting" }
+  if (source.collection_supported === false) return { label: "No connector", message: issue?.message ?? source.collection_note ?? null, tone: "waiting" }
   if (source.type === "LINKEDIN" && !linkedinConfigured) return { label: "Setup needed", message: issue?.message ?? null, tone: "waiting" }
   if (source.pending_snapshot_id) return { label: "Checking", message: null, tone: "waiting" }
+  if (source.collection_enabled === false && source.collection_note) return issue ?? {
+    label: 'Setup needed', message: source.collection_note, tone: 'waiting',
+  }
   if (source.type === "FACEBOOK" && source.collection_note) return { label: "Setup needed", message: source.collection_note, tone: "waiting" }
+  if (source.collection_enabled === false) return issue ?? { label: 'Collection disabled', message: 'Collection is disabled for this source. Stored posts remain available.', tone: 'waiting' }
   return issue ?? { label: source.last_checked_at ? "Monitoring" : "Ready", message: null, tone: "normal" }
 }

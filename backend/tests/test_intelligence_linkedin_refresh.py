@@ -12,9 +12,10 @@ from app.intelligence.services import CollectedNewsItem
 
 @pytest.mark.parametrize("subscribed,expected", [(True, True), (False, False)])
 def test_email_subscription_keeps_activity_outside_category_filter(monkeypatch, subscribed, expected):
-    source = SimpleNamespace(id=uuid4(), type="RSS", categories=["GRANTS"])
+    source = SimpleNamespace(id=uuid4(), type="RSS", url="https://example.com/feed", categories=["GRANTS"])
     stored = []
     db = SimpleNamespace(scalar=AsyncMock(side_effect=[None, source.id if subscribed else None]),
+                         scalars=AsyncMock(return_value=[]),
                          add=stored.append, flush=AsyncMock())
     analysis = SimpleNamespace(summary="News", category="BUSINESS", importanceScore=10, relevanceScore=10,
                                whyItMatters=None, deadline=None, fundingAmount=None, eligibility=None,

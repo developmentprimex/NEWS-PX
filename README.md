@@ -4,11 +4,13 @@ This folder is a standalone application. It has its own Next.js frontend, FastAP
 
 ## Email reports
 
-For once-daily social collection, adaptive source limits and verified reservation
-settlement, see [daily collection](docs/daily-collection.md). That mode collects a
-closed UTC day once at 00:05 UTC while keeping the 07:00/21:00 email reports.
+For the production 07:00/21:00 collection schedule, checkpoint transitions and
+shared adaptive limits, see [twice-daily collection](docs/twice-daily-collection.md).
+It requires `NEWS_SOCIAL_SCHEDULE_ENABLED=true` and `NEWS_SOCIAL_DAILY_FETCH=false`.
+The optional [daily collection](docs/daily-collection.md) mode instead collects a
+closed UTC day once at 00:05 UTC while keeping the same email report times.
 
-Each source has an Email on/off choice. With `NEWS_SOCIAL_SCHEDULE_ENABLED=true` (the default), LinkedIn and approved Facebook sources are checked in two daily cycles at **07:00 and 21:00 Europe/Budapest**, including daylight-saving changes. Website/RSS collection continues at each source's interval. Manual checks and ordinary scans cannot start extra social fetches. A delayed scheduler may start a slot within 30 minutes; missed slots are not replayed. Pending snapshots can still be retrieved after that window without starting replacement jobs.
+Each source has an Email on/off choice. With `NEWS_SOCIAL_SCHEDULE_ENABLED=true` and `NEWS_SOCIAL_DAILY_FETCH=false`, LinkedIn and approved Facebook sources are checked in two daily cycles at **07:00 and 21:00 Europe/Budapest**, including daylight-saving changes. Website/RSS collection continues at each source's interval and report slot. Manual checks and ordinary scans cannot start extra social fetches. A delayed scheduler may start a slot within 30 minutes; missed slots are not replayed. Pending snapshots can still be retrieved after that window without starting replacement jobs.
 
 After collection finishes, a combined report includes previously undelivered updates from subscribed active sources, including periodic News/website/RSS updates. Reports wait up to 30 minutes for pending social results. No email is sent without new updates; empty categories, idle sources and collection diagnostics are omitted. Late results can enter the next report. Delivery claims and item receipts survive restarts; uncertain SMTP outcomes block automatic resending and subsequent reports for that recipient/user until verified. Collection continues under the existing account, daily/monthly, Facebook pilot and source-cap protections; these may defer sources and never guarantee complete coverage. Source inventory is frozen separately for each slot, so newly added sources enter the next slot.
 
@@ -57,7 +59,7 @@ Before copying to another computer, run `./prepare-copy.ps1` in PowerShell from 
 
 LinkedIn cards show available likes/reactions, comment and repost/share counts, a preview of public comments, and shared-post content and attribution when Bright Data returns them. Missing counts remain unknown. Comment previews are partial and do not include comments the source account makes across other people's posts. Plain repost discovery depends on provider coverage; the app cannot promise a complete activity feed.
 
-Scheduled LinkedIn updates use the last confirmed cycle checkpoint and a six-record limit. A source's first cycle starts at the previous 07:00/21:00 slot. Provider date filters enclose the precise cycle interval, so returned duplicates may consume allowance. Social email entries require a confirmed activity timestamp. Web requests read stored posts and cannot trigger or poll scrapes. Historical backfills require a separate operator command and an approval reference. Stored posts, analyses and read/saved state remain available when fetching is paused. Saturated result windows pause for reconciliation instead of silently skipping unseen posts. Existing installations add the collection ledger and source checkpoints at API startup.
+Scheduled LinkedIn updates use the last confirmed cycle checkpoint. With adaptive limits enabled, small initial requests grow from observed results within the shared budget and configured ceiling. A source's first cycle starts at the previous 07:00/21:00 slot unless an earlier unresolved interval must be retained. Provider date filters enclose the precise cycle interval, so returned duplicates may consume allowance. Social email entries require a confirmed activity timestamp. Web requests read stored posts and cannot trigger or poll scrapes. Historical backfills require a separate operator command and an approval reference. Stored posts, analyses and read/saved state remain available when fetching is paused. Saturated windows remain unconfirmed and can receive a larger bounded request or require reconciliation. Existing installations add the collection ledger and source checkpoints at API startup. See [source quality](docs/source-quality.md) for content filtering and collection status meanings.
 
 ## Repost watch
 
@@ -69,7 +71,7 @@ The curated, canonicalized source manifest is in `data/repost-watch-sources.json
 
 LinkedIn posts now offer **Review & repost**. Connect a personal account or an authorized company Page, review the target post, optionally add commentary, then choose **Approve & repost**. Publishing requires official LinkedIn app credentials and explicit approval for each post; collection never publishes. See [LinkedIn publishing setup](docs/linkedin-publishing.md) for app products, the callback URL, server settings, post identifier limitations and uncertain-outcome handling.
 
-Canonical LinkedIn URL validation rejects duplicate creation and edits, including concurrent submissions. Historical duplicate rows remain intact and share one canonical collection owner. Identity changes and deletion are blocked after collection history exists; pause the source to retain its posts, analyses, saved state and daily limit.
+Canonical LinkedIn URL validation rejects duplicate creation and edits, including concurrent submissions. Historical duplicate rows remain intact and share one canonical collection owner. Identity changes are blocked after collection history exists. Administrators can delete a source after confirmation, permanently removing its collected posts, analyses, saved/read state and email subscription. Pending collections must finish or be reconciled before deletion. Provider execution and budget records are retained. Pause a source instead to retain its content.
 
 ## Release safety
 

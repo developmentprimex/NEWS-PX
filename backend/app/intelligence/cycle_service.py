@@ -113,8 +113,7 @@ async def freeze_inventory(db, cycle):
             if cycle.phase in COLLECTION_PHASES:
                 from app.intelligence.collection_exception import applies
                 experiment = applies(cycle, cycle.cutoff_at)
-                if not settings.NEWS_ENABLE_COLLECTION or (source.type not in {'LINKEDIN', 'FACEBOOK'}
-                        and not experiment and not settings.NEWS_SOCIAL_DAILY_FETCH):
+                if not settings.NEWS_ENABLE_COLLECTION:
                     continue
                 from app.intelligence.social_schedule import social_fetch_slot
                 if source.type in {'LINKEDIN', 'FACEBOOK'} and not social_fetch_slot(cycle):
@@ -142,8 +141,9 @@ async def freeze_inventory(db, cycle):
                     # This owner-authorized experiment measures the last slot;
                     # it does not silently buy a historical backfill.
                     point = bootstrap
-                if settings.NEWS_SOCIAL_DAILY_FETCH and source.type in {'LINKEDIN', 'FACEBOOK'} and not point:
-                    # Never forget a missed daily interval simply because no checkpoint exists yet.
+                if source.type in {'LINKEDIN', 'FACEBOOK'} and not point:
+                    # Preserve unresolved intervals across a daily/twice-daily
+                    # schedule switch when no verified checkpoint exists yet.
                     unresolved = await db.scalar(select(func.min(CollectionCycleSource.window_start))
                         .join(CollectionCycle, CollectionCycle.id == CollectionCycleSource.cycle_id).where(
                             CollectionCycleSource.source_id == source.id,
