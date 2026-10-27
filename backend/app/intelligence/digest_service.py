@@ -85,7 +85,8 @@ def activity_delivery_key(item: NewsItem) -> str:
 
 
 def digest_content(entries: list[dict], slot: datetime, source_names: list[str] | None = None,
-                   *, interval_start: datetime | None = None, sources: list[NewsSource] | None = None) -> tuple[str, str, str]:
+                   *, interval_start: datetime | None = None, sources: list[NewsSource] | None = None,
+                   empty_status: str | None = None) -> tuple[str, str, str]:
     start = interval_start or slot
     interval = f"{_stamp(start)} · {_stamp(slot)}"
     count = len(entries)
@@ -96,12 +97,16 @@ def digest_content(entries: list[dict], slot: datetime, source_names: list[str] 
     summary = " · ".join(f"{counts[kind]} {label}" for kind, label in [("NEWS", "lajme"), ("POST", "postime"), ("REPOST", "repostime"), ("ARTICLE", "artikuj")] if counts[kind])
     if other:
         summary += f" · {other} aktivitete të tjera"
+    if not entries:
+        summary = "0 aktivitete të reja"
     text_lines = [title, f"Intervali: {interval} (Europe/Budapest)", summary, ""]
     sections: dict[str, list[dict]] = {}
     for entry in entries:
         sections.setdefault(str(entry["source"].id), []).append(entry)
     if not entries:
         message = "Nuk u gjet aktivitet i ri në të dhënat e mbledhura nga burimet e zgjedhura për këtë interval."
+        if empty_status:
+            message += " " + empty_status
         text_lines.extend([message, ""])
     else:
         message = "Lajme, postime, repostime dhe artikuj nga burimet me email të aktivizuar."

@@ -5,6 +5,15 @@ Production collection uses 07:00 and 21:00 Europe/Budapest when
 The timezone follows daylight-saving changes. Combined reports retain the same
 times. Website/RSS collection retains its periodic checks and report-slot reads.
 
+Both report slots send a confirmation even when no new activities are available,
+as long as at least one active source has email enabled. A zero-activity email
+shows the interval and collection status. Partial coverage, failed or blocked
+sources, pending results and sources absent from the cycle are distinguished
+from completed checks with confirmed coverage. Zero results alone do not prove
+that a source published nothing. The existing durable SMTP claim prevents
+duplicate submissions, including for these empty reports. Previously recorded
+empty slots are not replayed after an upgrade.
+
 Each source starts at its last verified checkpoint. After a successful evening
 cycle, morning collection covers `(21:00, 07:00]`; after a successful morning
 cycle, evening covers `(07:00, 21:00]`. On a switch from closed UTC days, the first

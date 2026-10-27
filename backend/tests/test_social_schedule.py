@@ -324,7 +324,9 @@ def test_combined_reports_wait_for_collection_and_send_once_per_slot(database, m
 
 
 @pytest.mark.parametrize('smtp_error', [False, True])
-def test_concurrent_report_workers_and_uncertain_smtp_never_resend(database, monkeypatch, smtp_error):
+@pytest.mark.parametrize('empty', [False, True])
+def test_concurrent_report_workers_and_uncertain_smtp_never_resend(database, monkeypatch, smtp_error, empty):
+    from sqlalchemy import delete
     _, sessions = database
     calls = []
     async def send(*content):
@@ -336,12 +338,15 @@ def test_concurrent_report_workers_and_uncertain_smtp_never_resend(database, mon
     async def run():
         async with sessions() as db:
             user, cid = await prepare_report(db)
+            if empty:
+                await db.execute(delete(NewsItem))
+                await db.commit()
         async def worker():
             async with sessions() as db:
                 return await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user, AM + timedelta(minutes=2))
         results = await asyncio.gather(worker(), worker())
         assert len(calls) == 1
-        assert sum(results) == (0 if smtp_error else 2)
+        assert sum(results) == (0 if smtp_error or empty else 2)
         assert await worker() == 0
         async with sessions() as db:
             report = (await db.scalars(select(ScheduledDigestReport))).one()
@@ -349,11 +354,11 @@ def test_concurrent_report_workers_and_uncertain_smtp_never_resend(database, mon
     asyncio.run(run())
 
 
-def test_empty_reports_and_unsubscribed_updates_do_not_send(database, monkeypatch):
+def test_unsubscribed_updates_do_not_send(database, monkeypatch):
     from sqlalchemy import delete
     _, sessions = database
     async def send(*content):
-        pytest.fail('No email authorized without new subscribed updates')
+        pytest.fail('No email authorized without subscribed sources')
     monkeypatch.setattr(service, '_send_digest', send)
     original = service.scheduled_entries
     async def select_then_unsubscribe(db, user, *args, **kwargs):
@@ -369,6 +374,118 @@ def test_empty_reports_and_unsubscribed_updates_do_not_send(database, monkeypatc
             assert await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user, AM + timedelta(minutes=2)) == 0
             report = (await db.scalars(select(ScheduledDigestReport))).one()
             assert report.state == 'empty' and report.sent_at is None
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('state,confirmed', [
+    ('completed', True), ('completed', False), ('partial', False),
+    ('blocked', False), ('failed', False), ('uncertain', False), ('running', False),
+])
+def test_empty_scheduled_report_sends_once_with_honest_collection_status(database, monkeypatch, state, confirmed):
+    from sqlalchemy import delete
+    from app.intelligence.cycle_service import source_identity
+    from app.intelligence.models import NewsDigestDelivery
+    _, sessions = database
+    sent = []
+    async def send(*content):
+        sent.append(content)
+    monkeypatch.setattr(service, '_send_digest', send)
+    async def run():
+        async with sessions() as db:
+            user, cid = await prepare_report(db)
+            await db.execute(delete(NewsItem))
+            await db.execute(delete(CollectionCycleSource))
+            for src in await db.scalars(select(NewsSource)):
+                db.add(CollectionCycleSource(cycle_id=cid, source_id=src.id, name=src.name,
+                    type=src.type, canonical_url=source_identity(src), window_start=service.previous_slot(AM),
+                    window_end=AM, verified_start=True, state=state, coverage_confirmed=confirmed))
+            await db.commit()
+            cycle = await db.get(CollectionCycle, cid)
+            if state == 'running':
+                await service.process_scheduled_digest(db, cycle, user, AM + timedelta(minutes=2))
+                assert not sent
+            now = AM + timedelta(minutes=30)
+            assert await service.process_scheduled_digest(db, cycle, user, now) == 0
+            assert len(sent) == 1
+            subject, body, html = sent[0]
+            assert '0 aktivitete të reja' in subject
+            for content in (body, html):
+                assert '0 aktivitete të reja' in content
+                assert 'Intervali:' in content
+                assert '20.10.2026 07:00' in content
+                assert 'Nuk u gjet aktivitet i ri' in content
+                if state == 'completed' and confirmed:
+                    assert 'Kontrolli përfundoi pa gabime të regjistruara.' in content
+                    assert 'Mbulimi është i paplotë' not in content
+                else:
+                    assert 'Mbulimi është i paplotë' in content
+                    assert 'nuk konfirmon mungesën e publikimeve' in content
+            report = (await db.scalars(select(ScheduledDigestReport))).one()
+            assert report.state == 'sent' and report.sent_at == now
+            assert report.content['item_ids'] == []
+            assert not list(await db.scalars(select(NewsDigestDelivery)))
+            digest = await db.get(NewsDigestSettings, user)
+            assert digest.last_slot_at == AM and digest.last_sent_at == now and digest.last_error is None
+            await service.process_scheduled_digest(db, cycle, user, now + timedelta(minutes=1))
+            assert len(sent) == 1
+    asyncio.run(run())
+
+
+def test_empty_scheduled_report_without_smtp_does_not_consume_slot(database, monkeypatch):
+    from sqlalchemy import delete
+    _, sessions = database
+    monkeypatch.setattr(settings, 'EMAIL_PASSWORD', '')
+    async def run():
+        async with sessions() as db:
+            user, cid = await prepare_report(db)
+            await db.execute(delete(NewsItem))
+            await db.commit()
+            await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user, AM + timedelta(minutes=2))
+            assert not list(await db.scalars(select(ScheduledDigestReport)))
+            digest = await db.get(NewsDigestSettings, user)
+            assert digest.last_slot_at == service.previous_slot(AM) and digest.last_sent_at is None
+    asyncio.run(run())
+
+
+def test_empty_report_status_includes_sources_missing_from_cycle():
+    from types import SimpleNamespace
+    sid, missing = uuid4(), uuid4()
+    status = service.empty_report_status(
+        [SimpleNamespace(source_id=sid, state='completed', coverage_confirmed=True)], {sid, missing})
+    assert '1 me mbulim të konfirmuar' in status
+    assert '1 pa rezultat kontrolli për këtë cikël' in status
+    assert 'Mbulimi është i paplotë' in status
+    assert 'Kontrolli përfundoi pa gabime' not in status
+
+
+def test_empty_report_does_not_confirm_coverage_for_a_source_edited_after_collection(database, monkeypatch):
+    from sqlalchemy import delete
+    _, sessions = database
+    sent = []
+    async def send(*content):
+        sent.append(content)
+    monkeypatch.setattr(service, '_send_digest', send)
+    async def run():
+        async with sessions() as db:
+            user, cid = await prepare_report(db)
+            await db.execute(delete(NewsItem))
+            await db.execute(delete(CollectionCycleSource))
+            for src in await db.scalars(select(NewsSource)):
+                if src.type != 'RSS':
+                    await db.execute(delete(NewsSourceEmailSubscription).where(NewsSourceEmailSubscription.source_id == src.id))
+                    continue
+                db.add(CollectionCycleSource(cycle_id=cid, source_id=src.id, name=src.name,
+                    type=src.type, canonical_url=src.url, window_start=service.previous_slot(AM),
+                    window_end=AM, verified_start=True, state='completed', coverage_confirmed=True))
+                src.url = 'https://example.org/new-unchecked-feed'
+            await db.commit()
+            await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user, AM + timedelta(minutes=2))
+            assert len(sent) == 1
+            for content in sent[0][1:]:
+                assert '1 pa rezultat kontrolli për këtë cikël' in content
+                assert 'Mbulimi është i paplotë' in content
+                assert 'me mbulim të konfirmuar' not in content
+                assert 'Kontrolli përfundoi pa gabime' not in content
     asyncio.run(run())
 
 
