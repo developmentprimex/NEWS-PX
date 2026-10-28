@@ -15,7 +15,7 @@ from app.intelligence.models import (
     NewsSource, NewsSourceEmailSubscription,
 )
 from app.intelligence.digest_service import DIGEST_ZONE, activity_delivery_key, activity_kind, digest_content, _send_digest
-from app.intelligence.ga_timetable import morning_enabled, morning_attachment, attachment_metadata
+from app.intelligence.ga_timetable import morning_enabled, morning_attachments, attachment_metadata
 
 logger = logging.getLogger(__name__)
 SCHEDULE_TIMES = ['07:00', '21:00']
@@ -228,24 +228,24 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         and sources[e['source'].id].status == 'ACTIVE'
         and source_identity(sources[e['source'].id]) == identities[e['source'].id]
         and e['item'].created_at >= subscriptions[e['source'].id].enabled_at]
-    attachment = None
+    attachments = []
     if morning_enabled(cycle.phase):
         if not settings.EMAIL_USER or not settings.EMAIL_PASSWORD:
             await db.rollback()
             return 0
         try:
-            attachment = await morning_attachment(cycle.phase, cycle.cutoff_at)
+            attachments = await morning_attachments(cycle.phase, cycle.cutoff_at)
         except Exception:
             # No SMTP claim or delivery receipts until the required PDF exists.
             # A later scheduler tick may retry the read-only export safely.
-            digest.last_error = 'GA Time Table PDF unavailable; morning report waiting for attachment.'
+            digest.last_error = 'GA Time Table attachments unavailable; morning report waiting for PDF and Excel.'
             await db.commit()
-            logger.warning('Morning report waiting for GA timetable PDF')
+            logger.warning('Morning report waiting for GA timetable PDF and Excel')
             return 0
     report = ScheduledDigestReport(cycle_id=cycle.id, user_id=user_id,
         recipient_fingerprint=fingerprint, state='empty', content={'item_ids': []})
     db.add(report)
-    if not entries and attachment is None:
+    if not entries and not attachments:
         digest.last_slot_at, digest.last_error = cycle.cutoff_at, None
         await db.commit()
         return 0
@@ -259,18 +259,18 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         return 0
     subject, body, html = digest_content(entries, cycle.cutoff_at, interval_start=start)
     report.content = {'item_ids': [str(e['item'].id) for e in entries], 'subject': subject, 'body': body, 'html': html}
-    if attachment is not None:
-        note = f'Bashkangjitur: GA Time Table per daten {cycle.cutoff_at.astimezone(DIGEST_ZONE):%d.%m.%Y} (PDF).'
+    if attachments:
+        note = f'Bashkangjitur: GA Time Table per daten {cycle.cutoff_at.astimezone(DIGEST_ZONE):%d.%m.%Y} (PDF + Excel).'
         body += '\n\n' + note
         html = html.replace('</body>', f'<p style="font:14px Arial,sans-serif;padding:16px">{note}</p></body>')
         if not entries:
             subject = '[News Intelligence] GA Time Table · 07:00'
         report.content.update(subject=subject, body=body, html=html,
-                              attachments=[attachment_metadata(attachment)])
+                              attachments=[attachment_metadata(item) for item in attachments])
     report.state, report.claimed_at = 'sending', now
     await db.commit()  # A crash after claiming cannot cause a second SMTP submission.
     try:
-        extra = {'attachments': [attachment]} if attachment is not None else {}
+        extra = {'attachments': attachments} if attachments else {}
         await _send_digest(subject, body, html, **extra)
     except Exception:
         report.state, report.error = 'uncertain', 'SMTP outcome requires verification; automatic retry disabled.'

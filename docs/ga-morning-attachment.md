@@ -1,6 +1,7 @@
 # GA Time Table in the morning email
 
-This optional integration attaches `GA-Time-Table-YYYY-MM-DD.pdf` to the recurring
+This optional integration attaches `GA-Time-Table-YYYY-MM-DD.pdf` and
+`GA-Time-Table-YYYY-MM-DD.xlsx` to the recurring
 07:00 News report. It uses the report cutoff date in Europe/Budapest, including DST,
 and the existing Admin Tasks print layout with its single-day filter. The evening
 report, per-source subscriptions and the configured News recipient are preserved.
@@ -29,9 +30,14 @@ and reads the existing GA rows, slots and Common View meeting data before printi
 No PrimeFlow application files or settings are changed.
 
 PDF validation requires one page, a valid PDF signature, the exact dated heading
-and the comment column. The export reuses a private dated snapshot after success.
+and the comment column. The Excel file uses the existing authenticated single-day
+export as its layout and fills its four columns from the same frozen Print rows,
+including comments, reminders and meetings. Values remain literal text, including
+notes beginning with `=`. Its date, headers, single-day columns and all printed
+cell values are verified before delivery. Row heights expand to fit the content.
+Both formats reuse a private dated snapshot after success.
 If export fails, no email claim or item-delivery receipt is created, the checkpoint
-is preserved and Email settings shows that the morning report awaits its PDF.
+is preserved and Email settings shows that the morning report awaits PDF and Excel.
 Once SMTP is claimed, the existing uncertain-outcome protection still applies:
 never clear a claim or automatically resend after an ambiguous SMTP result.
 

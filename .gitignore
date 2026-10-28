@@ -14,6 +14,7 @@ tmp/credit-pg-*/
 /audit/
 /tmp/
 /output/
+/outputs/
 /docs/brightdata-*.md
 /docs/linkedin-provider-fallback-analysis.md
 **/private/

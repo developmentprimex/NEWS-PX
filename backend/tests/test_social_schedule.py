@@ -356,9 +356,10 @@ def test_morning_pdf_is_sent_once_even_without_news(database, monkeypatch, empty
     _, sessions = database
     monkeypatch.setattr(settings, 'NEWS_GA_TIMETABLE_BINDING_FILE', 'private-binding')
     attachment = EmailAttachment('GA-Time-Table-2026-10-20.pdf', b'%PDF-test')
-    export = AsyncMock(return_value=attachment)
+    excel = EmailAttachment('GA-Time-Table-2026-10-20.xlsx', b'xlsx-test', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    export = AsyncMock(return_value=[attachment, excel])
     send = AsyncMock()
-    monkeypatch.setattr(service, 'morning_attachment', export)
+    monkeypatch.setattr(service, 'morning_attachments', export)
     monkeypatch.setattr(service, '_send_digest', send)
     if empty:
         monkeypatch.setattr(service, 'scheduled_entries', AsyncMock(return_value=[]))
@@ -369,12 +370,13 @@ def test_morning_pdf_is_sent_once_even_without_news(database, monkeypatch, empty
             async with sessions() as db:
                 await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user, AM + timedelta(minutes=2))
         assert send.await_count == export.await_count == 1
-        assert send.await_args.kwargs['attachments'] == [attachment]
+        assert send.await_args.kwargs['attachments'] == [attachment, excel]
         assert export.await_args.args == ('scheduled-am', AM)
         async with sessions() as db:
             report = (await db.scalars(select(ScheduledDigestReport))).one()
             assert report.state == 'sent'
             assert report.content['attachments'][0]['filename'] == attachment.filename
+            assert report.content['attachments'][1]['filename'] == excel.filename
             assert len(report.content['item_ids']) == (0 if empty else 2)
             assert (await db.get(NewsDigestSettings, user)).last_sent_at is not None
     asyncio.run(run())
@@ -385,9 +387,9 @@ def test_failed_pdf_retries_before_claim_without_losing_news(database, monkeypat
     from unittest.mock import AsyncMock
     _, sessions = database
     monkeypatch.setattr(settings, 'NEWS_GA_TIMETABLE_BINDING_FILE', 'private-binding')
-    export = AsyncMock(side_effect=[RuntimeError('PrimeFlow unavailable'), EmailAttachment('GA.pdf', b'%PDF-test')])
+    export = AsyncMock(side_effect=[RuntimeError('PrimeFlow unavailable'), [EmailAttachment('GA.pdf', b'%PDF-test')]])
     send = AsyncMock()
-    monkeypatch.setattr(service, 'morning_attachment', export)
+    monkeypatch.setattr(service, 'morning_attachments', export)
     monkeypatch.setattr(service, '_send_digest', send)
     async def run():
         async with sessions() as db:
@@ -409,9 +411,9 @@ def test_uncertain_morning_smtp_retains_pdf_claim_and_never_resends(database, mo
     from unittest.mock import AsyncMock
     _, sessions = database
     monkeypatch.setattr(settings, 'NEWS_GA_TIMETABLE_BINDING_FILE', 'private-binding')
-    export = AsyncMock(return_value=EmailAttachment('GA.pdf', b'%PDF-test'))
+    export = AsyncMock(return_value=[EmailAttachment('GA.pdf', b'%PDF-test')])
     send = AsyncMock(side_effect=ConnectionError('SMTP acceptance unknown'))
-    monkeypatch.setattr(service, 'morning_attachment', export)
+    monkeypatch.setattr(service, 'morning_attachments', export)
     monkeypatch.setattr(service, '_send_digest', send)
     async def run():
         async with sessions() as db:
@@ -431,7 +433,7 @@ def test_evening_report_does_not_export_pdf_when_morning_feature_enabled(databas
     _, sessions = database
     monkeypatch.setattr(settings, 'NEWS_GA_TIMETABLE_BINDING_FILE', 'private-binding')
     export, send = AsyncMock(), AsyncMock()
-    monkeypatch.setattr(service, 'morning_attachment', export)
+    monkeypatch.setattr(service, 'morning_attachments', export)
     monkeypatch.setattr(service, '_send_digest', send)
     async def run():
         async with sessions() as db:
