@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     NEWS_COOKIE_SECURE: bool = False
     NEWS_PUBLIC_ORIGIN: str = "http://localhost:3101"
     NEWS_EMAIL_RECIPIENT: str = "180primex.eu@gmail.com"
+    NEWS_GA_TIMETABLE_BINDING_FILE: str | None = None
     NEWS_ENABLE_COLLECTION: bool = False
     NEWS_SOCIAL_SCHEDULE_ENABLED: bool = True
     NEWS_SOCIAL_DAILY_FETCH: bool = False

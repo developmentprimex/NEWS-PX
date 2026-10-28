@@ -20,7 +20,7 @@ from app.intelligence.models import (
     NewsAnalysis, NewsDigestDelivery, NewsDigestSettings,
     NewsItem, NewsSource, NewsSourceEmailSubscription,
 )
-from app.mail import GmailService
+from app.mail import EmailAttachment, GmailService
 
 logger = logging.getLogger(__name__)
 DIGEST_ZONE = ZoneInfo("Europe/Budapest")
@@ -166,13 +166,15 @@ def digest_content(entries: list[dict], slot: datetime, source_names: list[str] 
     return subject, "\n".join(text_lines), html
 
 
-async def _send_digest(subject: str, body: str, html: str, *, credentials: tuple[str, str] | None = None) -> None:
+async def _send_digest(subject: str, body: str, html: str, *, credentials: tuple[str, str] | None = None,
+                       attachments: list[EmailAttachment] | None = None) -> None:
     mailer = GmailService(credentials=credentials) if credentials is not None else GmailService()
     if mailer.port != 465 and not await _smtp_reachable(mailer.host, mailer.port):
         if not await _smtp_reachable(mailer.host, 465):
             raise ConnectionError("SMTP submission ports are unreachable")
         mailer.port = 465
-    await mailer.send_verified(subject, [settings.NEWS_EMAIL_RECIPIENT], body, html=html)
+    extra = {"attachments": attachments} if attachments else {}
+    await mailer.send_verified(subject, [settings.NEWS_EMAIL_RECIPIENT], body, html=html, **extra)
 
 
 async def send_digest_test(*, credentials: tuple[str, str] | None = None) -> None:

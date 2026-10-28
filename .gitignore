@@ -13,6 +13,7 @@ tmp/credit-pg-*/
 # Private investigations, exports and local preparation tools never ship.
 /audit/
 /tmp/
+/output/
 /docs/brightdata-*.md
 /docs/linkedin-provider-fallback-analysis.md
 **/private/

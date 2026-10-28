@@ -349,6 +349,104 @@ def test_concurrent_report_workers_and_uncertain_smtp_never_resend(database, mon
     asyncio.run(run())
 
 
+@pytest.mark.parametrize('empty', [False, True])
+def test_morning_pdf_is_sent_once_even_without_news(database, monkeypatch, empty):
+    from app.mail import EmailAttachment
+    from unittest.mock import AsyncMock
+    _, sessions = database
+    monkeypatch.setattr(settings, 'NEWS_GA_TIMETABLE_BINDING_FILE', 'private-binding')
+    attachment = EmailAttachment('GA-Time-Table-2026-10-20.pdf', b'%PDF-test')
+    export = AsyncMock(return_value=attachment)
+    send = AsyncMock()
+    monkeypatch.setattr(service, 'morning_attachment', export)
+    monkeypatch.setattr(service, '_send_digest', send)
+    if empty:
+        monkeypatch.setattr(service, 'scheduled_entries', AsyncMock(return_value=[]))
+    async def run():
+        async with sessions() as db:
+            user, cid = await prepare_report(db)
+        for _ in range(2):
+            async with sessions() as db:
+                await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user, AM + timedelta(minutes=2))
+        assert send.await_count == export.await_count == 1
+        assert send.await_args.kwargs['attachments'] == [attachment]
+        assert export.await_args.args == ('scheduled-am', AM)
+        async with sessions() as db:
+            report = (await db.scalars(select(ScheduledDigestReport))).one()
+            assert report.state == 'sent'
+            assert report.content['attachments'][0]['filename'] == attachment.filename
+            assert len(report.content['item_ids']) == (0 if empty else 2)
+            assert (await db.get(NewsDigestSettings, user)).last_sent_at is not None
+    asyncio.run(run())
+
+
+def test_failed_pdf_retries_before_claim_without_losing_news(database, monkeypatch):
+    from app.mail import EmailAttachment
+    from unittest.mock import AsyncMock
+    _, sessions = database
+    monkeypatch.setattr(settings, 'NEWS_GA_TIMETABLE_BINDING_FILE', 'private-binding')
+    export = AsyncMock(side_effect=[RuntimeError('PrimeFlow unavailable'), EmailAttachment('GA.pdf', b'%PDF-test')])
+    send = AsyncMock()
+    monkeypatch.setattr(service, 'morning_attachment', export)
+    monkeypatch.setattr(service, '_send_digest', send)
+    async def run():
+        async with sessions() as db:
+            user, cid = await prepare_report(db)
+            await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user, AM + timedelta(minutes=2))
+            assert send.await_count == 0
+            assert list(await db.scalars(select(ScheduledDigestReport))) == []
+            digest = await db.get(NewsDigestSettings, user)
+            assert digest.last_slot_at == service.previous_slot(AM)
+            assert 'waiting' in digest.last_error
+        async with sessions() as db:
+            assert await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user, AM + timedelta(minutes=3)) == 2
+        assert send.await_count == 1
+    asyncio.run(run())
+
+
+def test_uncertain_morning_smtp_retains_pdf_claim_and_never_resends(database, monkeypatch):
+    from app.mail import EmailAttachment
+    from unittest.mock import AsyncMock
+    _, sessions = database
+    monkeypatch.setattr(settings, 'NEWS_GA_TIMETABLE_BINDING_FILE', 'private-binding')
+    export = AsyncMock(return_value=EmailAttachment('GA.pdf', b'%PDF-test'))
+    send = AsyncMock(side_effect=ConnectionError('SMTP acceptance unknown'))
+    monkeypatch.setattr(service, 'morning_attachment', export)
+    monkeypatch.setattr(service, '_send_digest', send)
+    async def run():
+        async with sessions() as db:
+            user, cid = await prepare_report(db)
+        for minute in (2, 3):
+            async with sessions() as db:
+                await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user, AM + timedelta(minutes=minute))
+        assert send.await_count == export.await_count == 1
+        async with sessions() as db:
+            report = (await db.scalars(select(ScheduledDigestReport))).one()
+            assert report.state == 'uncertain' and report.content['attachments'][0]['filename'] == 'GA.pdf'
+    asyncio.run(run())
+
+
+def test_evening_report_does_not_export_pdf_when_morning_feature_enabled(database, monkeypatch):
+    from unittest.mock import AsyncMock
+    _, sessions = database
+    monkeypatch.setattr(settings, 'NEWS_GA_TIMETABLE_BINDING_FILE', 'private-binding')
+    export, send = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(service, 'morning_attachment', export)
+    monkeypatch.setattr(service, '_send_digest', send)
+    async def run():
+        async with sessions() as db:
+            user, cid = await prepare_report(db)
+            cycle = await db.get(CollectionCycle, cid)
+            cycle.phase, cycle.cutoff_at = 'scheduled-pm', PM
+            cycle.deadline_at = PM + timedelta(minutes=30)
+            await db.commit()
+            await service.process_scheduled_digest(db, cycle, user, PM + timedelta(minutes=2))
+        assert send.await_count == 1
+        assert send.await_args.kwargs == {}
+        export.assert_not_awaited()
+    asyncio.run(run())
+
+
 def test_empty_reports_and_unsubscribed_updates_do_not_send(database, monkeypatch):
     from sqlalchemy import delete
     _, sessions = database
