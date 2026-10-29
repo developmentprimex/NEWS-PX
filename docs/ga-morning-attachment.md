@@ -1,11 +1,14 @@
-# GA Time Table in the morning email
+# GA Time Table in scheduled emails
 
 This optional integration attaches `GA-Time-Table-YYYY-MM-DD.pdf` and
 `GA-Time-Table-YYYY-MM-DD.xlsx` to the recurring
-07:00 News report. It uses the report cutoff date in Europe/Budapest, including DST,
-and the existing Admin Tasks print layout with its single-day filter. The evening
-report, per-source subscriptions and the configured News recipient are preserved.
-An enabled morning attachment also sends on days without new News items.
+07:00 and 21:00 News reports. It uses the report cutoff date in Europe/Budapest, including DST,
+and the existing Admin Tasks print layout with its single-day filter. Existing
+per-source subscriptions and the configured News recipient are preserved.
+Enabled attachments also send on days without new News items.
+Morning files keep their existing private cache. Evening files use a separate
+`scheduled-pm` directory so later timetable edits appear in the evening report
+without overwriting the morning snapshot. Retries reuse their own slot's files.
 
 Configure `NEWS_GA_TIMETABLE_BINDING_FILE` with the absolute path to a protected JSON
 file outside the checkout and public web directories. Its fields are:
@@ -37,11 +40,11 @@ notes beginning with `=`. Its date, headers, single-day columns and all printed
 cell values are verified before delivery. Row heights expand to fit the content.
 Both formats reuse a private dated snapshot after success.
 If export fails, no email claim or item-delivery receipt is created, the checkpoint
-is preserved and Email settings shows that the morning report awaits PDF and Excel.
+is preserved and Email settings shows that the scheduled report awaits PDF and Excel.
 Once SMTP is claimed, the existing uncertain-outcome protection still applies:
 never clear a claim or automatically resend after an ambiguous SMTP result.
 
 For rollback, clear only `NEWS_GA_TIMETABLE_BINDING_FILE` and restart the reviewed
 News API runtime. Keep dated snapshots private. Existing report claims and News
-item receipts must be retained. Disabling the binding restores ordinary morning
+item receipts must be retained. Disabling the binding restores ordinary scheduled
 reports that send only when new subscribed News items are available.

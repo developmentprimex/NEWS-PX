@@ -54,10 +54,10 @@ def test_pdf_requires_exact_report_date_and_one_page():
             service.validate_pdf(invalid, date(2026, 10, 28))
 
 
-@pytest.mark.parametrize('phase', ['scheduled-pm', 'scheduled-day'])
-def test_evening_and_collection_slots_never_load_binding_or_export(monkeypatch, phase):
+@pytest.mark.parametrize('phase', ['scheduled-day', 'manual-am', 'recovery-day'])
+def test_non_report_slots_never_load_binding_or_export(monkeypatch, phase):
     monkeypatch.setattr(settings, 'NEWS_GA_TIMETABLE_BINDING_FILE', 'private-binding')
-    monkeypatch.setattr(service, 'load_binding', lambda: pytest.fail('Evening must not read PrimeFlow'))
+    monkeypatch.setattr(service, 'load_binding', lambda: pytest.fail('Collection-only slots must not read PrimeFlow'))
     assert asyncio.run(service.morning_attachment(phase, datetime.now(timezone.utc))) is None
 
 
@@ -151,12 +151,15 @@ def test_download_excel_requests_exact_day_and_includes_printed_meetings(tmp_pat
     assert requests[0].headers['authorization']=='Bearer test-token'
 
 
-def test_pdf_and_excel_are_cached_by_report_day(tmp_path,monkeypatch):
+def test_pdf_and_excel_are_cached_independently_for_both_report_slots(tmp_path,monkeypatch):
     monkeypatch.setattr(settings,'NEWS_GA_TIMETABLE_BINDING_FILE','private-binding')
     monkeypatch.setattr(service,'load_binding',lambda:{'cache_directory':str(tmp_path)})
     render=AsyncMock(return_value=pdf())
     download=AsyncMock(return_value=excel())
     (tmp_path/'GA-Time-Table-2026-10-28.rows.json').write_text(json.dumps({'version':2,'date':'2026-10-28','rows':[['','','','Wednesday activity']]}))
+    evening = tmp_path/'scheduled-pm'
+    evening.mkdir()
+    (evening/'GA-Time-Table-2026-10-28.rows.json').write_text(json.dumps({'version':2,'date':'2026-10-28','rows':[['','','','Wednesday activity']]}))
     monkeypatch.setattr(service,'render_pdf',render)
     monkeypatch.setattr(service,'download_excel',download)
     async def run():
@@ -167,8 +170,21 @@ def test_pdf_and_excel_are_cached_by_report_day(tmp_path,monkeypatch):
         assert [item.filename for item in first]==['GA-Time-Table-2026-10-28.pdf','GA-Time-Table-2026-10-28.xlsx']
         assert first[1].content_type==service.XLSX_TYPE
         assert download.await_count==render.await_count==1
-        assert await service.morning_attachments('scheduled-pm',stamp)==[]
+        pm_stamp=datetime(2026,10,28,20,tzinfo=timezone.utc)
+        pm_first=await service.morning_attachments('scheduled-pm',pm_stamp)
+        pm_second=await service.morning_attachments('scheduled-pm',pm_stamp)
+        assert pm_first==pm_second and len(pm_first)==2
+        assert download.await_count==render.await_count==2
+        assert render.await_args.args[0]['cache_directory']==str(evening)
+        assert (tmp_path/'GA-Time-Table-2026-10-28.pdf').exists()
+        assert (evening/'GA-Time-Table-2026-10-28.pdf').exists()
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('phase',['scheduled-am','scheduled-pm'])
+def test_disabled_binding_skips_both_reports(monkeypatch,phase):
+    monkeypatch.setattr(settings,'NEWS_GA_TIMETABLE_BINDING_FILE','')
+    assert asyncio.run(service.morning_attachments(phase,datetime.now(timezone.utc)))==[]
 
 
 def test_excel_failure_prevents_partial_attachment_bundle(tmp_path,monkeypatch):

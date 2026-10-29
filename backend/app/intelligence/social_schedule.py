@@ -238,9 +238,9 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         except Exception:
             # No SMTP claim or delivery receipts until the required PDF exists.
             # A later scheduler tick may retry the read-only export safely.
-            digest.last_error = 'GA Time Table attachments unavailable; morning report waiting for PDF and Excel.'
+            digest.last_error = 'GA Time Table attachments unavailable; scheduled report waiting for PDF and Excel.'
             await db.commit()
-            logger.warning('Morning report waiting for GA timetable PDF and Excel')
+            logger.warning('Scheduled report waiting for GA timetable PDF and Excel')
             return 0
     report = ScheduledDigestReport(cycle_id=cycle.id, user_id=user_id,
         recipient_fingerprint=fingerprint, state='empty', content={'item_ids': []})
@@ -264,7 +264,7 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         body += '\n\n' + note
         html = html.replace('</body>', f'<p style="font:14px Arial,sans-serif;padding:16px">{note}</p></body>')
         if not entries:
-            subject = '[News Intelligence] GA Time Table · 07:00'
+            subject = f'[News Intelligence] GA Time Table · {cycle.cutoff_at.astimezone(DIGEST_ZONE):%H:%M}'
         report.content.update(subject=subject, body=body, html=html,
                               attachments=[attachment_metadata(item) for item in attachments])
     report.state, report.claimed_at = 'sending', now

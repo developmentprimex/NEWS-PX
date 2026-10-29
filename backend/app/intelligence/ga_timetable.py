@@ -1,4 +1,4 @@
-"""Read PrimeFlow's dated print view and attach it only to the morning report."""
+"""Attach PrimeFlow's dated print view to the morning and evening reports."""
 import asyncio
 import hashlib
 import io
@@ -24,7 +24,15 @@ SHEET_NS = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
 
 
 def morning_enabled(phase: str) -> bool:
-    return phase == 'scheduled-am' and bool(settings.NEWS_GA_TIMETABLE_BINDING_FILE)
+    return phase in {'scheduled-am', 'scheduled-pm'} and bool(settings.NEWS_GA_TIMETABLE_BINDING_FILE)
+
+
+def slot_binding(phase: str) -> dict:
+    binding = load_binding()
+    if phase == 'scheduled-pm':
+        # The evening report captures later edits instead of reusing 07:00 files.
+        binding = dict(binding, cache_directory=str(Path(binding['cache_directory']) / 'scheduled-pm'))
+    return binding
 
 
 def load_binding() -> dict:
@@ -188,7 +196,7 @@ async def render_pdf(binding: dict, day: date) -> bytes:
 async def morning_attachment(phase: str, cutoff: datetime) -> EmailAttachment | None:
     if not morning_enabled(phase):
         return None
-    binding = load_binding()
+    binding = slot_binding(phase)
     day = cutoff.astimezone(ZONE).date()
     folder = Path(binding['cache_directory'])
     folder.mkdir(parents=True, exist_ok=True)
@@ -312,7 +320,7 @@ async def download_excel(binding: dict, day: date) -> bytes:
 async def morning_attachments(phase: str, cutoff: datetime) -> list[EmailAttachment]:
     if not morning_enabled(phase):
         return []
-    binding = load_binding()
+    binding = slot_binding(phase)
     day = cutoff.astimezone(ZONE).date()
     folder = Path(binding['cache_directory'])
     folder.mkdir(parents=True, exist_ok=True)

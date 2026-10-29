@@ -428,13 +428,19 @@ def test_uncertain_morning_smtp_retains_pdf_claim_and_never_resends(database, mo
     asyncio.run(run())
 
 
-def test_evening_report_does_not_export_pdf_when_morning_feature_enabled(database, monkeypatch):
+@pytest.mark.parametrize('empty',[False,True])
+def test_evening_report_attaches_both_files_once(database, monkeypatch, empty):
     from unittest.mock import AsyncMock
+    from app.mail import EmailAttachment
     _, sessions = database
     monkeypatch.setattr(settings, 'NEWS_GA_TIMETABLE_BINDING_FILE', 'private-binding')
-    export, send = AsyncMock(), AsyncMock()
+    attachments=[EmailAttachment('GA.pdf',b'%PDF-test'),EmailAttachment('GA.xlsx',b'xlsx-test',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')]
+    export, send = AsyncMock(return_value=attachments), AsyncMock()
     monkeypatch.setattr(service, 'morning_attachments', export)
     monkeypatch.setattr(service, '_send_digest', send)
+    if empty:
+        monkeypatch.setattr(service,'scheduled_entries',AsyncMock(return_value=[]))
     async def run():
         async with sessions() as db:
             user, cid = await prepare_report(db)
@@ -443,9 +449,15 @@ def test_evening_report_does_not_export_pdf_when_morning_feature_enabled(databas
             cycle.deadline_at = PM + timedelta(minutes=30)
             await db.commit()
             await service.process_scheduled_digest(db, cycle, user, PM + timedelta(minutes=2))
+            await service.process_scheduled_digest(db, cycle, user, PM + timedelta(minutes=3))
         assert send.await_count == 1
-        assert send.await_args.kwargs == {}
-        export.assert_not_awaited()
+        assert send.await_args.kwargs['attachments'] == attachments
+        export.assert_awaited_once_with('scheduled-pm',PM)
+        async with sessions() as db:
+            report=(await db.scalars(select(ScheduledDigestReport))).one()
+            assert report.state=='sent' and len(report.content['attachments'])==2
+            if empty:
+                assert report.content['subject'].endswith('21:00')
     asyncio.run(run())
 
 
