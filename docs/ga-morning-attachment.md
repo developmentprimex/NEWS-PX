@@ -39,8 +39,12 @@ including comments, reminders and meetings. Values remain literal text, includin
 notes beginning with `=`. Its date, headers, single-day columns and all printed
 cell values are verified before delivery. Row heights expand to fit the content.
 Both formats reuse a private dated snapshot after success.
-If export fails, no email claim or item-delivery receipt is created, the checkpoint
-is preserved and Email settings shows that the scheduled report awaits PDF and Excel.
+If export fails, News still sends the scheduled report without attachments, including
+when there are no new News items. Both the plain-text and HTML report explain that
+GA Time Table is unavailable and PDF/Excel are omitted. This warning is stored with
+the report. A successful News delivery advances the checkpoint and records item
+receipts normally; a later scheduler tick cannot resend that report just because
+the timetable becomes available. The next scheduled slot attempts export again.
 Once SMTP is claimed, the existing uncertain-outcome protection still applies:
 never clear a claim or automatically resend after an ambiguous SMTP result.
 

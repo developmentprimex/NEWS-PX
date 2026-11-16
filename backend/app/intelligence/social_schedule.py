@@ -229,6 +229,7 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         and source_identity(sources[e['source'].id]) == identities[e['source'].id]
         and e['item'].created_at >= subscriptions[e['source'].id].enabled_at]
     attachments = []
+    attachment_warning = None
     if morning_enabled(cycle.phase):
         if not settings.EMAIL_USER or not settings.EMAIL_PASSWORD:
             await db.rollback()
@@ -236,16 +237,14 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         try:
             attachments = await morning_attachments(cycle.phase, cycle.cutoff_at)
         except Exception:
-            # No SMTP claim or delivery receipts until the required PDF exists.
-            # A later scheduler tick may retry the read-only export safely.
-            digest.last_error = 'GA Time Table attachments unavailable; scheduled report waiting for PDF and Excel.'
-            await db.commit()
-            logger.warning('Scheduled report waiting for GA timetable PDF and Excel')
-            return 0
+            # Timetable export is optional: its failure must not block News delivery.
+            attachment_warning = ('GA Time Table nuk eshte i disponueshem. '
+                                  'Raporti News dergohet pa bashkengjitjet PDF dhe Excel.')
+            logger.warning('GA timetable export unavailable; sending scheduled News report without attachments')
     report = ScheduledDigestReport(cycle_id=cycle.id, user_id=user_id,
         recipient_fingerprint=fingerprint, state='empty', content={'item_ids': []})
     db.add(report)
-    if not entries and not attachments:
+    if not entries and not attachments and not attachment_warning:
         digest.last_slot_at, digest.last_error = cycle.cutoff_at, None
         await db.commit()
         return 0
@@ -258,7 +257,12 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         await db.rollback()
         return 0
     subject, body, html = digest_content(entries, cycle.cutoff_at, interval_start=start)
+    if attachment_warning:
+        body += '\n\n' + attachment_warning
+        html = html.replace('</body>', f'<p style="font:14px Arial,sans-serif;padding:16px">{attachment_warning}</p></body>')
     report.content = {'item_ids': [str(e['item'].id) for e in entries], 'subject': subject, 'body': body, 'html': html}
+    if attachment_warning:
+        report.content['attachment_warning'] = attachment_warning
     if attachments:
         note = f'Bashkangjitur: GA Time Table per daten {cycle.cutoff_at.astimezone(DIGEST_ZONE):%d.%m.%Y} (PDF + Excel).'
         body += '\n\n' + note

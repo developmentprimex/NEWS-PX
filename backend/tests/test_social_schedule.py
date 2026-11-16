@@ -382,27 +382,61 @@ def test_morning_pdf_is_sent_once_even_without_news(database, monkeypatch, empty
     asyncio.run(run())
 
 
-def test_failed_pdf_retries_before_claim_without_losing_news(database, monkeypatch):
-    from app.mail import EmailAttachment
+@pytest.mark.parametrize('phase,cutoff', [('scheduled-am', AM), ('scheduled-pm', PM)])
+@pytest.mark.parametrize('empty', [False, True])
+@pytest.mark.parametrize('smtp_error', [False, True])
+def test_unavailable_timetable_sends_news_once_without_attachments(database, monkeypatch, phase, cutoff, empty, smtp_error):
+    from sqlalchemy import delete
+    from app.intelligence.models import NewsDigestDelivery
     from unittest.mock import AsyncMock
     _, sessions = database
     monkeypatch.setattr(settings, 'NEWS_GA_TIMETABLE_BINDING_FILE', 'private-binding')
-    export = AsyncMock(side_effect=[RuntimeError('PrimeFlow unavailable'), [EmailAttachment('GA.pdf', b'%PDF-test')]])
-    send = AsyncMock()
+    export = AsyncMock(side_effect=RuntimeError('private export failure details'))
+    send = AsyncMock(side_effect=ConnectionError('SMTP acceptance unknown') if smtp_error else None)
     monkeypatch.setattr(service, 'morning_attachments', export)
     monkeypatch.setattr(service, '_send_digest', send)
     async def run():
         async with sessions() as db:
             user, cid = await prepare_report(db)
-            await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user, AM + timedelta(minutes=2))
-            assert send.await_count == 0
-            assert list(await db.scalars(select(ScheduledDigestReport))) == []
-            digest = await db.get(NewsDigestSettings, user)
-            assert digest.last_slot_at == service.previous_slot(AM)
-            assert 'waiting' in digest.last_error
-        async with sessions() as db:
-            assert await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user, AM + timedelta(minutes=3)) == 2
+            cycle = await db.get(CollectionCycle, cid)
+            cycle.phase, cycle.cutoff_at = phase, cutoff
+            cycle.deadline_at = cutoff + timedelta(minutes=30)
+            if empty:
+                await db.execute(delete(NewsItem))
+            else:
+                future = await db.scalar(select(NewsItem).where(NewsItem.title == 'Future news'))
+                future.published_at = cutoff + timedelta(hours=1)
+            await db.commit()
+        now = cutoff + timedelta(minutes=2)
+        for minute in (2, 3):
+            async with sessions() as db:
+                await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user,
+                    cutoff + timedelta(minutes=minute))
         assert send.await_count == 1
+        assert 'attachments' not in send.await_args.kwargs
+        subject, body, html = send.await_args.args
+        for content in (body, html):
+            assert 'GA Time Table' in content and 'PDF' in content and 'Excel' in content
+            assert 'private export failure details' not in content
+            assert 'Bashkangjitur:' not in content
+            assert ('New social post' in content) is not empty
+        if empty:
+            assert '0 aktivitete' in subject
+            assert 'Nuk u gjet aktivitet i ri' in body
+        async with sessions() as db:
+            report = (await db.scalars(select(ScheduledDigestReport))).one()
+            assert report.state == ('uncertain' if smtp_error else 'sent')
+            assert report.sent_at == (None if smtp_error else now)
+            assert report.content['body'] == body and report.content['html'] == html
+            assert report.content['attachment_warning']
+            assert 'attachments' not in report.content
+            assert len(report.content['item_ids']) == (0 if empty else 2)
+            receipts = list(await db.scalars(select(NewsDigestDelivery)))
+            assert len(receipts) == (0 if empty or smtp_error else 2)
+            digest = await db.get(NewsDigestSettings, user)
+            assert digest.last_slot_at == (service.previous_slot(AM) if smtp_error else cutoff)
+            assert digest.last_sent_at == (None if smtp_error else now)
+            assert bool(digest.last_error) is smtp_error
     asyncio.run(run())
 
 
