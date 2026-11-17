@@ -46,24 +46,25 @@ export function SourcesAdminWorkspace({ user, apiFetch, confirm }: {
   const [deletingId, setDeletingId] = React.useState<string | null>(null)
   const deletingRef = React.useRef<string | null>(null)
   const [budget, setBudget] = React.useState<{ pausedReason?: string; effectiveRecords?: number; operationalBudget?: number; providerRecords?: number | null; alerts?: number[] } | null>(null)
+  const isAdmin = user?.role === "ADMIN"
 
   const load = React.useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true)
     setError("")
     try {
       const [sourcesResponse, statusResponse, budgetResponse] = await Promise.all([
-        apiFetch("/intelligence/sources"), apiFetch("/intelligence/status"), apiFetch("/intelligence/collection-budget"),
+        apiFetch("/intelligence/sources"), apiFetch("/intelligence/status"), isAdmin ? apiFetch("/intelligence/collection-budget") : Promise.resolve(null),
       ])
       if (!sourcesResponse.ok || !statusResponse.ok) throw new Error("Could not load sources.")
       const [sourceData, statusData] = await Promise.all([sourcesResponse.json(), statusResponse.json()])
       setSources(sourceData)
       setConfigured(Boolean(statusData.linkedinConfigured))
-      if (budgetResponse.ok) setBudget(await budgetResponse.json())
+      if (budgetResponse?.ok) setBudget(await budgetResponse.json())
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not load sources.") }
     finally { if (!quiet) setLoading(false) }
-  }, [apiFetch])
+  }, [apiFetch, isAdmin])
 
-  React.useEffect(() => { if (user?.role === "ADMIN") void load() }, [load, user?.role])
+  React.useEffect(() => { if (user) void load() }, [load, user])
   React.useEffect(() => {
     if (!sources.some((source) => source.collection_supported && source.status === "ACTIVE")) return
     const timer = window.setInterval(() => void load(true), 30_000)
@@ -168,7 +169,7 @@ export function SourcesAdminWorkspace({ user, apiFetch, confirm }: {
   const visible = sources.filter((source) =>
     [source.name, source.url, source.type, ...source.categories, ...(source.repost_groups || [])].some((value) => value.toLowerCase().includes(search.toLowerCase())),
   )
-  if (user?.role !== "ADMIN") return <div className="mx-auto max-w-2xl p-8"><h1 className="text-xl font-semibold">Sources are available to admins.</h1><Button asChild variant="link" className="mt-3 px-0"><Link href="/intelligence">Return to Intelligence</Link></Button></div>
+  if (!user) return null
 
   return <div className="min-h-screen px-4 pb-16 pt-7 text-[#1d2b23] sm:px-7 lg:px-10 lg:pt-9"><div className="mx-auto max-w-[1180px]">
     <Link href="/intelligence" className="inline-flex items-center gap-1.5 text-xs font-medium text-[#7b8b80] hover:text-[#314e3a]"><ArrowLeft className="size-3.5" /> Intelligence</Link>

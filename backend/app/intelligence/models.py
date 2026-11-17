@@ -8,12 +8,14 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
+from app.auth import ADMIN_ID
 
 
 class NewsSource(Base):
     __tablename__ = "intelligence_sources"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True, default=lambda: ADMIN_ID, server_default=text(f"'{ADMIN_ID}'"))
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     url: Mapped[str] = mapped_column(String(2000), nullable=False)
     type: Mapped[str] = mapped_column(String(24), nullable=False)

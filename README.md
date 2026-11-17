@@ -2,6 +2,32 @@
 
 This folder is a standalone application. It has its own Next.js frontend, FastAPI backend, PostgreSQL database, login, source polling, and optional OpenAI, Bright Data, and SMTP integrations. The optional GA attachments read PrimeFlow's authenticated print view; ordinary News collection does not depend on PrimeFlow.
 
+## Private user accounts
+
+The existing configured administrator can create member accounts in **Users**,
+disable or enable them, and reset passwords. There is no public registration.
+Members sign in with their account email and a password of at least 12 characters,
+manage their own **Sources**, and see only those sources' news, analyses and saved
+items. Share initial/reset credentials privately; the app does not email passwords.
+Disabling a member revokes sessions and stops their reports while preserving data.
+
+Startup adds the member account table and source ownership column in place. All
+existing sources remain owned by the original configured administrator ID; source
+and article IDs, subscriptions, history, read/saved state, delivery receipts,
+`NEWS_EMAIL_RECIPIENT` and schedules are preserved. Keep the administrator email
+configuration unchanged when upgrading because it determines that existing ID.
+New users start empty. Their manual, test and scheduled emails go to their own
+login email and include only their enabled personal sources. GA timetable
+attachments remain exclusive to the original administrator. SMTP credentials,
+collection schedules and provider spending limits remain shared server settings.
+The same social URL can be added independently by different users; each monitor
+uses its own history and consumes the existing shared allowance.
+
+Deploy the matching frontend and backend together during a maintenance restart;
+take the usual database backup first. No existing source or delivery settings need
+to be re-entered. This migration requires the same schema permissions as the
+existing additive startup migrations.
+
 ## Email reports
 
 For once-daily social collection, adaptive source limits and verified reservation

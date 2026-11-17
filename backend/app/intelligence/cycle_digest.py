@@ -27,7 +27,7 @@ async def trial_digest_entries(db, cycle_id, user_id):
     entries = []
     for window, subscription in await subscribed_windows(db, cycle_id, user_id):
         source = await db.get(NewsSource, window.source_id)
-        if not source or source.status != 'ACTIVE' or source_identity(source) != window.canonical_url:
+        if not source or source.owner_id != user_id or source.status != 'ACTIVE' or source_identity(source) != window.canonical_url:
             continue
         rows = (await db.execute(select(NewsItem, NewsAnalysis).outerjoin(NewsAnalysis,
             NewsAnalysis.news_item_id == NewsItem.id).where(NewsItem.source_id == source.id)
@@ -107,7 +107,7 @@ async def process_trial_digest(db, cycle_id, now):
     source_ids = list(await db.scalars(select(CollectionCycleSource.source_id).where(CollectionCycleSource.cycle_id == cycle_id)))
     source_rows = list(await db.scalars(select(NewsSource).where(NewsSource.id.in_(source_ids)).order_by(NewsSource.id)
         .with_for_update().execution_options(populate_existing=True)))
-    sources_by_id = {s.id: s for s in source_rows if s.status == 'ACTIVE'}
+    sources_by_id = {s.id: s for s in source_rows if s.status == 'ACTIVE' and s.owner_id == user_id}
     subscriptions = list(await db.scalars(select(NewsSourceEmailSubscription).where(
         NewsSourceEmailSubscription.user_id == user_id, NewsSourceEmailSubscription.source_id.in_(source_ids))
         .with_for_update().execution_options(populate_existing=True)))

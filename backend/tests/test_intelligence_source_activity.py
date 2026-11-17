@@ -1,3 +1,4 @@
+from app.auth import ADMIN_ID, User
 import asyncio
 from types import SimpleNamespace
 from uuid import uuid4
@@ -18,7 +19,7 @@ def test_company_feed_filters_source_and_activity_before_limit(activity_kind):
             statements.append(query)
             return SimpleNamespace(all=lambda: [])
 
-    asyncio.run(news_router.list_items(db=FakeDB(), user=SimpleNamespace(id=uuid4()),
+    asyncio.run(news_router.list_items(db=FakeDB(), user=User(id=ADMIN_ID, email="test@example.com"),
                                       source_id=source_id, activity_kind=activity_kind))
     compiled = statements[-1].compile(dialect=postgresql.dialect())
     query = str(compiled)
@@ -40,7 +41,7 @@ def test_combined_company_feed_applies_both_sources_before_limit():
             statements.append(query)
             return SimpleNamespace(all=lambda: [])
 
-    asyncio.run(news_router.list_items(db=FakeDB(), user=SimpleNamespace(id=uuid4()), source_ids=ids))
+    asyncio.run(news_router.list_items(db=FakeDB(), user=User(id=ADMIN_ID, email="test@example.com"), source_ids=ids))
     compiled = statements[-1].compile(dialect=postgresql.dialect())
     assert "intelligence_sources.id IN" in str(compiled)
     assert ids in compiled.params.values()
@@ -59,9 +60,9 @@ def test_linkedin_refresh_endpoints_do_not_schedule_scraping(monkeypatch):
     monkeypatch.setattr(news_router, "_check_all_task", None)
     monkeypatch.setattr(news_router, "_get_source", AsyncMock(return_value=source))
     with pytest.raises(HTTPException) as error:
-        asyncio.run(news_router.check_all_sources_now(db=db, _=None))
+        asyncio.run(news_router.check_all_sources_now(db=db, _=User(id=ADMIN_ID, email="test@example.com")))
     assert error.value.status_code == 409
     with pytest.raises(HTTPException) as error:
-        asyncio.run(news_router.check_source_now(source.id, db=db, _=None))
+        asyncio.run(news_router.check_source_now(source.id, db=db, _=User(id=ADMIN_ID, email="test@example.com")))
     assert error.value.status_code == 409
     checker.assert_not_awaited()

@@ -14,6 +14,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.auth import account_recipient
 from app.db import SessionLocal
 from app.intelligence.email_service import _smtp_reachable
 from app.intelligence.models import (
@@ -167,27 +168,30 @@ def digest_content(entries: list[dict], slot: datetime, source_names: list[str] 
 
 
 async def _send_digest(subject: str, body: str, html: str, *, credentials: tuple[str, str] | None = None,
-                       attachments: list[EmailAttachment] | None = None) -> None:
+                       attachments: list[EmailAttachment] | None = None, recipient: str | None = None) -> None:
     mailer = GmailService(credentials=credentials) if credentials is not None else GmailService()
     if mailer.port != 465 and not await _smtp_reachable(mailer.host, mailer.port):
         if not await _smtp_reachable(mailer.host, 465):
             raise ConnectionError("SMTP submission ports are unreachable")
         mailer.port = 465
     extra = {"attachments": attachments} if attachments else {}
-    await mailer.send_verified(subject, [settings.NEWS_EMAIL_RECIPIENT], body, html=html, **extra)
+    await mailer.send_verified(subject, [recipient or settings.NEWS_EMAIL_RECIPIENT], body, html=html, **extra)
 
 
-async def send_digest_test(*, credentials: tuple[str, str] | None = None) -> None:
+async def send_digest_test(*, credentials: tuple[str, str] | None = None, recipient: str | None = None) -> None:
     subject = "[News Intelligence] Test i raportit me email"
     body = "Ky është një email test. Raportet e planifikuara do të përmbajnë lajmet, postimet, repostimet dhe artikujt e rinj nga burimet ku emaili është aktiv."
     html = ('<div style="max-width:600px;margin:auto;padding:28px;font-family:Arial,sans-serif;color:#24342a">'
             '<p style="color:#63866a;font-size:12px;font-weight:700;letter-spacing:2px">NEWS INTELLIGENCE</p>'
             '<h1 style="font-size:24px">Test i raportit me email</h1>'
             '<p>Konfigurimi i emailit po punon. Raportet e planifikuara do të përmbajnë lajmet, postimet, repostimet dhe artikujt e rinj nga burimet ku emaili është aktiv.</p></div>')
-    await _send_digest(subject, body, html, credentials=credentials)
+    await _send_digest(subject, body, html, credentials=credentials, recipient=recipient)
 
 
 async def process_digest(db: AsyncSession, user_id: uuid.UUID, now: datetime | None = None) -> int:
+    recipient = await account_recipient(db, user_id)
+    if recipient is None:
+        return 0
     now = now or datetime.now(timezone.utc)
     digest = (await db.execute(select(NewsDigestSettings).where(NewsDigestSettings.user_id == user_id)
                                .with_for_update(skip_locked=True))).scalar_one_or_none()
@@ -199,7 +203,7 @@ async def process_digest(db: AsyncSession, user_id: uuid.UUID, now: datetime | N
     sources = (await db.scalars(
         select(NewsSource)
         .join(NewsSourceEmailSubscription, NewsSourceEmailSubscription.source_id == NewsSource.id)
-        .where(NewsSourceEmailSubscription.user_id == user_id, NewsSource.status == "ACTIVE")
+        .where(NewsSource.owner_id == user_id, NewsSourceEmailSubscription.user_id == user_id, NewsSource.status == "ACTIVE")
         .order_by(NewsSource.name)
     )).all()
     if not sources:
@@ -212,7 +216,7 @@ async def process_digest(db: AsyncSession, user_id: uuid.UUID, now: datetime | N
         .outerjoin(NewsAnalysis, NewsAnalysis.news_item_id == NewsItem.id)
         .join(NewsSource, NewsSource.id == NewsItem.source_id)
         .join(NewsSourceEmailSubscription, NewsSourceEmailSubscription.source_id == NewsSource.id)
-        .where(NewsSourceEmailSubscription.user_id == user_id, NewsSource.status == "ACTIVE",
+        .where(NewsSource.owner_id == user_id, NewsSourceEmailSubscription.user_id == user_id, NewsSource.status == "ACTIVE",
                NewsItem.created_at >= NewsSourceEmailSubscription.enabled_at,
                NewsItem.created_at <= slot, activity_time <= slot,
                or_(activity_time > digest.last_slot_at,
@@ -245,7 +249,7 @@ async def process_digest(db: AsyncSession, user_id: uuid.UUID, now: datetime | N
         return 0
     subject, body, html = digest_content(entries, slot, interval_start=digest.last_slot_at, sources=sources)
     try:
-        await _send_digest(subject, body, html)
+        await _send_digest(subject, body, html, recipient=recipient)
     except Exception as exc:
         digest.last_error = str(exc)[:500]
         await db.commit()

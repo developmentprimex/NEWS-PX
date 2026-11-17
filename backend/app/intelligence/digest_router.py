@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import User, get_current_user
+from app.auth import ADMIN_ID, User, get_current_user, user_recipient
 from app.config import settings
 from app.db import get_db
 from app.intelligence.digest_service import ensure_digest_settings, send_digest_test
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 async def _report_credentials(db: AsyncSession, user_id) -> tuple[str, str] | None:
     if settings.EMAIL_USER and settings.EMAIL_PASSWORD:
         return settings.EMAIL_USER, settings.EMAIL_PASSWORD
-    if not settings.NEWS_SOCIAL_SCHEDULE_ENABLED and settings.NEWS_TRIAL_EMAIL_USER and settings.NEWS_TRIAL_EMAIL_PASSWORD:
+    if user_id == ADMIN_ID and not settings.NEWS_SOCIAL_SCHEDULE_ENABLED and settings.NEWS_TRIAL_EMAIL_USER and settings.NEWS_TRIAL_EMAIL_PASSWORD:
         config = await trial_configuration(db)
         if (trial_active(config, datetime.now(timezone.utc))
                 and config.get('user_id') == str(user_id)
@@ -31,9 +31,9 @@ async def _report_credentials(db: AsyncSession, user_id) -> tuple[str, str] | No
     return None
 
 
-def _settings_out(digest, credentials: tuple[str, str] | None) -> dict:
+def _settings_out(digest, credentials: tuple[str, str] | None, recipient: str | None = None) -> dict:
     return {"times": SCHEDULE_TIMES if settings.NEWS_SOCIAL_SCHEDULE_ENABLED else digest.times,
-            "scheduleManaged": settings.NEWS_SOCIAL_SCHEDULE_ENABLED, "timezone": "Europe/Budapest", "recipient": settings.NEWS_EMAIL_RECIPIENT,
+            "scheduleManaged": settings.NEWS_SOCIAL_SCHEDULE_ENABLED, "timezone": "Europe/Budapest", "recipient": recipient or settings.NEWS_EMAIL_RECIPIENT,
             "socialDailyFetch": settings.NEWS_SOCIAL_DAILY_FETCH,
             "socialFetchSchedule": 'Once daily, 00:05 UTC; previous closed UTC day' if settings.NEWS_SOCIAL_DAILY_FETCH else '07:00 / 21:00 Europe/Budapest',
             "lastSentAt": digest.last_sent_at, "lastError": digest.last_error,
@@ -45,7 +45,7 @@ async def get_digest_settings(db: AsyncSession = Depends(get_db), user: User = D
     digest = await ensure_digest_settings(db, user.id)
     credentials = await _report_credentials(db, user.id)
     await db.commit()
-    return _settings_out(digest, credentials)
+    return _settings_out(digest, credentials, user_recipient(user))
 
 
 @router.put("/digest-settings")
@@ -59,7 +59,7 @@ async def update_digest_settings(payload: DigestSettingsInput, db: AsyncSession 
         digest.last_slot_at = datetime.now(timezone.utc)
     credentials = await _report_credentials(db, user.id)
     await db.commit()
-    return _settings_out(digest, credentials)
+    return _settings_out(digest, credentials, user_recipient(user))
 
 
 @router.post("/digest-settings/test", status_code=status.HTTP_204_NO_CONTENT)
@@ -68,7 +68,7 @@ async def test_digest_email(user: User = Depends(get_current_user), db: AsyncSes
     if credentials is None:
         raise HTTPException(status_code=503, detail="SMTP is not configured on the server.")
     try:
-        await send_digest_test(credentials=credentials)
+        await send_digest_test(credentials=credentials, recipient=user_recipient(user))
     except Exception as exc:
         logger.exception("Digest test email failed")
         raise HTTPException(status_code=502, detail="Test email failed. Check the SMTP settings and server logs.") from exc

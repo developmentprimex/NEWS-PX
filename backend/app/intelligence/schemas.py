@@ -190,6 +190,7 @@ class FeedItemOut(BaseModel):
 
 class NewsFeedOut(BaseModel):
     items: list[FeedItemOut]
+    demoAllowed: bool = True
     hasLiveSources: bool
     emailConfigured: bool
     emailRecipient: str

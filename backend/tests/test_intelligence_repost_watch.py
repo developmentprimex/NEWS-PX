@@ -1,3 +1,4 @@
+from app.auth import ADMIN_ID, User
 import asyncio
 import json
 from pathlib import Path
@@ -40,7 +41,7 @@ def test_group_filter_is_applied_before_feed_limit():
         async def execute(self, query):
             statements.append(query)
             return SimpleNamespace(all=lambda: [])
-    asyncio.run(list_items(read_state="all", due_soon=False, saved_only=False, repost_group="COMPANY", db=FakeDB(), user=SimpleNamespace(id=uuid4())))
+    asyncio.run(list_items(read_state="all", due_soon=False, saved_only=False, repost_group="COMPANY", db=FakeDB(), user=User(id=ADMIN_ID, email="test@example.com")))
     query = str(statements[-1].compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": False}))
     assert "@>" in query
     assert query.index("WHERE") < query.index("LIMIT")
@@ -49,5 +50,5 @@ def test_group_filter_is_applied_before_feed_limit():
 def test_unread_badge_counts_shared_post_once_and_in_each_group():
     rows = [(uuid4(), ["CEO"]), (uuid4(), ["CEO", "COMPANY"]), (uuid4(), ["COMPANY"])]
     db = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(all=lambda: rows)))
-    result = asyncio.run(repost_watch_status(db=db, user=SimpleNamespace(id=uuid4())))
+    result = asyncio.run(repost_watch_status(db=db, user=User(id=ADMIN_ID, email="test@example.com")))
     assert result == {"unread": 3, "CEO": 2, "COMPANY": 2}

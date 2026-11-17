@@ -7,6 +7,7 @@ from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 
 from app.config import settings
+from app.auth import ADMIN_ID, account_recipient
 from app.intelligence.collection_cycles import (
     CollectionCycle, CollectionCycleSource, ScheduledDigestReport, confirmed_activity_time,
 )
@@ -158,7 +159,7 @@ async def scheduled_entries(db, user_id, start, cutoff, now, *, strict_interval=
         .outerjoin(NewsAnalysis, NewsAnalysis.news_item_id == NewsItem.id)
         .join(NewsSource, NewsSource.id == NewsItem.source_id)
         .join(NewsSourceEmailSubscription, NewsSourceEmailSubscription.source_id == NewsSource.id)
-        .where(NewsSourceEmailSubscription.user_id == user_id, NewsSource.status == 'ACTIVE',
+        .where(NewsSource.owner_id == user_id, NewsSourceEmailSubscription.user_id == user_id, NewsSource.status == 'ACTIVE',
             NewsItem.created_at >= NewsSourceEmailSubscription.enabled_at,
             NewsItem.created_at <= now, activity <= cutoff,
             or_(activity > start, and_(NewsItem.created_at > start,
@@ -188,12 +189,15 @@ async def process_scheduled_digest(db, cycle, user_id, now):
     from app.intelligence.cycle_service import TERMINAL, source_identity
     if not settings.NEWS_SOCIAL_SCHEDULE_ENABLED or cycle.phase not in SCHEDULE_PHASES or now < cycle.cutoff_at:
         return 0
+    recipient = await account_recipient(db, user_id)
+    if recipient is None:
+        return 0
     # Serialize both slots and concurrent workers for this user's delivery history.
     digest = await db.scalar(select(NewsDigestSettings).where(NewsDigestSettings.user_id == user_id)
         .with_for_update(skip_locked=True).execution_options(populate_existing=True))
     if not digest:
         return 0
-    fingerprint = hashlib.sha256(settings.NEWS_EMAIL_RECIPIENT.strip().casefold().encode()).hexdigest()
+    fingerprint = hashlib.sha256(recipient.strip().casefold().encode()).hexdigest()
     if await db.scalar(select(ScheduledDigestReport.id).where(
         ScheduledDigestReport.user_id == user_id, ScheduledDigestReport.recipient_fingerprint == fingerprint,
         ScheduledDigestReport.state.in_(['sending', 'uncertain'])).limit(1)):
@@ -225,12 +229,13 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         NewsSourceEmailSubscription.user_id == user_id, NewsSourceEmailSubscription.source_id.in_(source_ids))
         .order_by(NewsSourceEmailSubscription.source_id).with_for_update().execution_options(populate_existing=True))}
     entries = [e for e in entries if e['source'].id in subscriptions
+        and sources[e['source'].id].owner_id == user_id
         and sources[e['source'].id].status == 'ACTIVE'
         and source_identity(sources[e['source'].id]) == identities[e['source'].id]
         and e['item'].created_at >= subscriptions[e['source'].id].enabled_at]
     attachments = []
     attachment_warning = None
-    if morning_enabled(cycle.phase):
+    if user_id == ADMIN_ID and morning_enabled(cycle.phase):
         if not settings.EMAIL_USER or not settings.EMAIL_PASSWORD:
             await db.rollback()
             return 0
@@ -253,7 +258,7 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         await db.rollback()
         return 0
     if (not settings.NEWS_SOCIAL_SCHEDULE_ENABLED
-            or hashlib.sha256(settings.NEWS_EMAIL_RECIPIENT.strip().casefold().encode()).hexdigest() != fingerprint):
+            or await account_recipient(db, user_id) != recipient):
         await db.rollback()
         return 0
     subject, body, html = digest_content(entries, cycle.cutoff_at, interval_start=start)
@@ -275,6 +280,7 @@ async def process_scheduled_digest(db, cycle, user_id, now):
     await db.commit()  # A crash after claiming cannot cause a second SMTP submission.
     try:
         extra = {'attachments': attachments} if attachments else {}
+        extra['recipient'] = recipient
         await _send_digest(subject, body, html, **extra)
     except Exception:
         report.state, report.error = 'uncertain', 'SMTP outcome requires verification; automatic retry disabled.'
@@ -310,9 +316,12 @@ async def run_social_reports(now=None):
                 except Exception:
                     await db.rollback()
                     logger.warning('One-evening usage observation deferred; existing evidence retained')
-    fingerprint = hashlib.sha256(settings.NEWS_EMAIL_RECIPIENT.strip().casefold().encode()).hexdigest()
     for user_id in users:
         async with collection.SessionLocal() as db:
+            recipient = await account_recipient(db, user_id)
+            if recipient is None:
+                continue
+            fingerprint = hashlib.sha256(recipient.strip().casefold().encode()).hexdigest()
             if await db.scalar(select(ScheduledDigestReport.id).where(
                 ScheduledDigestReport.user_id == user_id, ScheduledDigestReport.recipient_fingerprint == fingerprint,
                 ScheduledDigestReport.state.in_(['sending', 'uncertain'])).limit(1)):

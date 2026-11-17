@@ -1,3 +1,4 @@
+from app.auth import ADMIN_ID, User
 """A single evening can exceed daily caps; expiry, billing and identity still hold."""
 import asyncio
 import json
@@ -212,11 +213,11 @@ def test_evening_email_only_contains_confirmed_activity_in_the_last_slot_for_eve
     monkeypatch.setattr(settings, 'EMAIL_USER', 'sender@example.org')
     monkeypatch.setattr(settings, 'EMAIL_PASSWORD', 'test-only')
     sent = []
-    async def smtp(subject, body, html):
+    async def smtp(subject, body, html, **kwargs):
         sent.append(body)
     monkeypatch.setattr(schedule, '_send_digest', smtp)
     async def run():
-        user_id = uuid4()
+        user_id = ADMIN_ID
         async with sessions() as db:
             await fresh(db, PM)
             db.add(NewsDigestSettings(user_id=user_id, times=['07:00','21:00'],

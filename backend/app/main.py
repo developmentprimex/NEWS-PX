@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, text
 
-from app.auth import router as auth_router
+from app.auth import router as auth_router, migrate_users
 from app.config import settings
 from app.db import AppMetadata, Base, SessionLocal, engine
 from app.import_primeflow import import_export
@@ -27,6 +27,7 @@ from app.intelligence.digest_router import router as digest_router
 async def lifespan(_: FastAPI):
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        await migrate_users(connection)
         await collection_cycles.migrate_trial_schema(connection)
         await connection.execute(text("ALTER TABLE intelligence_items ADD COLUMN IF NOT EXISTS linkedin_data JSONB"))
         await connection.execute(text("ALTER TABLE intelligence_sources ADD COLUMN IF NOT EXISTS repost_groups JSONB NOT NULL DEFAULT '[]'::jsonb"))

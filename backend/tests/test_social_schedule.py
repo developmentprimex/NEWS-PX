@@ -1,3 +1,4 @@
+from app.auth import ADMIN_ID, User
 """Recurring real-ledger scheduling; provider HTTP, RSS and SMTP remain mocked."""
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -210,7 +211,7 @@ def test_reports_run_without_waiting_for_collection_worker_lock(database, monkey
     from sqlalchemy import text
     _, sessions = database
     sent = []
-    async def send(*content):
+    async def send(*content, **kwargs):
         sent.append(content)
     monkeypatch.setattr(service, '_send_digest', send)
     async def run():
@@ -262,7 +263,7 @@ def test_facebook_also_runs_only_in_two_slots_and_websites_keep_periodic_checks(
 
 
 async def prepare_report(db, *, pending=False):
-    user = uuid4()
+    user = ADMIN_ID
     digest = NewsDigestSettings(user_id=user, times=['12:30'], last_slot_at=service.previous_slot(AM))
     active = NewsSource(name='Active & useful', type='LINKEDIN', url='https://linkedin.com/company/test/', status='ACTIVE')
     news = NewsSource(name='News', type='RSS', url='https://example.org/feed', status='ACTIVE')
@@ -295,7 +296,7 @@ async def prepare_report(db, *, pending=False):
 def test_combined_reports_wait_for_collection_and_send_once_per_slot(database, monkeypatch):
     _, sessions = database
     sent = []
-    async def send(*content):
+    async def send(*content, **kwargs):
         sent.append(content)
     monkeypatch.setattr(service, '_send_digest', send)
     async def run():
@@ -327,7 +328,7 @@ def test_combined_reports_wait_for_collection_and_send_once_per_slot(database, m
 def test_concurrent_report_workers_and_uncertain_smtp_never_resend(database, monkeypatch, smtp_error):
     _, sessions = database
     calls = []
-    async def send(*content):
+    async def send(*content, **kwargs):
         calls.append(content)
         await asyncio.sleep(0.05)
         if smtp_error:
@@ -498,7 +499,7 @@ def test_evening_report_attaches_both_files_once(database, monkeypatch, empty):
 def test_empty_reports_and_unsubscribed_updates_do_not_send(database, monkeypatch):
     from sqlalchemy import delete
     _, sessions = database
-    async def send(*content):
+    async def send(*content, **kwargs):
         pytest.fail('No email authorized without new subscribed updates')
     monkeypatch.setattr(service, '_send_digest', send)
     original = service.scheduled_entries
@@ -530,8 +531,8 @@ def test_email_settings_expose_fixed_times_and_block_arbitrary_schedule(monkeypa
     monkeypatch.setattr(digest_router, 'ensure_digest_settings', AsyncMock(return_value=digest))
     with pytest.raises(HTTPException) as error:
         asyncio.run(digest_router.update_digest_settings(DigestSettingsInput(times=['12:30']),
-            db=SimpleNamespace(), user=SimpleNamespace(id=uuid4())))
+            db=SimpleNamespace(), user=User(id=ADMIN_ID, email="test@example.com")))
     assert error.value.status_code == 422
     output = asyncio.run(digest_router.update_digest_settings(DigestSettingsInput(times=['07:00', '21:00']),
-        db=SimpleNamespace(commit=AsyncMock()), user=SimpleNamespace(id=uuid4())))
+        db=SimpleNamespace(commit=AsyncMock()), user=User(id=ADMIN_ID, email="test@example.com")))
     assert output['times'] == ['07:00', '21:00'] and digest.last_slot_at == AM

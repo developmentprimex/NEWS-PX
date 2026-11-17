@@ -335,7 +335,7 @@ async def protected_facebook_check(db, source, now, *, reason='scheduled', backf
             if not cycle_source_id and reason.startswith('scheduled'):
                 from app.intelligence.cycle_service import trial_owns_source
                 if await trial_owns_source(db,source.id,now):return 'paused'
-            candidates=list(await db.scalars(select(NewsSource).where(NewsSource.type=='FACEBOOK').order_by(NewsSource.created_at,NewsSource.id)))
+            candidates=list(await db.scalars(select(NewsSource).where(NewsSource.type=='FACEBOOK', NewsSource.owner_id == source.owner_id).order_by(NewsSource.created_at,NewsSource.id)))
             owners=[s for s in candidates if facebook_identity(s.url)==identity]
             if not owners or owners[0].id!=source.id:return 'paused'
             if source.linkedin_paused_reason:

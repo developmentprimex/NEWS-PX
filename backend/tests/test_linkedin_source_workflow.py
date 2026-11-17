@@ -1,3 +1,4 @@
+from app.auth import ADMIN_ID
 """New-source API -> protected polling -> private DB -> stored feed, HTTP mocked."""
 import asyncio
 import json
@@ -38,7 +39,7 @@ def test_new_source_to_persistent_feed_with_budget_and_daily_schedule(database, 
     provider = Provider(monkeypatch, [*rows, rows[0]])
     app = FastAPI()  # Router only: never imports/starts production lifespan.
     app.include_router(router, prefix='/api/intelligence')
-    user = SimpleNamespace(id=uuid4(), role='ADMIN')
+    user = SimpleNamespace(id=ADMIN_ID, role='ADMIN')
 
     async def db_dependency():
         async with sessions() as db:

@@ -1,3 +1,4 @@
+from app.auth import ADMIN_ID, User
 import asyncio
 import hashlib
 import json
@@ -16,7 +17,7 @@ from app.intelligence.schemas import DigestSettingsInput
 
 @pytest.fixture
 def configured_trial(monkeypatch):
-    user = SimpleNamespace(id=uuid4())
+    user = User(id=ADMIN_ID, email="test@example.com")
     recipient = 'recipient@example.com'
     config = {'enabled': True, 'date': datetime.now(ZoneInfo('Europe/Budapest')).date().isoformat(),
               'user_id': str(user.id),
@@ -81,7 +82,7 @@ def test_test_button_uses_the_authorized_trial_transport(configured_trial, monke
     monkeypatch.setattr(digest_router, 'send_digest_test', send)
     response = asyncio.run(digest_router.test_digest_email(user=user, db=db))
     assert response.status_code == 204
-    send.assert_awaited_once_with(credentials=('sender@example.com', 'test-app-password'))
+    send.assert_awaited_once_with(credentials=('sender@example.com', 'test-app-password'), recipient='recipient@example.com')
 
 
 def test_standard_smtp_still_works_without_a_trial(configured_trial, monkeypatch):
@@ -94,7 +95,7 @@ def test_standard_smtp_still_works_without_a_trial(configured_trial, monkeypatch
     output = asyncio.run(digest_router.get_digest_settings(db=db, user=user))
     assert output['emailConfigured'] is True
     asyncio.run(digest_router.test_digest_email(user=user, db=db))
-    send.assert_awaited_once_with(credentials=('ordinary@example.com', 'ordinary-password'))
+    send.assert_awaited_once_with(credentials=('ordinary@example.com', 'ordinary-password'), recipient='recipient@example.com')
 
 
 def test_trial_smtp_failure_returns_safe_error(configured_trial, monkeypatch):
@@ -112,7 +113,7 @@ def test_test_template_passes_explicit_credentials_without_changing_recipient(mo
     credentials = ('sender@example.com', 'test-password')
     asyncio.run(digest_service.send_digest_test(credentials=credentials))
     send.assert_awaited_once()
-    assert send.await_args.kwargs == {'credentials': credentials}
+    assert send.await_args.kwargs == {'credentials': credentials, 'recipient': None}
 
 
 def test_explicit_test_credentials_reach_transport_and_fixed_recipient(monkeypatch):
