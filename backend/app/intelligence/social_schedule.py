@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from app.config import settings
 from app.auth import ADMIN_ID, account_recipient
+from app.intelligence.content_quality import excluded_item_query
 from app.intelligence.collection_cycles import (
     CollectionCycle, CollectionCycleSource, ScheduledDigestReport, confirmed_activity_time,
 )
@@ -160,6 +161,7 @@ async def scheduled_entries(db, user_id, start, cutoff, now, *, strict_interval=
         .join(NewsSource, NewsSource.id == NewsItem.source_id)
         .join(NewsSourceEmailSubscription, NewsSourceEmailSubscription.source_id == NewsSource.id)
         .where(NewsSource.owner_id == user_id, NewsSourceEmailSubscription.user_id == user_id, NewsSource.status == 'ACTIVE',
+            ~excluded_item_query(NewsItem.id),
             NewsItem.created_at >= NewsSourceEmailSubscription.enabled_at,
             NewsItem.created_at <= now, activity <= cutoff,
             or_(activity > start, and_(NewsItem.created_at > start,
@@ -183,6 +185,29 @@ async def scheduled_entries(db, user_id, start, cutoff, now, *, strict_interval=
     return [entry for key, entry in entries.items() if key not in receipts
         and not (legacy[key] in receipts and activity_kind(entry['item'], entry['source']) != 'REPOST'
                  and receipts[legacy[key]] >= entry['item'].created_at)]
+
+
+def empty_report_status(rows, source_ids):
+    """Zero deliverable items is distinct from confirmed collection coverage."""
+    counts = {'confirmed': 0, 'partial': 0, 'blocked': 0, 'failed': 0, 'uncertain': 0, 'pending': 0}
+    for row in rows:
+        if row.state == 'completed' and row.coverage_confirmed:
+            counts['confirmed'] += 1
+        elif row.state in {'completed', 'partial'}:
+            counts['partial'] += 1
+        else:
+            counts[row.state if row.state in counts else 'pending'] += 1
+    missing = len(set(source_ids) - {row.source_id for row in rows})
+    labels = {'confirmed': 'me mbulim të konfirmuar', 'partial': 'me mbulim të pjesshëm',
+              'blocked': 'të bllokuara', 'failed': 'të dështuara',
+              'uncertain': 'me rezultat të pasigurt', 'pending': 'ende në pritje'}
+    details = [f'{count} {labels[key]}' for key, count in counts.items() if count]
+    if missing:
+        details.append(f'{missing} pa rezultat kontrolli për këtë cikël')
+    status = 'Gjendja e burimeve: ' + '; '.join(details) + '.'
+    if counts['confirmed'] == len(source_ids) and not missing:
+        return status + ' Kontrolli përfundoi pa gabime të regjistruara.'
+    return status + ' Mbulimi është i paplotë; mungesa e rezultateve nuk konfirmon mungesën e publikimeve gjatë intervalit.'
 
 
 async def process_scheduled_digest(db, cycle, user_id, now):
@@ -221,7 +246,10 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         # Late, verified updates remain deliverable; insertion time never certifies publication.
         entries = [e for e in entries if confirmed_activity_time(e['item']) is not None]
     # Honor source edits, pauses and unsubscribe that occurred during selection.
-    source_ids = sorted({e['source'].id for e in entries})
+    source_ids = list(await db.scalars(select(NewsSource.id)
+        .join(NewsSourceEmailSubscription, NewsSourceEmailSubscription.source_id == NewsSource.id)
+        .where(NewsSource.owner_id == user_id, NewsSourceEmailSubscription.user_id == user_id, NewsSource.status == 'ACTIVE')
+        .order_by(NewsSource.id)))
     identities = {e['source'].id: source_identity(e['source']) for e in entries}
     sources = {s.id: s for s in await db.scalars(select(NewsSource).where(NewsSource.id.in_(source_ids))
         .order_by(NewsSource.id).with_for_update().execution_options(populate_existing=True))}
@@ -229,12 +257,12 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         NewsSourceEmailSubscription.user_id == user_id, NewsSourceEmailSubscription.source_id.in_(source_ids))
         .order_by(NewsSourceEmailSubscription.source_id).with_for_update().execution_options(populate_existing=True))}
     entries = [e for e in entries if e['source'].id in subscriptions
+        and e['source'].id in sources
         and sources[e['source'].id].owner_id == user_id
         and sources[e['source'].id].status == 'ACTIVE'
         and source_identity(sources[e['source'].id]) == identities[e['source'].id]
         and e['item'].created_at >= subscriptions[e['source'].id].enabled_at]
     attachments = []
-    attachment_warning = None
     if user_id == ADMIN_ID and morning_enabled(cycle.phase):
         if not settings.EMAIL_USER or not settings.EMAIL_PASSWORD:
             await db.rollback()
@@ -242,14 +270,17 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         try:
             attachments = await morning_attachments(cycle.phase, cycle.cutoff_at)
         except Exception:
-            # Timetable export is optional: its failure must not block News delivery.
-            attachment_warning = ('GA Time Table nuk eshte i disponueshem. '
-                                  'Raporti News dergohet pa bashkengjitjet PDF dhe Excel.')
-            logger.warning('GA timetable export unavailable; sending scheduled News report without attachments')
+            # No SMTP claim or delivery receipts until the required PDF exists.
+            # A later scheduler tick may retry the read-only export safely.
+            digest.last_error = 'GA Time Table attachments unavailable; scheduled report waiting for PDF and Excel.'
+            await db.commit()
+            logger.warning('Scheduled report waiting for GA timetable PDF and Excel')
+            return 0
     report = ScheduledDigestReport(cycle_id=cycle.id, user_id=user_id,
         recipient_fingerprint=fingerprint, state='empty', content={'item_ids': []})
     db.add(report)
-    if not entries and not attachments and not attachment_warning:
+    active_ids = {sid for sid in subscriptions if sid in sources and sources[sid].owner_id == user_id and sources[sid].status == 'ACTIVE'}
+    if not active_ids:
         digest.last_slot_at, digest.last_error = cycle.cutoff_at, None
         await db.commit()
         return 0
@@ -261,13 +292,15 @@ async def process_scheduled_digest(db, cycle, user_id, now):
             or await account_recipient(db, user_id) != recipient):
         await db.rollback()
         return 0
-    subject, body, html = digest_content(entries, cycle.cutoff_at, interval_start=start)
-    if attachment_warning:
-        body += '\n\n' + attachment_warning
-        html = html.replace('</body>', f'<p style="font:14px Arial,sans-serif;padding:16px">{attachment_warning}</p></body>')
+    empty_status = None
+    if not entries:
+        rows = list(await db.scalars(select(CollectionCycleSource).where(
+            CollectionCycleSource.cycle_id == cycle.id, CollectionCycleSource.source_id.in_(active_ids))))
+        rows = [row for row in rows if row.type == sources[row.source_id].type
+                and row.canonical_url == source_identity(sources[row.source_id])]
+        empty_status = empty_report_status(rows, active_ids)
+    subject, body, html = digest_content(entries, cycle.cutoff_at, interval_start=start, empty_status=empty_status)
     report.content = {'item_ids': [str(e['item'].id) for e in entries], 'subject': subject, 'body': body, 'html': html}
-    if attachment_warning:
-        report.content['attachment_warning'] = attachment_warning
     if attachments:
         note = f'Bashkangjitur: GA Time Table per daten {cycle.cutoff_at.astimezone(DIGEST_ZONE):%d.%m.%Y} (PDF + Excel).'
         body += '\n\n' + note

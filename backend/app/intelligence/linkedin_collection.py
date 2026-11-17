@@ -119,7 +119,7 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
         await db.commit()
         return "paused"
     await db.commit()
-    if facebook and cycle_row and cycle.phase in {'scheduled-day', 'recovery-day', 'recovery-extra'}:
+    if facebook and cycle_row and (cycle.phase.startswith('scheduled-') or cycle.phase in {'recovery-day', 'recovery-extra'}):
         from app.intelligence.models import NewsItem
         known = list(await db.scalars(select(NewsItem.external_id).where(
             NewsItem.source_id == source.id, NewsItem.external_id.like('facebook:%'),

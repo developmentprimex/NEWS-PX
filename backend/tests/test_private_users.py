@@ -13,7 +13,7 @@ from sqlalchemy import select, text
 
 from app import auth
 from app.config import settings
-from app.db import get_db
+from app.db import get_db, AppMetadata
 from app.intelligence import router as feeds, digest_router, social_schedule
 from app.intelligence.models import NewsSource, NewsItem, NewsAnalysis, NewsDigestSettings, NewsSourceEmailSubscription, NewsUserState, NewsDigestDelivery
 from app.intelligence.collection_cycles import CollectionCycle
@@ -195,6 +195,27 @@ def test_member_test_email_uses_own_address(database, monkeypatch):
             await member.post('auth/login', json={'email': account['email'], 'password': 'member-password-123'})
             assert (await member.post('intelligence/digest-settings/test')).status_code == 204
             assert sender.await_args.kwargs['recipient'] == account['email']
+    asyncio.run(run())
+
+
+def test_existing_quality_exclusions_stay_hidden_for_owned_items(database):
+    _, sessions = database
+    async def run():
+        async with client(sessions) as admin:
+            await admin_login(admin)
+            async with sessions() as db:
+                source = NewsSource(name='Existing filtered source', type='RSS', url='https://example.org/quality')
+                db.add(source)
+                await db.flush()
+                item = NewsItem(source_id=source.id, title='Privacy policy', url='https://example.org/privacy')
+                db.add(item)
+                await db.flush()
+                db.add(NewsAnalysis(news_item_id=item.id, summary='Excluded navigation page', category='BUSINESS', importance_score=50, relevance_score=50))
+                db.add(AppMetadata(key='news-quality-excluded:'+item.id.hex, value='Previously excluded navigation content'))
+                await db.commit()
+            response = await admin.get('intelligence/items')
+            assert response.status_code == 200
+            assert response.json()['items'] == []
     asyncio.run(run())
 
 

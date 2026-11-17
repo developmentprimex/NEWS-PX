@@ -34,6 +34,7 @@ def post_url(value):
         path=p.path
         parts=path.strip('/').split('/')
         if not (('/posts/' in path and len(parts)>=3) or path.startswith(('/reel/','/videos/'))
+                or len(parts)==2 and parts[0]=='events' and parts[1].isdigit()
                 or len(parts)>=3 and parts[1] in {'photos','videos'}
                 or path in {'/permalink.php','/story.php','/photo.php'}):return None
         query=parse_qs(p.query)
@@ -50,7 +51,7 @@ def belongs(record,source):
         expected=urlsplit(identity).path.strip('/').split('/')[-1]
         return group==identity or bool(identifier and identifier==expected)
     candidates=(record.get('page_url'),record.get('user_url'))
-    if any(identity_or_none(v)==identity for v in candidates if v):return record.get('is_page') is not False
+    if any(identity_or_none(v)==identity for v in candidates if v):return True
     expected=parse_qs(urlsplit(identity).query).get('id',[urlsplit(identity).path.strip('/')])[0]
     return bool(expected.isdigit() and str(record.get('profile_id') or '')==expected and record.get('is_page') is True)
 
@@ -64,7 +65,8 @@ def parse_posts(records,source):
         raw=row.get('date_posted')
         original=row.get('original_post')
         shared=bool(isinstance(original,dict) and any(k!='user_avatar_image' and v for k,v in original.items()))
-        precise=publication_has_precise_time(raw) and not shared
+        # Event records do not establish when the page announced the event.
+        precise=publication_has_precise_time(raw) and not shared and '/events/' not in url
         try:
             stamp=datetime.fromisoformat(raw.replace('Z','+00:00')) if isinstance(raw,str) else None
             if stamp and not stamp.tzinfo:stamp=stamp.replace(tzinfo=timezone.utc)

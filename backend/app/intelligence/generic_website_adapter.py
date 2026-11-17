@@ -22,6 +22,7 @@ from playwright.async_api import async_playwright
 
 from app.intelligence.rss_adapter import _check_public_dns, parse_feed, rss_url_is_supported
 from app.intelligence.services import CollectedNewsItem, publication_has_precise_time
+from app.intelligence.content_quality import canonical_article_url, website_content_reason, announcement_signal, STATIC_PATH
 
 MAX_BODY = 4_000_000
 MAX_LINKS = 35
@@ -55,9 +56,9 @@ def _clean_url(url: str, base: str) -> str | None:
     if not _same_site(resolved, base):
         return None
     parts = urlsplit(resolved)
-    if SKIP_PATH.search(parts.path):
+    if SKIP_PATH.search(parts.path) or STATIC_PATH.search(parts.path):
         return None
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
+    return canonical_article_url(resolved)
 
 
 def _text(node: BeautifulSoup) -> str:
@@ -74,6 +75,8 @@ def discover_links(html: str, page_url: str) -> tuple[list[tuple[str, str]], lis
                 feeds.append(link)
     entries: dict[str, tuple[int, str]] = {}
     for link in soup.select("main a[href], article a[href], a[href]"):
+        if link.find_parent(['nav','header','footer','aside']):
+            continue
         url = _clean_url(link.get("href", ""), page_url)
         if not url or url == page_url or url in entries:
             continue
@@ -109,15 +112,17 @@ def parse_publication_date(soup: BeautifulSoup) -> datetime | None:
 
 def parse_html_article(page: Page, fallback_title: str) -> CollectedNewsItem | None:
     soup = BeautifulSoup(page.body, "html.parser")
+    if not announcement_signal(soup):
+        return None
     for node in soup.select("script, style, nav, footer, header, aside, form, noscript"):
         node.decompose()
     main = soup.select_one("article") or soup.select_one("main") or soup.select_one("body")
     if main is None:
         return None
-    title_node = soup.select_one("h1")
+    title_node = main.select_one("h1") or soup.select_one("h1")
     title = _text(title_node) if title_node else fallback_title
     body = _text(main)[:20_000]
-    if len(title) < 8 or len(body) < 60:
+    if len(title) < 8 or len(body) < 60 or website_content_reason(page.url,page.url,title,body):
         return None
     raw_time = next((str(node.get(attr)) for selector, attr in (
         ("meta[property='article:published_time']", 'content'), ("meta[name='date']", 'content'), ('time[datetime]', 'datetime'))
@@ -162,6 +167,15 @@ class GenericWebsiteAdapter:
         if not rss_url_is_supported(source_url):
             raise GenericWebsiteError("Use a public HTTP or HTTPS website URL without credentials or a custom port.")
         self.source_url = source_url
+
+    def _eligible(self, post):
+        if website_content_reason(self.source_url,post.url,post.title,post.original_text):
+            return False
+        # A homepage feed often contains years of old entries. Do not import
+        # those as newly discovered news or accept future publication dates.
+        from datetime import timedelta
+        now=datetime.now(timezone.utc)
+        return not post.published_at or now-timedelta(days=90) <= post.published_at <= now+timedelta(hours=1)
 
     async def _get(self, client: httpx.AsyncClient, url: str) -> Page:
         try:
@@ -250,7 +264,7 @@ class GenericWebsiteAdapter:
         async with httpx.AsyncClient(timeout=httpx.Timeout(20.0), follow_redirects=False, trust_env=False) as client:
             home = await self._get(client, self.source_url)
             if any(kind in home.content_type for kind in ("rss", "atom", "xml")):
-                return parse_feed(home.body, home.url)[:max_items]
+                return [post for post in parse_feed(home.body, home.url) if self._eligible(post)][:max_items]
             if "pdf" in home.content_type:
                 item = parse_pdf_article(home, urlsplit(home.url).path.rsplit("/", 1)[-1])
                 return [item] if item else []
@@ -259,7 +273,7 @@ class GenericWebsiteAdapter:
                 try:
                     feed = await self._get(client, feed_url)
                     if "html" not in feed.content_type:
-                        posts = parse_feed(feed.body, feed.url)
+                        posts = [post for post in parse_feed(feed.body, feed.url) if self._eligible(post)]
                         if posts:
                             return posts[:max_items]
                 except (httpx.HTTPError, GenericWebsiteError, ValueError):
@@ -282,16 +296,16 @@ class GenericWebsiteAdapter:
                 except (httpx.HTTPError, GenericWebsiteError):
                     pass
             if not links:
-                raise GenericWebsiteError("No public announcement links were found. This site may require a browser or sign-in.")
+                return []
             posts: list[CollectedNewsItem] = []
             for url, title in links[:max_items]:
                 try:
                     page = await self._get(client, url)
                     item = parse_pdf_article(page, title) if "pdf" in page.content_type else parse_html_article(page, title) if "html" in page.content_type else None
-                    if item:
+                    if item and self._eligible(item):
                         posts.append(item)
                 except (httpx.HTTPError, GenericWebsiteError):
                     continue
-            if not posts:
-                raise GenericWebsiteError("Announcement links were found, but their content could not be read.")
+            # A readable website with no current qualifying announcements is
+            # different from a failed HTTP request.
             return posts

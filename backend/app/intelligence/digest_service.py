@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.auth import account_recipient
+from app.intelligence.content_quality import excluded_item_query
 from app.db import SessionLocal
 from app.intelligence.email_service import _smtp_reachable
 from app.intelligence.models import (
@@ -85,7 +86,8 @@ def activity_delivery_key(item: NewsItem) -> str:
 
 
 def digest_content(entries: list[dict], slot: datetime, source_names: list[str] | None = None,
-                   *, interval_start: datetime | None = None, sources: list[NewsSource] | None = None) -> tuple[str, str, str]:
+                   *, interval_start: datetime | None = None, sources: list[NewsSource] | None = None,
+                   empty_status: str | None = None) -> tuple[str, str, str]:
     start = interval_start or slot
     interval = f"{_stamp(start)} · {_stamp(slot)}"
     count = len(entries)
@@ -96,12 +98,16 @@ def digest_content(entries: list[dict], slot: datetime, source_names: list[str] 
     summary = " · ".join(f"{counts[kind]} {label}" for kind, label in [("NEWS", "lajme"), ("POST", "postime"), ("REPOST", "repostime"), ("ARTICLE", "artikuj")] if counts[kind])
     if other:
         summary += f" · {other} aktivitete të tjera"
+    if not entries:
+        summary = "0 aktivitete të reja"
     text_lines = [title, f"Intervali: {interval} (Europe/Budapest)", summary, ""]
     sections: dict[str, list[dict]] = {}
     for entry in entries:
         sections.setdefault(str(entry["source"].id), []).append(entry)
     if not entries:
         message = "Nuk u gjet aktivitet i ri në të dhënat e mbledhura nga burimet e zgjedhura për këtë interval."
+        if empty_status:
+            message += " " + empty_status
         text_lines.extend([message, ""])
     else:
         message = "Lajme, postime, repostime dhe artikuj nga burimet me email të aktivizuar."
@@ -217,6 +223,7 @@ async def process_digest(db: AsyncSession, user_id: uuid.UUID, now: datetime | N
         .join(NewsSource, NewsSource.id == NewsItem.source_id)
         .join(NewsSourceEmailSubscription, NewsSourceEmailSubscription.source_id == NewsSource.id)
         .where(NewsSource.owner_id == user_id, NewsSourceEmailSubscription.user_id == user_id, NewsSource.status == "ACTIVE",
+               ~excluded_item_query(NewsItem.id),
                NewsItem.created_at >= NewsSourceEmailSubscription.enabled_at,
                NewsItem.created_at <= slot, activity_time <= slot,
                or_(activity_time > digest.last_slot_at,

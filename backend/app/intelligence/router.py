@@ -27,6 +27,7 @@ from app.intelligence.linkedin_identity import identity_or_none, lock_source_ide
 from app.intelligence.models import LinkedInSourceIdentity
 from app.intelligence.models import BrightDataExecution, NewsAnalysis, NewsItem, NewsSource, NewsSourceEmailSubscription, NewsUserState
 from app.intelligence.priority import analyzed_news_priority
+from app.intelligence.content_quality import excluded_item_query
 from app.intelligence.rss_adapter import rss_url_is_supported
 from app.intelligence.schemas import DeepInsightOut, EmailShareOut, IntelligenceStatusOut, LinkedInMonitorOut, NewsFeedOut, NewsSourceCreate, NewsSourceEmailInput, NewsSourceOut, NewsSourceUpdate, SourceCheckOut, StrategicBriefOut
 from app.intelligence.website_adapter import source_kind
@@ -76,12 +77,16 @@ def _source_out(source: NewsSource, email_enabled: bool = False) -> NewsSourceOu
     output.collection_supported = source.type == "LINKEDIN" or (source.type in {"WEBSITE", "RSS"} and rss_url_is_supported(source.url))
     output.email_enabled = email_enabled
     output.collection_enabled = source.type == "LINKEDIN" and source.status == "ACTIVE" and settings.NEWS_ENABLE_COLLECTION and settings.NEWS_LINKEDIN_FETCH_ENABLED and not settings.NEWS_BRIGHTDATA_CANARY_LIVE_ENABLED and not source.linkedin_paused_reason
+    if source.type in {'WEBSITE','RSS'}:
+        output.collection_enabled = bool(output.collection_supported and source.status == 'ACTIVE' and settings.NEWS_ENABLE_COLLECTION)
+    if source.type in {'LINKEDIN','FACEBOOK'} and source.linkedin_paused_reason:
+        output.collection_note = source.linkedin_paused_reason
     if source.type == 'FACEBOOK':
         from app.intelligence.facebook_identity import identity_or_none as facebook_identity, setup_note, source_approved
         output.collection_supported = bool(facebook_identity(source.url))
         output.collection_enabled = bool(source.status == 'ACTIVE' and settings.NEWS_ENABLE_COLLECTION
             and settings.NEWS_FACEBOOK_FETCH_ENABLED and source_approved(source) and not source.linkedin_paused_reason)
-        output.collection_note = setup_note(source)
+        output.collection_note = source.linkedin_paused_reason or setup_note(source)
     return output
 
 
@@ -140,6 +145,8 @@ async def list_items(
         query = query.where(NewsUserState.read_at.is_not(None))
     if saved_only:
         query = query.where(NewsUserState.saved_at.is_not(None))
+    else:
+        query = query.where(~excluded_item_query(NewsItem.id))
     if repost_group == "ALL":
         query = query.where(NewsSource.repost_groups != [])
     elif repost_group:
@@ -162,6 +169,7 @@ async def list_items(
         "sourceType": source.type, "externalId": item.external_id,
         "url": item.url, "title": item.title, "originalText": item.original_text,
         "publishedAt": (item.published_at or item.created_at).isoformat(),
+        "publicationTimeKnown": item.published_at is not None,
         "imageUrl": item.image_url, "contentHash": item.content_hash,
         "createdAt": item.created_at.isoformat(), "location": None,
         "linkedin": item.linkedin_data,
@@ -188,6 +196,7 @@ async def _brief_rows(db: AsyncSession, user_id: uuid.UUID) -> list[tuple[NewsIt
         select(NewsItem, NewsSource, NewsAnalysis)
         .join(NewsSource, NewsSource.id == NewsItem.source_id)
         .join(NewsAnalysis, NewsAnalysis.news_item_id == NewsItem.id)
+        .where(~excluded_item_query(NewsItem.id))
         .order_by(NewsItem.published_at.desc().nullslast(), NewsItem.created_at.desc())
         .where(NewsSource.owner_id == user_id)
         .limit(80)
