@@ -141,7 +141,7 @@ class NewsAnalysis(Base):
     deadline: Mapped[date | None] = mapped_column(Date)
     funding_amount: Mapped[str | None] = mapped_column(String(160))
     eligibility: Mapped[str | None] = mapped_column(Text)
-    opportunity_type: Mapped[str | None] = mapped_column(String(40))
+    opportunity_type: Mapped[str | None] = mapped_column(Text)
     tags: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
     analyzed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 

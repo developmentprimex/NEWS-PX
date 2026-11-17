@@ -114,6 +114,12 @@ def parse_html_article(page: Page, fallback_title: str) -> CollectedNewsItem | N
     soup = BeautifulSoup(page.body, "html.parser")
     if not announcement_signal(soup):
         return None
+    # Publication metadata can live in the article header, which is removed
+    # below to keep navigation and repeated titles out of the article body.
+    published_at = parse_publication_date(soup)
+    raw_time = next((str(node.get(attr)) for selector, attr in (
+        ("meta[property='article:published_time']", 'content'), ("meta[name='date']", 'content'), ('time[datetime]', 'datetime'))
+        if (node := soup.select_one(selector)) is not None and node.get(attr)), None)
     for node in soup.select("script, style, nav, footer, header, aside, form, noscript"):
         node.decompose()
     main = soup.select_one("article") or soup.select_one("main") or soup.select_one("body")
@@ -124,10 +130,7 @@ def parse_html_article(page: Page, fallback_title: str) -> CollectedNewsItem | N
     body = _text(main)[:20_000]
     if len(title) < 8 or len(body) < 60 or website_content_reason(page.url,page.url,title,body):
         return None
-    raw_time = next((str(node.get(attr)) for selector, attr in (
-        ("meta[property='article:published_time']", 'content'), ("meta[name='date']", 'content'), ('time[datetime]', 'datetime'))
-        if (node := soup.select_one(selector)) is not None and node.get(attr)), None)
-    return CollectedNewsItem(page.url[:500], page.url, title[:500], body, parse_publication_date(soup),
+    return CollectedNewsItem(page.url[:500], page.url, title[:500], body, published_at,
                              publication_time_verified=publication_has_precise_time(raw_time))
 
 
@@ -183,6 +186,8 @@ class GenericWebsiteAdapter:
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code not in {500, 502, 503, 504}:
                 raise
+        except (httpx.ReadTimeout, httpx.ConnectTimeout):
+            pass
         # Retry one transient read failure; access denials and certificate
         # problems need operator/site-owner action, not repeated requests.
         await asyncio.sleep(1)

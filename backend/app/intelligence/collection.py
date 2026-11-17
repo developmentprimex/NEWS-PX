@@ -262,7 +262,12 @@ async def check_source(db: AsyncSession, source_id: uuid.UUID, *, force: bool = 
         source = await db.get(NewsSource, source_id)
         if source is None:
             return "error"
-        source.last_error = str(exc)[:500]
+        message = str(exc).strip()
+        if not message:
+            message = ("Source request timed out; it will be retried at the next scheduled check."
+                       if isinstance(exc, httpx.TimeoutException)
+                       else f"Source check failed ({type(exc).__name__}).")
+        source.last_error = message[:500]
         source.last_started_at = now
         await db.commit()
         logger.warning("Intelligence source %s: %s", source.id, exc)
