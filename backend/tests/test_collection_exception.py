@@ -165,7 +165,7 @@ def test_usage_baseline_and_delayed_rollup_are_distinct_from_reservations(databa
     asyncio.run(run())
 
 
-def test_today_additionally_checks_websites_but_tomorrow_does_not(database, monkeypatch):
+def test_recurring_website_checks_continue_after_the_exception_date(database, monkeypatch):
     _, sessions = database
     calls = []
     async def rss(adapter):
@@ -180,7 +180,7 @@ def test_today_additionally_checks_websites_but_tomorrow_does_not(database, monk
         await schedule.run_social_collection(PM+timedelta(minutes=1))
         assert calls == ['https://example.org/feed']
         await schedule.run_social_collection(PM+timedelta(days=1))
-        assert len(calls) == 1
+        assert len(calls) == 2
     asyncio.run(run())
 
 

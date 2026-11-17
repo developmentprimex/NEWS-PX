@@ -386,7 +386,7 @@ def test_morning_pdf_is_sent_once_even_without_news(database, monkeypatch, empty
 @pytest.mark.parametrize('phase,cutoff', [('scheduled-am', AM), ('scheduled-pm', PM)])
 @pytest.mark.parametrize('empty', [False, True])
 @pytest.mark.parametrize('smtp_error', [False, True])
-def test_unavailable_timetable_sends_news_once_without_attachments(database, monkeypatch, phase, cutoff, empty, smtp_error):
+def test_unavailable_timetable_defers_admin_delivery_until_export_recovers(database, monkeypatch, phase, cutoff, empty, smtp_error):
     from sqlalchemy import delete
     from app.intelligence.models import NewsDigestDelivery
     from unittest.mock import AsyncMock
@@ -413,31 +413,34 @@ def test_unavailable_timetable_sends_news_once_without_attachments(database, mon
             async with sessions() as db:
                 await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user,
                     cutoff + timedelta(minutes=minute))
+        # Keep the installed administrator behavior: a failed required export
+        # leaves the report unclaimed and sends neither News nor delivery receipts.
+        send.assert_not_awaited()
+        assert export.await_count == 2
+        async with sessions() as db:
+            assert list(await db.scalars(select(ScheduledDigestReport))) == []
+            assert list(await db.scalars(select(NewsDigestDelivery))) == []
+            digest = await db.get(NewsDigestSettings, user)
+            assert digest.last_slot_at == service.previous_slot(AM)
+            assert digest.last_sent_at is None
+            assert 'waiting for PDF and Excel' in digest.last_error
+            assert 'private export failure details' not in digest.last_error
+        from app.mail import EmailAttachment
+        attachments = [EmailAttachment('GA.pdf', b'%PDF-test')]
+        export.side_effect = None
+        export.return_value = attachments
+        async with sessions() as db:
+            await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user,
+                cutoff + timedelta(minutes=4))
+            await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user,
+                cutoff + timedelta(minutes=5))
         assert send.await_count == 1
-        assert 'attachments' not in send.await_args.kwargs
-        subject, body, html = send.await_args.args
-        for content in (body, html):
-            assert 'GA Time Table' in content and 'PDF' in content and 'Excel' in content
-            assert 'private export failure details' not in content
-            assert 'Bashkangjitur:' not in content
-            assert ('New social post' in content) is not empty
-        if empty:
-            assert '0 aktivitete' in subject
-            assert 'Nuk u gjet aktivitet i ri' in body
+        assert send.await_args.kwargs['attachments'] == attachments
         async with sessions() as db:
             report = (await db.scalars(select(ScheduledDigestReport))).one()
             assert report.state == ('uncertain' if smtp_error else 'sent')
-            assert report.sent_at == (None if smtp_error else now)
-            assert report.content['body'] == body and report.content['html'] == html
-            assert report.content['attachment_warning']
-            assert 'attachments' not in report.content
             assert len(report.content['item_ids']) == (0 if empty else 2)
-            receipts = list(await db.scalars(select(NewsDigestDelivery)))
-            assert len(receipts) == (0 if empty or smtp_error else 2)
-            digest = await db.get(NewsDigestSettings, user)
-            assert digest.last_slot_at == (service.previous_slot(AM) if smtp_error else cutoff)
-            assert digest.last_sent_at == (None if smtp_error else now)
-            assert bool(digest.last_error) is smtp_error
+            assert len(list(await db.scalars(select(NewsDigestDelivery)))) == (0 if empty or smtp_error else 2)
     asyncio.run(run())
 
 
