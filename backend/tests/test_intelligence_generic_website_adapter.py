@@ -35,6 +35,31 @@ def test_article_extracts_content_and_publication_date():
     assert post.published_at.isoformat() == "2026-09-29T10:00:00+00:00"
 
 
+@pytest.mark.parametrize('selector,raw,expected', [
+    ('name="govuk:first-published-at"', '2026-10-01T15:37:00+01:00', '2026-10-01T15:37:00+01:00'),
+    ('itemprop="datePublished"', '2026-10-20T10:23:51-0400', '2026-10-20T10:23:51-04:00'),
+])
+def test_article_uses_verified_publication_metadata_after_an_invalid_tag(selector, raw, expected):
+    html = f'''<meta property="article:published_time" content="invalid">
+        <meta {selector} content="{raw}">
+        <meta itemprop="dateModified" content="2026-11-16T10:30:00Z">
+        <main><h1>New grant for Kosovo businesses</h1><p>Applications are now open for technology companies in Kosovo.
+        The application deadline is 30 November, and applicants must submit their documentation online.</p></main>'''
+    post = parse_html_article(Page('https://example.org/news/grant', html.encode(), 'text/html'), 'New grant')
+    assert post is not None
+    assert post.published_at.isoformat() == expected
+    assert post.publication_time_verified
+
+
+@pytest.mark.parametrize('value,verified', [('2026-11-16T10:30:00Z', True), ('2026-11-16', False)])
+def test_article_header_date_survives_body_cleanup_without_inventing_time(value, verified):
+    html = f'<main><article><header><h1>New grant for technology companies</h1><time datetime="{value}">Published</time></header><p>Applications are open for technology companies in Kosovo. Please read the eligibility requirements and the application deadline.</p></article></main>'
+    post = parse_html_article(Page('https://example.org/news/new-grant', html.encode(), 'text/html'), 'New grant for technology companies')
+    assert post is not None and post.published_at.date().isoformat() == '2026-11-16'
+    assert post.publication_time_verified is verified
+    assert 'Published' not in post.original_text
+
+
 def test_redirect_to_another_host_is_not_fetched(monkeypatch):
     adapter = GenericWebsiteAdapter("https://example.org/news")
     monkeypatch.setattr("app.intelligence.generic_website_adapter._check_public_dns", AsyncMock())

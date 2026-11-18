@@ -94,21 +94,30 @@ def discover_links(html: str, page_url: str) -> tuple[list[tuple[str, str]], lis
     return [(url, title) for url, (_, title) in ranked[:MAX_LINKS]], feeds
 
 
-def parse_publication_date(soup: BeautifulSoup) -> datetime | None:
-    for selector, attr in (("meta[property='article:published_time']", "content"), ("meta[name='date']", "content"), ("time[datetime]", "datetime")):
+def parse_publication_date(soup: BeautifulSoup) -> tuple[datetime | None, bool]:
+    for selector, attr in (
+        ("meta[property='article:published_time']", "content"),
+        ("meta[name='govuk:first-published-at']", "content"),
+        ("meta[itemprop='datePublished'], meta[name='datePublished'], meta[property='datePublished']", "content"),
+        ("meta[name='date']", "content"),
+        ("time[datetime]", "datetime"),
+    ):
         node = soup.select_one(selector)
-        if not node or not node.get(attr):
+        raw = node.get(attr) if node else None
+        if not isinstance(raw, str) or not raw:
             continue
         try:
-            result = datetime.fromisoformat(node[attr].replace("Z", "+00:00"))
-            return result.replace(tzinfo=timezone.utc) if result.tzinfo is None else result
+            result = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         except ValueError:
             continue
-    return None
+        published_at = result.replace(tzinfo=timezone.utc) if result.tzinfo is None else result
+        return published_at, publication_has_precise_time(raw)
+    return None, False
 
 
 def parse_html_article(page: Page, fallback_title: str) -> CollectedNewsItem | None:
     soup = BeautifulSoup(page.body, "html.parser")
+    published_at, publication_time_verified = parse_publication_date(soup)
     for node in soup.select("script, style, nav, footer, header, aside, form, noscript"):
         node.decompose()
     main = soup.select_one("article") or soup.select_one("main") or soup.select_one("body")
@@ -119,11 +128,8 @@ def parse_html_article(page: Page, fallback_title: str) -> CollectedNewsItem | N
     body = _text(main)[:20_000]
     if len(title) < 8 or len(body) < 60:
         return None
-    raw_time = next((str(node.get(attr)) for selector, attr in (
-        ("meta[property='article:published_time']", 'content'), ("meta[name='date']", 'content'), ('time[datetime]', 'datetime'))
-        if (node := soup.select_one(selector)) is not None and node.get(attr)), None)
-    return CollectedNewsItem(page.url[:500], page.url, title[:500], body, parse_publication_date(soup),
-                             publication_time_verified=publication_has_precise_time(raw_time))
+    return CollectedNewsItem(page.url[:500], page.url, title[:500], body, published_at,
+                             publication_time_verified=publication_time_verified)
 
 
 def parse_pdf_article(page: Page, fallback_title: str) -> CollectedNewsItem | None:
