@@ -2,7 +2,7 @@ from app.auth import ADMIN_ID, User
 """Recurring real-ledger scheduling; provider HTTP, RSS and SMTP remain mocked."""
 import asyncio
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select
@@ -227,7 +227,7 @@ def test_reports_run_without_waiting_for_collection_worker_lock(database, monkey
     asyncio.run(run())
 
 
-def test_facebook_also_runs_only_in_two_slots_and_websites_keep_periodic_checks(database, monkeypatch):
+def test_scheduled_rss_checks_and_periodic_checks_do_not_start_extra_facebook_jobs(database, monkeypatch):
     from app.intelligence import facebook_collection
     _, sessions = database
     provider = Provider(monkeypatch)
@@ -253,12 +253,12 @@ def test_facebook_also_runs_only_in_two_slots_and_websites_keep_periodic_checks(
             await service.run_social_collection(cutoff)
             await service.run_social_collection(cutoff + timedelta(minutes=1))
         assert len(provider.triggers) == 2
-        assert not reads  # Social slots do not force extra website/RSS checks.
+        assert reads == ['https://example.com/feed'] * 2
         await collection.check_due_sources()
-        assert reads == ['https://example.com/feed']
+        assert reads == ['https://example.com/feed'] * 3
         assert len(provider.triggers) == 2
         async with sessions() as db:
-            assert set(await db.scalars(select(CollectionCycleSource.type))) == {'FACEBOOK'}
+            assert set(await db.scalars(select(CollectionCycleSource.type))) == {'FACEBOOK', 'RSS'}
     asyncio.run(run())
 
 
@@ -285,9 +285,9 @@ async def prepare_report(db, *, pending=False):
             original_text=title, published_at=AM - timedelta(minutes=10), created_at=AM + timedelta(minutes=1),
             linkedin_data={'kind': 'POST'} if src == active else None, publication_time_verified=True))
     db.add(NewsItem(source_id=news.id, title='Future news', url='https://example.org/future',
-        published_at=AM + timedelta(hours=1), created_at=AM + timedelta(minutes=1)))
+        published_at=AM + timedelta(hours=1), created_at=AM + timedelta(minutes=1), publication_time_verified=True))
     db.add(NewsItem(source_id=active.id, title='Unverified social time', url='https://example.org/unknown',
-        published_at=AM - timedelta(minutes=5), created_at=AM + timedelta(minutes=1),
+        published_at=AM - timedelta(minutes=5), created_at=service.previous_slot(AM) - timedelta(minutes=1),
         linkedin_data={'kind': 'REPOST'}, publication_time_verified=False))
     await db.commit()
     return user, cycle.id
@@ -322,6 +322,114 @@ def test_combined_reports_wait_for_collection_and_send_once_per_slot(database, m
             assert 'Future news' in sent[1][1] and 'New social post' not in sent[1][1]
             assert len(list(await db.scalars(select(ScheduledDigestReport)))) == 2
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('phase,cutoff', [('scheduled-am', AM), ('scheduled-pm', PM)])
+def test_scheduled_report_separates_discovery_from_publication_interval(database, monkeypatch, phase, cutoff):
+    from sqlalchemy import delete
+    from unittest.mock import AsyncMock
+
+    _, sessions = database
+    send = AsyncMock()
+    monkeypatch.setattr(service, '_send_digest', send)
+
+    async def run():
+        async with sessions() as db:
+            user, cid = await prepare_report(db)
+            cycle = await db.get(CollectionCycle, cid)
+            cycle.phase, cycle.cutoff_at = phase, cutoff
+            cycle.deadline_at = cutoff + timedelta(minutes=30)
+            start = service.previous_slot(cutoff)
+            digest = await db.get(NewsDigestSettings, user)
+            digest.last_slot_at = start - timedelta(days=1)
+            news = await db.scalar(select(NewsSource).where(NewsSource.type == 'RSS'))
+            news.type = 'WEBSITE'
+            social = await db.scalar(select(NewsSource).where(NewsSource.type == 'LINKEDIN'))
+            await db.execute(delete(NewsItem))
+            repost_at = cutoff - timedelta(minutes=1)
+            cases = [
+                (news, 'Older article imported now', start - timedelta(hours=1), True, None),
+                (news, 'Already in previous slot', start, True, None),
+                (news, 'Unverified article', start + timedelta(hours=1), False, None),
+                (news, 'Undated article', None, False, None),
+                (news, 'After cutoff', cutoff + timedelta(seconds=1), True, None),
+                (news, 'Article at cutoff', cutoff, True, None),
+                (social, 'Recent verified repost', start - timedelta(days=2), False,
+                 {'kind': 'REPOST', 'activityTimeEvidence': 'verified-repost-time', 'activityAt': repost_at.isoformat()}),
+            ]
+            for source, title, published, verified, data in cases:
+                db.add(NewsItem(source_id=source.id, title=title, url=f'https://example.org/{uuid4()}',
+                    published_at=published, publication_time_verified=verified, linkedin_data=data,
+                    created_at=cutoff + timedelta(minutes=1)))
+            await db.commit()
+
+            assert await service.process_scheduled_digest(db, cycle, user, cutoff + timedelta(minutes=2)) == 2
+            report = (await db.scalars(select(ScheduledDigestReport))).one()
+            titles = await db.scalars(select(NewsItem.title).where(
+                NewsItem.id.in_([UUID(value) for value in report.content['item_ids']])))
+            assert set(titles) == {'Article at cutoff', 'Recent verified repost'}
+            assert len(report.content['archive_ids']) == 4
+            assert 'Arkivi i importuar (4)' in report.content['body']
+            assert 'Pas' not in report.content['subject']
+            send.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+def test_discovered_post_survives_report_claim_and_is_not_sent_again(database, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    _, sessions = database
+    send = AsyncMock()
+    monkeypatch.setattr(service, '_send_digest', send)
+
+    async def run():
+        async with sessions() as db:
+            user, cid = await prepare_report(db)
+            morning = await db.get(CollectionCycle, cid)
+            assert await service.process_scheduled_digest(db, morning, user, AM + timedelta(minutes=2)) == 2
+            source = await db.scalar(select(NewsSource).where(NewsSource.type == 'LINKEDIN'))
+            unknown = NewsItem(source_id=source.id, title='Post discovered in the evening',
+                url='https://www.linkedin.com/posts/new', created_at=PM + timedelta(minutes=8))
+            late = NewsItem(source_id=source.id, title='Verified post from the missed morning interval',
+                url='https://www.linkedin.com/posts/late', published_at=AM - timedelta(hours=1),
+                created_at=AM + timedelta(minutes=3), publication_time_verified=True)
+            evening = CollectionCycle(trial_date=PM.date(), phase='scheduled-pm', cutoff_at=PM,
+                deadline_at=PM + timedelta(minutes=30), state='finished', inventory_frozen=True)
+            db.add_all([unknown, late, evening])
+            await db.commit()
+
+            await service.process_scheduled_digest(db, evening, user, PM + timedelta(minutes=10))
+            report = await db.scalar(select(ScheduledDigestReport).where(ScheduledDigestReport.cycle_id == evening.id))
+            assert 'Zbuluar që nga raporti i fundit' in report.content['body']
+            assert 'Post discovered in the evening' in report.content['body']
+            assert 'Zbuluar me vonesë' in report.content['body']
+            assert 'Verified post from the missed morning interval' in report.content['body']
+            assert '1 aktivitet i ri' in report.content['subject']
+
+            following = AM + timedelta(days=1)
+            unknown.published_at = PM + timedelta(hours=1)
+            unknown.publication_time_verified = True
+            cycle = CollectionCycle(trial_date=following.date(), phase='scheduled-am', cutoff_at=following,
+                deadline_at=following + timedelta(minutes=30), state='finished', inventory_frozen=True)
+            db.add(cycle)
+            await db.commit()
+            assert await service.process_scheduled_digest(db, cycle, user, following + timedelta(minutes=2)) == 0
+            assert 'Post discovered in the evening' not in send.await_args.args[1]
+            assert 'Verified post from the missed morning interval' not in send.await_args.args[1]
+
+    asyncio.run(run())
+
+
+def test_confirmed_cross_platform_copies_share_a_delivery_key():
+    message = 'A detailed announcement from the same organization about a specific public event, its venue and registration: https://example.org/events/open-day'
+    facebook = NewsSource(name='Example - Facebook', type='FACEBOOK', url='https://www.facebook.com/example')
+    linkedin = NewsSource(name='Example - LinkedIn', type='LINKEDIN', url='https://www.linkedin.com/company/example')
+    first = NewsItem(url='https://www.facebook.com/example/posts/01', original_text=message)
+    copy = NewsItem(url='https://www.linkedin.com/posts/example-02', original_text=message)
+    assert service.digest_identities(first, facebook, {'example'}) & service.digest_identities(copy, linkedin, {'example'})
+    copy.original_text += ' Additional activities are scheduled for Friday.'
+    assert not service.digest_identities(first, facebook, {'example'}) & service.digest_identities(copy, linkedin, {'example'})
 
 
 @pytest.mark.parametrize('smtp_error', [False, True])
@@ -386,7 +494,7 @@ def test_morning_pdf_is_sent_once_even_without_news(database, monkeypatch, empty
 @pytest.mark.parametrize('phase,cutoff', [('scheduled-am', AM), ('scheduled-pm', PM)])
 @pytest.mark.parametrize('empty', [False, True])
 @pytest.mark.parametrize('smtp_error', [False, True])
-def test_unavailable_timetable_defers_admin_delivery_until_export_recovers(database, monkeypatch, phase, cutoff, empty, smtp_error):
+def test_unavailable_timetable_sends_news_without_attachments(database, monkeypatch, phase, cutoff, empty, smtp_error):
     from sqlalchemy import delete
     from app.intelligence.models import NewsDigestDelivery
     from unittest.mock import AsyncMock
@@ -407,40 +515,30 @@ def test_unavailable_timetable_defers_admin_delivery_until_export_recovers(datab
             else:
                 future = await db.scalar(select(NewsItem).where(NewsItem.title == 'Future news'))
                 future.published_at = cutoff + timedelta(hours=1)
+                eligible = await db.scalars(select(NewsItem).where(NewsItem.title.in_(['New social post', 'New RSS news'])))
+                for item in eligible:
+                    item.published_at = cutoff - timedelta(minutes=10)
             await db.commit()
         now = cutoff + timedelta(minutes=2)
         for minute in (2, 3):
             async with sessions() as db:
                 await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user,
                     cutoff + timedelta(minutes=minute))
-        # Keep the installed administrator behavior: a failed required export
-        # leaves the report unclaimed and sends neither News nor delivery receipts.
-        send.assert_not_awaited()
-        assert export.await_count == 2
-        async with sessions() as db:
-            assert list(await db.scalars(select(ScheduledDigestReport))) == []
-            assert list(await db.scalars(select(NewsDigestDelivery))) == []
-            digest = await db.get(NewsDigestSettings, user)
-            assert digest.last_slot_at == service.previous_slot(AM)
-            assert digest.last_sent_at is None
-            assert 'waiting for PDF and Excel' in digest.last_error
-            assert 'private export failure details' not in digest.last_error
-        from app.mail import EmailAttachment
-        attachments = [EmailAttachment('GA.pdf', b'%PDF-test')]
-        export.side_effect = None
-        export.return_value = attachments
-        async with sessions() as db:
-            await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user,
-                cutoff + timedelta(minutes=4))
-            await service.process_scheduled_digest(db, await db.get(CollectionCycle, cid), user,
-                cutoff + timedelta(minutes=5))
         assert send.await_count == 1
-        assert send.await_args.kwargs['attachments'] == attachments
+        export.assert_awaited_once_with(phase, cutoff)
+        assert 'attachments' not in send.await_args.kwargs
         async with sessions() as db:
             report = (await db.scalars(select(ScheduledDigestReport))).one()
             assert report.state == ('uncertain' if smtp_error else 'sent')
             assert len(report.content['item_ids']) == (0 if empty else 2)
-            assert len(list(await db.scalars(select(NewsDigestDelivery)))) == (0 if empty or smtp_error else 2)
+            assert 'attachments' not in report.content
+            warning = report.content['attachment_warning']
+            assert warning in send.await_args.args[1] and warning in send.await_args.args[2]
+            assert 'private export failure details' not in warning
+            assert len(list(await db.scalars(select(NewsDigestDelivery)))) == (0 if empty or smtp_error else 4)
+            digest = await db.get(NewsDigestSettings, user)
+            assert digest.last_slot_at == (service.previous_slot(AM) if smtp_error else cutoff)
+            assert digest.last_sent_at == (None if smtp_error else now)
     asyncio.run(run())
 
 

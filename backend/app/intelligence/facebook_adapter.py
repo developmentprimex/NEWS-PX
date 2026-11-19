@@ -71,6 +71,8 @@ def parse_posts(records,source):
             stamp=datetime.fromisoformat(raw.replace('Z','+00:00')) if isinstance(raw,str) else None
             if stamp and not stamp.tzinfo:stamp=stamp.replace(tzinfo=timezone.utc)
         except ValueError:stamp=None
+        if shared or '/events/' in url:
+            stamp = None
         content=row.get('content')
         content=content[:20000] if isinstance(content,str) else None
         title=(content[:140].strip() if content else '') or 'Facebook post - '+source.name

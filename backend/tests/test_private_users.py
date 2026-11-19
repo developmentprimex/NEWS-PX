@@ -16,7 +16,7 @@ from app.config import settings
 from app.db import get_db, AppMetadata
 from app.intelligence import router as feeds, digest_router, social_schedule
 from app.intelligence.models import NewsSource, NewsItem, NewsAnalysis, NewsDigestSettings, NewsSourceEmailSubscription, NewsUserState, NewsDigestDelivery
-from app.intelligence.collection_cycles import CollectionCycle
+from app.intelligence.collection_cycles import CollectionCycle, ScheduledDigestReport
 from test_brightdata_postgres_integration import database, private_postgres
 
 
@@ -55,6 +55,35 @@ async def add_member(api, email='member@example.com'):
     result = await api.post('auth/users', json={'email': email, 'password': 'member-password-123'})
     assert result.status_code == 201, result.text
     return result.json()
+
+
+def test_report_archive_is_visible_only_to_report_owner(database):
+    _, sessions = database
+
+    async def run():
+        async with client(sessions) as admin, client(sessions) as member:
+            await admin_login(admin)
+            user = await add_member(admin)
+            login = await member.post('auth/login', json={'email': user['email'], 'password': 'member-password-123'})
+            assert login.status_code == 200
+            async with sessions() as db:
+                source = NewsSource(name='Official archive', type='WEBSITE', url='https://example.org')
+                db.add(source)
+                await db.flush()
+                article = NewsItem(source_id=source.id, title='Archived article', url='https://example.org/article')
+                db.add(article)
+                await db.flush()
+                report = ScheduledDigestReport(cycle_id=uuid4(), user_id=auth.ADMIN_ID,
+                    recipient_fingerprint='test', state='sent', content={'archive_ids': [str(article.id)]})
+                db.add(report)
+                await db.commit()
+            url = f'intelligence/digest-archive/{report.id}'
+            response = await admin.get(url)
+            assert response.status_code == 200
+            assert response.json() == [{'title': article.title, 'url': article.url, 'source': source.name}]
+            assert (await member.get(url)).status_code == 404
+
+    asyncio.run(run())
 
 
 def test_member_login_and_admin_only_creation_and_disable(database):
@@ -299,8 +328,8 @@ def test_scheduled_reports_use_personal_recipient_and_ignore_foreign_subscriptio
             await admin_login(admin)
             created = await add_member(admin)
         uid = UUID(created['id'])
-        now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(minutes=1)
+        cutoff = datetime(2026, 11, 19, 6, tzinfo=timezone.utc)
+        now = cutoff + timedelta(minutes=1)
         async with sessions() as db:
             mine = NewsSource(owner_id=uid, name='Mine', type='RSS', url='https://example.org/mine')
             foreign = NewsSource(name='Private admin source', type='RSS', url='https://example.org/admin')

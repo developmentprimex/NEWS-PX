@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
 from app.config import settings
+from app.db import AppMetadata
 from app.intelligence.models import BrightDataAccount, BrightDataExecution
 
 logger = logging.getLogger(__name__)
@@ -150,10 +151,29 @@ def record_alerts(account, totals):
     account.alert_levels = sorted(levels)
 
 
+async def scheduled_slot_allows(db, cycle, totals, executions, limit):
+    from app.intelligence.collection_cycles import CollectionCycleSource
+
+    key = f'brightdata-slot-budget:{cycle.id}'
+    allocation = await db.get(AppMetadata, key)
+    if allocation is None:
+        day = cycle.trial_date
+        days_after_today = calendar.monthrange(day.year, day.month)[1] - day.day
+        slots_left = 2 * days_after_today + (2 if cycle.phase == 'scheduled-am' else 1)
+        remaining = max(0, totals['operationalBudget'] - totals['effectiveRecords'])
+        allocation = AppMetadata(key=key, value=str(remaining // slots_left))
+        db.add(allocation)
+    execution_ids = set(await db.scalars(select(CollectionCycleSource.execution_id).where(
+        CollectionCycleSource.cycle_id == cycle.id, CollectionCycleSource.execution_id.is_not(None))))
+    reserved = sum(execution.record_limit for execution in executions if execution.id in execution_ids)
+    return reserved + limit <= int(allocation.value)
+
+
 async def reserve_execution(db, source, now, start_date, end_date, *, reason="scheduled", limit=None, cycle_source_id=None, dataset_id=None):
     limit = limit or settings.NEWS_LINKEDIN_RECORD_LIMIT
     account = await locked_account(db)
     executions = await executions_for_budget(db)
+    cycle = None
     if cycle_source_id:
         from app.intelligence.collection_cycles import CollectionCycle, CollectionCycleSource
         row = await db.get(CollectionCycleSource, cycle_source_id)
@@ -191,6 +211,9 @@ async def reserve_execution(db, source, now, start_date, end_date, *, reason="sc
             denial = 'Facebook monthly reservation budget reached.'
         if dataset_id != dataset_for(source):
             raise ValueError('Facebook dataset does not match the approved source kind.')
+    if (not denial and not exception and cycle and cycle.phase in {'scheduled-am', 'scheduled-pm'}
+            and not await scheduled_slot_allows(db, cycle, totals, executions, limit)):
+        denial = 'Bright Data slot budget reached; source deferred.'
     if denial:
         source.last_error = denial
         await db.commit()

@@ -141,7 +141,11 @@ async def freeze_inventory(db, cycle):
                     # This owner-authorized experiment measures the last slot;
                     # it does not silently buy a historical backfill.
                     point = bootstrap
-                if source.type in {'LINKEDIN', 'FACEBOOK'} and not point:
+                if source.type in {'LINKEDIN', 'FACEBOOK'} and cycle.phase in {'scheduled-am', 'scheduled-pm'}:
+                    # A regular slot does not buy another request for older coverage gaps.
+                    if point is not None and point < bootstrap:
+                        point = None
+                elif source.type in {'LINKEDIN', 'FACEBOOK'} and not point:
                     # Preserve unresolved intervals across a daily/twice-daily
                     # schedule switch when no verified checkpoint exists yet.
                     unresolved = await db.scalar(select(func.min(CollectionCycleSource.window_start))

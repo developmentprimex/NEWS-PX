@@ -123,9 +123,10 @@ def digest_content(entries: list[dict], slot: datetime, source_names: list[str] 
             summary_text = getattr(analysis, "summary", None) or item.original_text or item.title
             summary_text = " ".join(summary_text.split())[:700]
             details = [label]
-            if item.published_at:
-                details.append(f"Publikuar: {_stamp(item.published_at)}")
-                if _utc(item.published_at) <= _utc(start):
+            activity_at = entry.get("activity_at") or item.published_at
+            if activity_at:
+                details.append(f"{'Ripostuar' if kind == 'REPOST' and entry.get('activity_at') else 'Publikuar'}: {_stamp(activity_at)}")
+                if _utc(activity_at) <= _utc(start):
                     details.append("Marrë me vonesë nga burimi")
             else:
                 details.append("Ora e publikimit nuk është dhënë nga burimi")
@@ -171,6 +172,50 @@ def digest_content(entries: list[dict], slot: datetime, source_names: list[str] 
             '<p style="font-size:11px;line-height:1.6;color:#687b6c;margin-top:24px">Aktivitetet raportohen vetëm një herë. Aktivitetet e marra me vonesë përfshihen në raportin pasues dhe shënohen veçmas. Numrat e reagimeve tregojnë gjendjen në kontrollin e fundit.</p>'
             '</td></tr></table></td></tr></table></body></html>')
     return subject, "\n".join(text_lines), html
+
+
+def digest_supplement(individual, archive, archive_url, coverage):
+    """Render discovery and coverage information outside the fixed publication interval."""
+    text_lines = []
+    blocks = []
+    headings = {
+        "late": "Zbuluar me vonesë",
+        "unverified": "Zbuluar që nga raporti i fundit",
+    }
+    for section, heading in headings.items():
+        entries = [entry for entry in individual if entry["section"] == section]
+        if not entries:
+            continue
+        text_lines.append(f"{heading} ({len(entries)})")
+        cards = []
+        for entry in entries:
+            item, source = entry["item"], entry["source"]
+            details = f"Zbuluar në {_stamp(item.created_at)}"
+            if entry["stamp"]:
+                details += f" · Publikuar më {_stamp(entry['stamp'])}"
+            else:
+                if item.published_at and activity_kind(item, source) != "REPOST":
+                    details += f" · Data e publikimit {_utc(item.published_at).astimezone(DIGEST_ZONE):%d.%m.%Y}"
+                details += " · Ora e publikimit e paverifikuar"
+            url = _safe_url(item.url)
+            text_lines.extend([f"{source.name} · {item.title}", details, url or "", ""])
+            title = escape(item.title)
+            if url:
+                title = f'<a href="{escape(url, quote=True)}">{title}</a>'
+            cards.append(f"<li><b>{escape(source.name)}</b> · {title}<br>{escape(details)}</li>")
+        blocks.append(f"<h2>{escape(heading)} ({len(entries)})</h2><ul>{''.join(cards)}</ul>")
+    if archive:
+        counts = {}
+        for entry in archive:
+            name = entry["source"].name
+            counts[name] = counts.get(name, 0) + 1
+        summary = f"Arkivi i importuar ({len(archive)}) · " + ", ".join(
+            f"{name} ({count})" for name, count in counts.items())
+        text_lines.extend([summary, archive_url, ""])
+        blocks.append(f'<p>{escape(summary)} · <a href="{escape(archive_url, quote=True)}">Hap listën në News</a></p>')
+    text_lines.append(coverage)
+    blocks.append(f"<p>{escape(coverage)}</p>")
+    return "\n".join(text_lines), '<div style="max-width:652px;margin:auto;padding:0 24px 20px">' + "".join(blocks) + "</div>"
 
 
 async def _send_digest(subject: str, body: str, html: str, *, credentials: tuple[str, str] | None = None,

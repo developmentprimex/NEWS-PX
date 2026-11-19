@@ -2,21 +2,43 @@
 
 import logging
 from datetime import datetime, timezone
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import ADMIN_ID, User, get_current_user, user_recipient
 from app.config import settings
 from app.db import get_db
+from app.intelligence.collection_cycles import ScheduledDigestReport
+from app.intelligence.content_quality import excluded_item_query
 from app.intelligence.digest_service import ensure_digest_settings, send_digest_test
 from app.intelligence.cycle_service import trial_active, trial_configuration
 from app.intelligence.cycle_digest import recipient_fingerprint
 from app.intelligence.schemas import DigestSettingsInput
+from app.intelligence.models import NewsItem, NewsSource
 from app.intelligence.social_schedule import SCHEDULE_TIMES
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+@router.get("/digest-archive/{report_id}")
+async def get_digest_archive(report_id: UUID, response: Response, db: AsyncSession = Depends(get_db),
+                             user: User = Depends(get_current_user)) -> list[dict]:
+    report = await db.get(ScheduledDigestReport, report_id)
+    if not report or report.user_id != user.id or report.state != 'sent':
+        raise HTTPException(status_code=404, detail="Report archive not found.")
+    response.headers['Cache-Control'] = 'private, no-store'
+    ids = [UUID(value) for value in report.content.get('archive_ids', [])]
+    if not ids:
+        return []
+    rows = await db.execute(select(NewsItem.title, NewsItem.url, NewsSource.name)
+        .join(NewsSource, NewsSource.id == NewsItem.source_id)
+        .where(NewsItem.id.in_(ids), NewsSource.owner_id == user.id, ~excluded_item_query(NewsItem.id))
+        .order_by(NewsSource.name, NewsItem.published_at.desc().nulls_last(), NewsItem.id))
+    return [{"title": title, "url": url, "source": name} for title, url, name in rows]
 
 
 async def _report_credentials(db: AsyncSession, user_id) -> tuple[str, str] | None:

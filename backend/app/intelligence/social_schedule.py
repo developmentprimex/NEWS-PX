@@ -1,6 +1,8 @@
 """Recurring 07:00/21:00 collection with durable slots and combined email reports."""
 import hashlib
 import logging
+import re
+from collections import Counter
 from datetime import datetime, time, timedelta, timezone
 
 from sqlalchemy import and_, func, or_, select, text
@@ -8,7 +10,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from app.config import settings
 from app.auth import ADMIN_ID, account_recipient
-from app.intelligence.content_quality import excluded_item_query
+from app.intelligence.content_quality import canonical_article_url, excluded_item_query
 from app.intelligence.collection_cycles import (
     CollectionCycle, CollectionCycleSource, ScheduledDigestReport, confirmed_activity_time,
 )
@@ -16,7 +18,9 @@ from app.intelligence.models import (
     NewsAnalysis, NewsDigestDelivery, NewsDigestSettings, NewsItem,
     NewsSource, NewsSourceEmailSubscription,
 )
-from app.intelligence.digest_service import DIGEST_ZONE, activity_delivery_key, activity_kind, digest_content, _send_digest
+from app.intelligence.digest_service import (
+    DIGEST_ZONE, activity_delivery_key, activity_kind, digest_content, digest_supplement, _send_digest,
+)
 from app.intelligence.ga_timetable import morning_enabled, morning_attachments, attachment_metadata
 
 logger = logging.getLogger(__name__)
@@ -24,6 +28,8 @@ SCHEDULE_TIMES = ['07:00', '21:00']
 SCHEDULE_PHASES = {'scheduled-am': 7, 'scheduled-pm': 21}
 COLLECTION_PHASES = [*SCHEDULE_PHASES, 'scheduled-day']
 START_GRACE = timedelta(minutes=30)
+LATE_REPORT_LIMIT = timedelta(hours=48)
+ARCHIVE_BATCH_SIZE = 20
 
 
 def social_fetch_slot(cycle):
@@ -153,38 +159,88 @@ async def run_social_collection(now=None, *, clock=None):
             await lock.execute(text('SELECT pg_advisory_unlock(:key)'), {'key': key})
 
 
-async def scheduled_entries(db, user_id, start, cutoff, now, *, strict_interval=False):
-    """Include late inserts from the completed social job, plus periodic website/RSS updates."""
-    activity = func.coalesce(NewsItem.published_at, NewsItem.created_at)
+def digest_alias(source):
+    return re.sub(r'\s*[-—–]?\s*(facebook|linkedin)\s*$', '', source.name.casefold()).strip()
+
+
+def digest_identities(item, source, paired_aliases):
+    if activity_kind(item, source) == 'REPOST':
+        return {activity_delivery_key(item)}
+    canonical = canonical_article_url(item.url)
+    identities = {hashlib.sha256(f'news-url:{canonical}'.encode()).hexdigest()}
+    if source.type in {'FACEBOOK', 'LINKEDIN'} and digest_alias(source) in paired_aliases:
+        message = ' '.join((item.original_text or '').split())
+        if len(message) >= 120 and re.search(r'https?://\S+', message):
+            identities.add(hashlib.sha256(f'social-copy:{digest_alias(source)}:{message}'.encode()).hexdigest())
+    return identities
+
+
+def report_section(stamp, discovered_at, source_first_seen, start, cutoff, discovery_floor, batch_size):
+    if stamp and stamp > cutoff:
+        return None
+    if stamp and start < stamp <= cutoff:
+        return 'interval'
+    if not discovery_floor or discovered_at <= discovery_floor:
+        return None
+    if (source_first_seen == discovered_at or batch_size >= ARCHIVE_BATCH_SIZE
+            or (stamp and stamp < cutoff - LATE_REPORT_LIMIT)):
+        return 'archive'
+    return 'late' if stamp else 'unverified'
+
+
+async def scheduled_entries(db, user_id, start, cutoff, now, *, discovery_floor=None):
+    """Find in-slot publications and still-unreported items discovered since rollout."""
+    first_seen = (select(func.min(NewsItem.created_at))
+        .where(NewsItem.source_id == NewsSource.id).correlate(NewsSource).scalar_subquery())
+    delivered = select(NewsDigestDelivery.user_id).where(
+        NewsDigestDelivery.user_id == user_id,
+        NewsDigestDelivery.url_hash == func.encode(
+            func.sha256(func.convert_to(func.concat('activity:', NewsItem.id), 'UTF8')), 'hex')).exists()
     rows = (await db.execute(select(NewsItem, NewsAnalysis, NewsSource)
+        .add_columns(first_seen.label('source_first_seen'))
         .outerjoin(NewsAnalysis, NewsAnalysis.news_item_id == NewsItem.id)
         .join(NewsSource, NewsSource.id == NewsItem.source_id)
         .join(NewsSourceEmailSubscription, NewsSourceEmailSubscription.source_id == NewsSource.id)
         .where(NewsSource.owner_id == user_id, NewsSourceEmailSubscription.user_id == user_id, NewsSource.status == 'ACTIVE',
             ~excluded_item_query(NewsItem.id),
+            ~delivered,
             NewsItem.created_at >= NewsSourceEmailSubscription.enabled_at,
-            NewsItem.created_at <= now, activity <= cutoff,
-            or_(activity > start, and_(NewsItem.created_at > start,
-                activity >= NewsSourceEmailSubscription.enabled_at)))
-        .order_by(NewsSource.name, activity.desc(), NewsItem.id))).all()
-    entries = {}
-    for item, analysis, source in rows:
-        if strict_interval:
-            stamp = confirmed_activity_time(item)
-            if stamp is None or not start < stamp <= cutoff:
-                continue
-        if source.type in {'LINKEDIN', 'FACEBOOK'}:
-            stamp = confirmed_activity_time(item)
-            if stamp is None or stamp > cutoff:
-                continue
-        entries[activity_delivery_key(item)] = {'item': item, 'analysis': analysis, 'source': source}
-    legacy = {key: hashlib.sha256(entry['item'].url.encode()).hexdigest() for key, entry in entries.items()}
+            NewsItem.created_at <= now,
+            or_(and_(NewsItem.publication_time_verified.is_(True),
+                    NewsItem.published_at > start, NewsItem.published_at <= cutoff),
+                NewsItem.created_at > (discovery_floor or start),
+                and_(NewsItem.linkedin_data['kind'].astext == 'REPOST',
+                    NewsItem.linkedin_data['activityTimeEvidence'].astext == 'verified-repost-time')))
+        .order_by(NewsSource.name, NewsItem.published_at.desc().nulls_last(), NewsItem.id))).all()
+    pairs = {}
+    if rows:
+        for source in await db.scalars(select(NewsSource).where(
+            NewsSource.owner_id == user_id, NewsSource.type.in_(['FACEBOOK', 'LINKEDIN']))):
+            pairs.setdefault(digest_alias(source), set()).add(source.type)
+    paired_aliases = {alias for alias, platforms in pairs.items() if len(platforms) == 2}
+    batches = Counter((source.id, item.created_at) for item, _, source, _ in rows)
+    entries = []
+    for item, analysis, source, source_first_seen in rows:
+        stamp = confirmed_activity_time(item)
+        section = report_section(stamp, item.created_at, source_first_seen, start, cutoff, discovery_floor,
+                                 batches[source.id, item.created_at])
+        if section is None:
+            continue
+        entries.append({'item': item, 'analysis': analysis, 'source': source, 'section': section,
+                        'stamp': stamp, 'identities': digest_identities(item, source, paired_aliases)})
+    keys = set().union(*(entry['identities'] for entry in entries))
+    keys.update(hashlib.sha256(entry['item'].url.encode()).hexdigest() for entry in entries)
     receipts = {r.url_hash: r.sent_at for r in await db.scalars(select(NewsDigestDelivery).where(
-        NewsDigestDelivery.user_id == user_id,
-        NewsDigestDelivery.url_hash.in_(set(entries) | set(legacy.values()))))} if entries else {}
-    return [entry for key, entry in entries.items() if key not in receipts
-        and not (legacy[key] in receipts and activity_kind(entry['item'], entry['source']) != 'REPOST'
-                 and receipts[legacy[key]] >= entry['item'].created_at)]
+        NewsDigestDelivery.user_id == user_id, NewsDigestDelivery.url_hash.in_(keys)))} if keys else {}
+    eligible = []
+    for entry in entries:
+        item, source = entry['item'], entry['source']
+        legacy = receipts.get(hashlib.sha256(item.url.encode()).hexdigest())
+        if entry['identities'].intersection(receipts) or (legacy and activity_kind(item, source) != 'REPOST'
+                                             and legacy >= item.created_at):
+            continue
+        eligible.append(entry)
+    return eligible
 
 
 def empty_report_status(rows, source_ids):
@@ -202,6 +258,9 @@ def empty_report_status(rows, source_ids):
               'blocked': 'të bllokuara', 'failed': 'të dështuara',
               'uncertain': 'me rezultat të pasigurt', 'pending': 'ende në pritje'}
     details = [f'{count} {labels[key]}' for key, count in counts.items() if count]
+    budget_deferred = sum('budget' in (row.coverage_warning or '').casefold() for row in rows)
+    if budget_deferred:
+        details.append(f'{budget_deferred} të shtyra për shkak të buxhetit të Bright Data')
     if missing:
         details.append(f'{missing} pa rezultat kontrolli për këtë cikël')
     status = 'Gjendja e burimeve: ' + '; '.join(details) + '.'
@@ -237,14 +296,16 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         return 0
     if digest.last_slot_at >= cycle.cutoff_at:
         return 0
-    from app.intelligence.collection_exception import applies
-    strict_interval = applies(cycle, cycle.cutoff_at)
-    start = previous_slot(cycle.cutoff_at) if strict_interval else digest.last_slot_at
-    entries = await scheduled_entries(db, user_id, start, cycle.cutoff_at, now,
-        strict_interval=strict_interval)
-    if settings.NEWS_SOCIAL_DAILY_FETCH:
-        # Late, verified updates remain deliverable; insertion time never certifies publication.
-        entries = [e for e in entries if confirmed_activity_time(e['item']) is not None]
+    start = previous_slot(cycle.cutoff_at)
+    previous_floor = await db.scalar(select(ScheduledDigestReport.content['discovery_floor'].astext).where(
+        ScheduledDigestReport.user_id == user_id, ScheduledDigestReport.recipient_fingerprint == fingerprint,
+        ScheduledDigestReport.state == 'sent', ScheduledDigestReport.content.has_key('discovery_floor'))
+        .order_by(ScheduledDigestReport.sent_at.desc()).limit(1))
+    previous_prepared = await db.scalar(select(ScheduledDigestReport.claimed_at).where(
+        ScheduledDigestReport.user_id == user_id, ScheduledDigestReport.recipient_fingerprint == fingerprint,
+        ScheduledDigestReport.state == 'sent').order_by(ScheduledDigestReport.sent_at.desc()).limit(1))
+    discovery_floor = datetime.fromisoformat(previous_floor) if previous_floor else previous_prepared or digest.last_slot_at
+    entries = await scheduled_entries(db, user_id, start, cycle.cutoff_at, now, discovery_floor=discovery_floor)
     # Honor source edits, pauses and unsubscribe that occurred during selection.
     source_ids = list(await db.scalars(select(NewsSource.id)
         .join(NewsSourceEmailSubscription, NewsSourceEmailSubscription.source_id == NewsSource.id)
@@ -262,7 +323,17 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         and sources[e['source'].id].status == 'ACTIVE'
         and source_identity(sources[e['source'].id]) == identities[e['source'].id]
         and e['item'].created_at >= subscriptions[e['source'].id].enabled_at]
+    priority = {'interval': 0, 'late': 1, 'unverified': 2, 'archive': 3}
+    selected = []
+    seen = set()
+    for entry in sorted(entries, key=lambda entry: priority[entry['section']]):
+        if not entry['identities'].intersection(seen):
+            selected.append(entry)
+        seen.update(entry['identities'])
+    individual = [entry for entry in selected if entry['section'] != 'archive']
+    archive = [entry for entry in selected if entry['section'] == 'archive']
     attachments = []
+    attachment_warning = None
     if user_id == ADMIN_ID and morning_enabled(cycle.phase):
         if not settings.EMAIL_USER or not settings.EMAIL_PASSWORD:
             await db.rollback()
@@ -270,12 +341,9 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         try:
             attachments = await morning_attachments(cycle.phase, cycle.cutoff_at)
         except Exception:
-            # No SMTP claim or delivery receipts until the required PDF exists.
-            # A later scheduler tick may retry the read-only export safely.
-            digest.last_error = 'GA Time Table attachments unavailable; scheduled report waiting for PDF and Excel.'
-            await db.commit()
-            logger.warning('Scheduled report waiting for GA timetable PDF and Excel')
-            return 0
+            attachment_warning = ('GA Time Table nuk është i disponueshëm. '
+                                  'Raporti News dërgohet pa bashkëngjitjet PDF dhe Excel.')
+            logger.warning('GA timetable export unavailable; sending scheduled News report without attachments')
     report = ScheduledDigestReport(cycle_id=cycle.id, user_id=user_id,
         recipient_fingerprint=fingerprint, state='empty', content={'item_ids': []})
     db.add(report)
@@ -292,20 +360,39 @@ async def process_scheduled_digest(db, cycle, user_id, now):
             or await account_recipient(db, user_id) != recipient):
         await db.rollback()
         return 0
-    empty_status = None
-    if not entries:
-        rows = list(await db.scalars(select(CollectionCycleSource).where(
-            CollectionCycleSource.cycle_id == cycle.id, CollectionCycleSource.source_id.in_(active_ids))))
-        rows = [row for row in rows if row.type == sources[row.source_id].type
-                and row.canonical_url == source_identity(sources[row.source_id])]
-        empty_status = empty_report_status(rows, active_ids)
-    subject, body, html = digest_content(entries, cycle.cutoff_at, interval_start=start, empty_status=empty_status)
-    report.content = {'item_ids': [str(e['item'].id) for e in entries], 'subject': subject, 'body': body, 'html': html}
+    rows = list(await db.scalars(select(CollectionCycleSource).where(
+        CollectionCycleSource.cycle_id == cycle.id, CollectionCycleSource.source_id.in_(active_ids))))
+    rows = [row for row in rows if row.type == sources[row.source_id].type
+            and row.canonical_url == source_identity(sources[row.source_id])]
+    coverage = empty_report_status(rows, active_ids)
+    for entry in individual:
+        if entry['section'] == 'interval':
+            entry['activity_at'] = entry['stamp']
+    interval = [entry for entry in individual if entry['section'] == 'interval']
+    await db.flush()
+    subject, body, html = digest_content(interval, cycle.cutoff_at, interval_start=start)
+    extra_count = len(individual) - len(interval)
+    if extra_count:
+        summary, separator, slot_name = subject.rpartition(' · ')
+        subject = f'{summary} + {extra_count} të zbuluara{separator}{slot_name}'
+    archive_url = f"{settings.NEWS_PUBLIC_ORIGIN.rstrip('/')}/intelligence/report-archive/{report.id}"
+    extra_text, extra_html = digest_supplement(individual, archive, archive_url, coverage)
+    body += '\n\n' + extra_text
+    html = html.replace('</body>', extra_html + '</body>')
+    if attachment_warning:
+        body += '\n\n' + attachment_warning
+        html = html.replace('</body>', f'<p style="font:14px Arial,sans-serif;padding:16px">{attachment_warning}</p></body>')
+    report.content = {'item_ids': [str(e['item'].id) for e in individual],
+                      'archive_ids': [str(e['item'].id) for e in archive],
+                      'discovery_floor': discovery_floor.isoformat(), 'prepared_at': now.isoformat(),
+                      'subject': subject, 'body': body, 'html': html}
+    if attachment_warning:
+        report.content['attachment_warning'] = attachment_warning
     if attachments:
         note = f'Bashkangjitur: GA Time Table per daten {cycle.cutoff_at.astimezone(DIGEST_ZONE):%d.%m.%Y} (PDF + Excel).'
         body += '\n\n' + note
         html = html.replace('</body>', f'<p style="font:14px Arial,sans-serif;padding:16px">{note}</p></body>')
-        if not entries:
+        if not individual and not archive:
             subject = f'[News Intelligence] GA Time Table · {cycle.cutoff_at.astimezone(DIGEST_ZONE):%H:%M}'
         report.content.update(subject=subject, body=body, html=html,
                               attachments=[attachment_metadata(item) for item in attachments])
@@ -320,13 +407,14 @@ async def process_scheduled_digest(db, cycle, user_id, now):
         digest.last_error = report.error
         await db.commit()
         return 0
-    for entry in entries:
+    delivered_keys = seen | {activity_delivery_key(entry['item']) for entry in entries}
+    for key in sorted(delivered_keys):
         await db.execute(insert(NewsDigestDelivery).values(user_id=user_id,
-            url_hash=activity_delivery_key(entry['item']), sent_at=now).on_conflict_do_nothing())
+            url_hash=key, sent_at=now).on_conflict_do_nothing())
     report.state, report.sent_at = 'sent', now
     digest.last_slot_at, digest.last_sent_at, digest.last_error = cycle.cutoff_at, now, None
     await db.commit()
-    return len(entries)
+    return len(individual)
 
 
 async def run_social_reports(now=None):
