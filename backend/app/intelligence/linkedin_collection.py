@@ -119,12 +119,14 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
         await db.commit()
         return "paused"
     await db.commit()
-    if facebook and cycle_row and cycle.phase in {'scheduled-day', 'recovery-day', 'recovery-extra'}:
+    if facebook and cycle_row and (cycle.phase.startswith('scheduled-') or cycle.phase in {'recovery-day', 'recovery-extra'}):
         from app.intelligence.models import NewsItem
+        from sqlalchemy import or_
         known = list(await db.scalars(select(NewsItem.external_id).where(
             NewsItem.source_id == source.id, NewsItem.external_id.like('facebook:%'),
-            NewsItem.published_at >= cycle_row.window_start - timedelta(days=1))
-            .order_by(NewsItem.published_at.desc()).limit(5000)))
+            or_(NewsItem.published_at >= cycle_row.window_start - timedelta(days=1),
+                NewsItem.created_at >= cycle_row.window_start - timedelta(days=1)))
+            .order_by(NewsItem.created_at.desc()).limit(5000)))
     else:
         known = []
     adapter = adapter or (BrightDataFacebookAdapter(settings.BRIGHTDATA_API_TOKEN, dataset_for(source),
@@ -198,9 +200,15 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
                 if facebook:
                     uncertain_dates = any(confirmed_activity_time(post) is None for post in posts)
                 def in_window(post):
-                    stamp=confirmed_activity_time(post)
-                    if stamp is None:return True
-                    if cycle_row:return cycle_row.window_start < stamp <= cycle_row.window_end
+                    stamp = confirmed_activity_time(post)
+                    if stamp is None:
+                        return True
+                    if cycle_row:
+                        if cycle.phase in {'scheduled-am', 'scheduled-pm'} and not experiment_cycle:
+                            from app.intelligence.social_schedule import LATE_REPORT_LIMIT
+                            # Retain recent results the current reservation already paid for.
+                            return cycle_row.window_end - LATE_REPORT_LIMIT <= stamp <= now
+                        return cycle_row.window_start < stamp <= cycle_row.window_end
                     return execution.start_date <= stamp.date() <= execution.end_date
                 posts_in_window = [post for post in posts if in_window(post)]
                 execution.ignored_records += len(posts) - len(posts_in_window)
@@ -246,14 +254,15 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
             if len(records) > execution.record_limit:
                 account = await locked_account(db)
                 account.paused_reason = "Provider exceeded the reserved record limit. Verify billing before resuming."
+            completed_at = clock() if clock else datetime.now(timezone.utc)
             if not errors and not saturated and not invalid and not uncertain_dates and not execution.trigger_reason.startswith("backfill:"):
                 source.last_successful_fetch_at = execution.started_at
-                source.last_checked_at = datetime.now(timezone.utc)
+                source.last_checked_at = completed_at
                 source.last_new_posts = execution.newly_saved_posts
                 source.empty_fetch_streak = 0 if execution.newly_saved_posts else source.empty_fetch_streak + 1
             source.last_error = source.linkedin_paused_reason or execution.coverage_warning or safe_errors
             source.pending_snapshot_id = source.pending_execution_id = None
-            finish(execution, datetime.now(timezone.utc), "partial" if errors or saturated or invalid or uncertain_dates else "completed", safe_errors)
+            finish(execution, completed_at, "partial" if errors or saturated or invalid or uncertain_dates else "completed", safe_errors)
             if cycle_row:
                 known_times = all(confirmed_activity_time(post) is not None for post in posts)
                 cycle_row.coverage_confirmed = execution.state == 'completed' and known_times
@@ -326,13 +335,13 @@ async def collect_linkedin(db, source, now, store_post, *, reason="scheduled", b
                 error = f"{execution.api_errors}\n{error}"[-8000:]
             if not execution.snapshot_id:
                 source.linkedin_paused_reason = "Trigger failed or outcome uncertain. Reconcile before retrying."
-                finish(execution, datetime.now(timezone.utc), "uncertain", error)
+                finish(execution, clock() if clock else datetime.now(timezone.utc), "uncertain", error)
             else:
                 execution.api_errors = error
                 execution.state = "retry"
                 if execution.retry_count >= 3:
                     source.linkedin_paused_reason = "Snapshot retrieval failed three times; reconcile before retrying."
-                    finish(execution, datetime.now(timezone.utc), "uncertain", error)
+                    finish(execution, clock() if clock else datetime.now(timezone.utc), "uncertain", error)
         if getattr(exc, "pause_account", False):
             account = await locked_account(db)
             account.provider_active = False

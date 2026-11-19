@@ -47,7 +47,7 @@ async def _smtp_reachable(host: str, port: int) -> bool:
     return await asyncio.to_thread(probe)
 
 
-async def send_news_email(item: NewsItem, source: NewsSource, analysis: NewsAnalysis) -> None:
+async def send_news_email(item: NewsItem, source: NewsSource, analysis: NewsAnalysis, *, recipient: str | None = None) -> None:
     subject, body = news_email_content(item, source, analysis)
     gmail = GmailService()
     if gmail.port != 465 and not await _smtp_reachable(gmail.host, gmail.port):
@@ -56,4 +56,4 @@ async def send_news_email(item: NewsItem, source: NewsSource, analysis: NewsAnal
         if not await _smtp_reachable(gmail.host, 465):
             raise ConnectionError("Gmail SMTP submission ports are unreachable")
         gmail.port = 465
-    await gmail.send_verified(subject, [INTELLIGENCE_RECIPIENT], body)
+    await gmail.send_verified(subject, [recipient or INTELLIGENCE_RECIPIENT], body)

@@ -9,7 +9,7 @@ import pytest
 from fastapi import FastAPI
 from sqlalchemy import select
 
-from app.auth import get_current_user, require_admin
+from app.auth import ADMIN_ID, get_current_user, require_admin
 from app.db import get_db
 from app.intelligence import collection
 from app.intelligence.models import NewsSource
@@ -44,7 +44,7 @@ def api(sessions):
     async def db_dependency():
         async with sessions() as db:
             yield db
-    user = SimpleNamespace(id=uuid4(), role='ADMIN')
+    user = SimpleNamespace(id=ADMIN_ID, role='ADMIN')
     app.dependency_overrides.update({get_db: db_dependency, get_current_user: lambda: user, require_admin: lambda: user})
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://offline')
 
@@ -213,16 +213,13 @@ def test_completed_empty_source_rejects_identity_change_but_allows_deletion(data
 
 
 def test_feed_users_can_discover_monitoring_sources_without_admin_configuration(database):
-    from fastapi import HTTPException
     _, sessions = database
     async def run():
         async with sessions() as db:
             db.add(NewsSource(name='Visible', type='LINKEDIN', url='https://linkedin.com/in/visible/', ai_instructions='private editor instructions'))
             await db.commit()
         async with api(sessions) as client:
-            def deny_admin(): raise HTTPException(status_code=403)
-            client._transport.app.dependency_overrides[require_admin] = deny_admin
-            assert (await client.get('/intelligence/sources')).status_code == 403
+            assert (await client.get('/intelligence/sources')).status_code == 200
             response = await client.get('/intelligence/linkedin-sources')
             assert response.status_code == 200
             assert response.json()[0]['name'] == 'Visible'

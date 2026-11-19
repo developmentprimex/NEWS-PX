@@ -111,3 +111,36 @@ def test_billing_evidence_validation():
         parse_evidence({**payload, "balance": "NaN"}, NOW)
     with pytest.raises(ValueError):
         parse_evidence({**payload, "billable_records": True}, NOW)
+
+
+def test_scheduled_slots_reserve_separate_shares_of_remaining_monthly_records():
+    import asyncio
+    from datetime import date
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from uuid import uuid4
+
+    from app.intelligence.credit_control import scheduled_slot_allows
+
+    async def run():
+        db = Mock()
+        db.get = AsyncMock(return_value=None)
+        db.scalars = AsyncMock(return_value=[])
+        day = date(2026, 11, 19)
+        totals = {'operationalBudget': 4000, 'effectiveRecords': 3228}
+        morning = SimpleNamespace(id=uuid4(), trial_date=day, phase='scheduled-am')
+        assert await scheduled_slot_allows(db, morning, totals, [], 32)
+        allocation = db.add.call_args.args[0]
+        assert allocation.value == '32'
+        execution = SimpleNamespace(id=uuid4(), record_limit=30)
+        db.get.return_value = allocation
+        db.scalars.return_value = [execution.id]
+        assert not await scheduled_slot_allows(db, morning, totals, [execution], 3)
+
+        db.get.return_value = None
+        db.scalars.return_value = []
+        evening = SimpleNamespace(id=uuid4(), trial_date=day, phase='scheduled-pm')
+        assert await scheduled_slot_allows(db, evening, {**totals, 'effectiveRecords': 3258}, [], 32)
+        assert db.add.call_args.args[0].value == '32'
+
+    asyncio.run(run())

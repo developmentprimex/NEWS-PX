@@ -1,3 +1,4 @@
+from app.auth import ADMIN_ID, User
 import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -61,7 +62,7 @@ class FakeSession:
 def test_digest_groups_sources_and_sends_only_new_items(monkeypatch):
     sent = []
 
-    async def fake_send(subject, body, html):
+    async def fake_send(subject, body, html, **kwargs):
         sent.append((subject, body, html))
 
     monkeypatch.setattr(digest_service, "_send_digest", fake_send)
@@ -72,7 +73,7 @@ def test_digest_groups_sources_and_sends_only_new_items(monkeypatch):
     duplicate = row("Business", "https://example.org/one", datetime(2026, 9, 30, 11, tzinfo=timezone.utc))
     second = row("Business", "https://example.org/two", datetime(2026, 9, 30, 12, tzinfo=timezone.utc))
     db = FakeSession(digest, [first, duplicate, second])
-    user_id = uuid4()
+    user_id = ADMIN_ID
 
     async def run():
         count = await digest_service.process_digest(db, user_id, datetime(2026, 9, 30, 15, 1, tzinfo=timezone.utc))
@@ -106,13 +107,13 @@ def test_digest_times_are_unique_and_sorted():
 def test_empty_report_advances_slot_without_sending(monkeypatch):
     sent = []
 
-    async def fake_send(subject, body, html):
+    async def fake_send(subject, body, html, **kwargs):
         sent.append((subject, body, html))
 
     monkeypatch.setattr(digest_service, "_send_digest", fake_send)
     digest = SimpleNamespace(times=["17:00", "21:00"], last_slot_at=datetime(2026, 9, 30, 10, 30, tzinfo=timezone.utc), last_sent_at=None, last_error=None)
     db = FakeSession(digest, [], sources=[source_fixture("KIESA & Lajme"), source_fixture("EU Digital")])
-    user_id = uuid4()
+    user_id = ADMIN_ID
 
     async def run():
         now = datetime(2026, 9, 30, 15, 1, tzinfo=timezone.utc)
@@ -136,14 +137,14 @@ def test_no_report_when_no_active_email_sources(monkeypatch):
     monkeypatch.setattr(digest_service, "_send_digest", unexpected_send)
     digest = SimpleNamespace(times=["17:00"], last_slot_at=datetime(2026, 9, 30, 10, 30, tzinfo=timezone.utc), last_sent_at=None, last_error=None)
     db = FakeSession(digest, [])
-    asyncio.run(digest_service.process_digest(db, uuid4(), datetime(2026, 9, 30, 15, 1, tzinfo=timezone.utc)))
+    asyncio.run(digest_service.process_digest(db, ADMIN_ID, datetime(2026, 9, 30, 15, 1, tzinfo=timezone.utc)))
     assert digest.last_sent_at is None
 
 
 def test_failed_report_with_updates_retries_without_advancing_slot(monkeypatch):
     calls = []
 
-    async def fake_send(*args):
+    async def fake_send(*args, **kwargs):
         calls.append(args)
         if len(calls) == 1:
             raise ConnectionError("SMTP unavailable")
@@ -152,7 +153,7 @@ def test_failed_report_with_updates_retries_without_advancing_slot(monkeypatch):
     previous = datetime(2026, 9, 30, 10, 30, tzinfo=timezone.utc)
     digest = SimpleNamespace(times=["17:00"], last_slot_at=previous, last_sent_at=None, last_error=None)
     db = FakeSession(digest, [row("KIESA", "https://example.org/new", datetime(2026, 9, 30, 12, tzinfo=timezone.utc))])
-    user_id = uuid4()
+    user_id = ADMIN_ID
     now = datetime(2026, 9, 30, 15, 1, tzinfo=timezone.utc)
 
     async def run():

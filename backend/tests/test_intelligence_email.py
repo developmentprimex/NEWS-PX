@@ -1,3 +1,4 @@
+from app.auth import ADMIN_ID, User
 import asyncio
 import smtplib
 import uuid
@@ -92,7 +93,7 @@ def test_repeated_click_does_not_send_the_same_item_again(monkeypatch):
     send = AsyncMock()
     monkeypatch.setattr("app.intelligence.router.send_news_email", send)
     db = SimpleNamespace(execute=AsyncMock(), commit=AsyncMock(), rollback=AsyncMock())
-    user = SimpleNamespace(id=uuid.uuid4())
+    user = User(id=ADMIN_ID, email="test@example.com")
     item_id = uuid.uuid4()
 
     async def click():
@@ -108,7 +109,7 @@ def test_repeated_click_does_not_send_the_same_item_again(monkeypatch):
     assert first.alreadySent is False
     assert second.alreadySent is True
     assert first.sentAt == second.sentAt
-    send.assert_awaited_once_with(item, source, analysis)
+    send.assert_awaited_once_with(item, source, analysis, recipient=INTELLIGENCE_RECIPIENT)
     db.commit.assert_awaited_once()
 
 
@@ -125,7 +126,7 @@ def test_smtp_auth_failure_is_reported_without_exposing_credentials(monkeypatch)
         commit=AsyncMock(), rollback=AsyncMock(),
     )
     with pytest.raises(HTTPException) as error:
-        asyncio.run(email_item(uuid.uuid4(), db, SimpleNamespace(id=uuid.uuid4())))
+        asyncio.run(email_item(uuid.uuid4(), db, User(id=ADMIN_ID, email="test@example.com")))
     assert error.value.status_code == 502
     assert "authentication failed" in error.value.detail
     assert "Secret server response" not in error.value.detail

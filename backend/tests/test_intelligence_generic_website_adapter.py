@@ -119,6 +119,27 @@ def test_persistent_http_errors_have_bounded_attempts(monkeypatch, status, attem
     assert len(requests) == attempts
 
 
+@pytest.mark.parametrize('recover', [True, False])
+def test_timeout_gets_one_bounded_retry_without_hiding_persistent_failure(monkeypatch, recover):
+    monkeypatch.setattr('app.intelligence.generic_website_adapter._check_public_dns', AsyncMock())
+    requests = []
+    def respond(request):
+        requests.append(request)
+        if len(requests) == 1 or not recover:
+            raise httpx.ReadTimeout('Public site took too long', request=request)
+        return httpx.Response(200, headers={'content-type': 'text/html'}, content=b'Recovered news page')
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            adapter = GenericWebsiteAdapter('https://example.org/news')
+            if recover:
+                assert (await adapter._get(client, adapter.source_url)).body == b'Recovered news page'
+            else:
+                with pytest.raises(httpx.ReadTimeout):
+                    await adapter._get(client, adapter.source_url)
+    asyncio.run(run())
+    assert len(requests) == 2
+
+
 def test_generic_failure_is_saved_without_leaving_stale_source_status(monkeypatch):
     from types import SimpleNamespace
     from uuid import uuid4
@@ -134,3 +155,16 @@ def test_generic_failure_is_saved_without_leaving_stale_source_status(monkeypatc
     assert source.last_error == "No public announcement links were found."
     assert source.last_started_at is not None
     assert source.last_checked_at is None
+
+
+def test_empty_timeout_still_records_a_visible_source_failure(monkeypatch):
+    from types import SimpleNamespace
+    from uuid import uuid4
+    from app.intelligence import collection
+    source = SimpleNamespace(id=uuid4(), type='WEBSITE', status='ACTIVE', url='https://example.org/',
+                             last_started_at=None, last_checked_at=None, last_error=None, fetch_interval_minutes=60)
+    db = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: source)),
+                         rollback=AsyncMock(), get=AsyncMock(return_value=source), commit=AsyncMock())
+    monkeypatch.setattr(GenericWebsiteAdapter, 'collect', AsyncMock(side_effect=httpx.ReadTimeout('')))
+    assert asyncio.run(collection.check_source(db, source.id)) == 'error'
+    assert 'timed out' in source.last_error and source.last_checked_at is None

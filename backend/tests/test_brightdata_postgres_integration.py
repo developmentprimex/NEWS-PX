@@ -1,3 +1,4 @@
+from app.auth import ADMIN_ID
 """Real private PostgreSQL transactions + mocked Bright Data HTTP responses."""
 import asyncio
 import os
@@ -485,7 +486,7 @@ def test_website_refreshes_work_when_fetching_paused(database, monkeypatch):
         async def db_dependency():
             async with sessions() as db:
                 yield db
-        user = SimpleNamespace(id=uuid4(), role="ADMIN")
+        user = SimpleNamespace(id=ADMIN_ID, role="ADMIN")
         app.dependency_overrides.update({get_db: db_dependency, get_current_user: lambda: user, require_admin: lambda: user})
         try:
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:

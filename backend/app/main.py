@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, text
 
-from app.auth import router as auth_router
+from app.auth import router as auth_router, migrate_users
 from app.config import settings
 from app.db import AppMetadata, Base, SessionLocal, engine
 from app.import_primeflow import import_export
@@ -15,6 +15,7 @@ from app.intelligence import models  # noqa: F401 - registers isolated tables
 from app.intelligence import collection_cycles  # noqa: F401 - additive trial tables
 from app.intelligence.collection import check_due_sources
 from app.intelligence.credit_migration import migrate_credit_controls
+from app.intelligence.analysis_migration import migrate_analysis_schema
 from app.intelligence.company_sources import ensure_company_sources, ensure_personal_activity_source
 from app.intelligence.digest_service import run_digest_cycle
 from app.intelligence.cycle_service import run_collection_trial_cycle, run_collection_trial_reports
@@ -27,11 +28,13 @@ from app.intelligence.digest_router import router as digest_router
 async def lifespan(_: FastAPI):
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        await migrate_users(connection)
         await collection_cycles.migrate_trial_schema(connection)
         await connection.execute(text("ALTER TABLE intelligence_items ADD COLUMN IF NOT EXISTS linkedin_data JSONB"))
         await connection.execute(text("ALTER TABLE intelligence_sources ADD COLUMN IF NOT EXISTS repost_groups JSONB NOT NULL DEFAULT '[]'::jsonb"))
         await connection.execute(text("ALTER TABLE intelligence_sources ADD COLUMN IF NOT EXISTS repost_guidance JSONB NOT NULL DEFAULT '{}'::jsonb"))
         await migrate_credit_controls(connection)
+        await migrate_analysis_schema(connection)
     snapshot = Path(__file__).resolve().parents[2] / "data" / "primeflow-export.json"
     if settings.NEWS_AUTO_IMPORT_SNAPSHOT and snapshot.is_file():
         async with SessionLocal() as session:

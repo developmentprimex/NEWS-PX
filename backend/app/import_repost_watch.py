@@ -8,6 +8,7 @@ from urllib.parse import unquote, urlparse
 from sqlalchemy import select
 
 from app.db import SessionLocal
+from app.auth import ADMIN_ID
 from app.intelligence.models import NewsSource
 from app.intelligence.schemas import NewsSourceCreate
 
@@ -21,7 +22,7 @@ async def import_sources(path: Path) -> None:
     created = updated = 0
     async with SessionLocal() as db:
         existing = {identity(source.url): source for source in (await db.scalars(
-            select(NewsSource).where(NewsSource.type == "LINKEDIN")
+            select(NewsSource).where(NewsSource.type == "LINKEDIN", NewsSource.owner_id == ADMIN_ID)
         )).all()}
         for row in rows:
             payload = NewsSourceCreate(

@@ -6,6 +6,7 @@ from urllib.parse import quote, unquote, urlsplit
 from sqlalchemy import select, text
 
 from app.intelligence.models import LinkedInSourceIdentity, NewsSource
+from app.auth import ADMIN_ID
 
 
 def canonical_linkedin_url(value: str) -> str:
@@ -45,8 +46,13 @@ async def lock_identity_change(db, old_url, new_url):
         await db.execute(text('SELECT pg_advisory_xact_lock(:key)'), {'key': key})
 
 
-async def matching_sources(db, identity):
-    rows = await db.scalars(select(NewsSource).where(NewsSource.type == 'LINKEDIN')
+def identity_key(identity, owner_id):
+    # Preserve the existing administrator's canonical registry keys.
+    return identity if owner_id == ADMIN_ID else f'{owner_id}:{identity}'
+
+
+async def matching_sources(db, identity, owner_id=ADMIN_ID):
+    rows = await db.scalars(select(NewsSource).where(NewsSource.type == 'LINKEDIN', NewsSource.owner_id == owner_id)
                             .order_by(NewsSource.created_at, NewsSource.id))
     return [row for row in rows if identity_or_none(row.url) == identity]
 
@@ -56,12 +62,13 @@ async def collection_owner(db, source):
     identity = identity_or_none(source.url)
     if not identity:
         return False
-    owner = await db.get(LinkedInSourceIdentity, identity)
+    key = identity_key(identity, source.owner_id)
+    owner = await db.get(LinkedInSourceIdentity, key)
     if owner is None:
-        candidates = await matching_sources(db, identity)
+        candidates = await matching_sources(db, identity, source.owner_id)
         if not candidates:
             return False
-        owner = LinkedInSourceIdentity(canonical_url=identity, source_id=candidates[0].id)
+        owner = LinkedInSourceIdentity(canonical_url=key, source_id=candidates[0].id)
         db.add(owner)
         await db.flush()
     return owner.source_id == source.id

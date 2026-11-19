@@ -14,19 +14,20 @@ from sqlalchemy import and_, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import User, get_current_user, require_admin
+from app.auth import ADMIN_ID, User, get_current_user, require_admin, user_recipient
 from app.config import settings
 from app.db import SessionLocal, get_db
 from app.intelligence.collection import check_source, linkedin_configured
 from app.intelligence.credit_control import budget_status
-from app.intelligence.email_service import INTELLIGENCE_RECIPIENT, send_news_email
+from app.intelligence.email_service import send_news_email
 from app.intelligence.focus import opportunity_focus_score
 from app.intelligence.insights import InsightGenerationError, cached_brief, deep_insight, strategic_brief
 from app.intelligence.linkedin_adapter import LinkedInCollectionError
-from app.intelligence.linkedin_identity import identity_or_none, lock_source_identity, lock_identity_change, matching_sources
+from app.intelligence.linkedin_identity import identity_or_none, lock_source_identity, lock_identity_change, matching_sources, identity_key
 from app.intelligence.models import LinkedInSourceIdentity
 from app.intelligence.models import BrightDataExecution, NewsAnalysis, NewsItem, NewsSource, NewsSourceEmailSubscription, NewsUserState
 from app.intelligence.priority import analyzed_news_priority
+from app.intelligence.content_quality import excluded_item_query
 from app.intelligence.rss_adapter import rss_url_is_supported
 from app.intelligence.schemas import DeepInsightOut, EmailShareOut, IntelligenceStatusOut, LinkedInMonitorOut, NewsFeedOut, NewsSourceCreate, NewsSourceEmailInput, NewsSourceOut, NewsSourceUpdate, SourceCheckOut, StrategicBriefOut
 from app.intelligence.website_adapter import source_kind
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 _check_all_lock = asyncio.Lock()
 _check_all_task: asyncio.Task[None] | None = None
 _check_all_status: dict[str, object] = {"state": "idle", "total": 0, "processed": 0, "failed": 0, "started": 0, "pending": 0}
+_member_checks: dict[uuid.UUID, dict] = {}
 
 
 async def _check_source_background(source_id: uuid.UUID) -> None:
@@ -48,25 +50,26 @@ async def _check_source_background(source_id: uuid.UUID) -> None:
         logger.exception("Manual source check failed for %s", source_id)
 
 
-async def _check_all_sources(source_ids: list[uuid.UUID]) -> None:
+async def _check_all_sources(source_ids: list[uuid.UUID], progress: dict | None = None) -> None:
+    progress = progress if progress is not None else _check_all_status
     try:
         for source_id in source_ids:
             try:
                 async with SessionLocal() as session:
                     result = await check_source(session, source_id, force=True)
                 if result == "error":
-                    _check_all_status["failed"] = int(_check_all_status["failed"]) + 1
+                    progress["failed"] = int(progress["failed"]) + 1
                 elif result == "started":
-                    _check_all_status["started"] = int(_check_all_status["started"]) + 1
+                    progress["started"] = int(progress["started"]) + 1
                 elif result == "pending":
-                    _check_all_status["pending"] = int(_check_all_status["pending"]) + 1
+                    progress["pending"] = int(progress["pending"]) + 1
             except Exception:
-                _check_all_status["failed"] = int(_check_all_status["failed"]) + 1
+                progress["failed"] = int(progress["failed"]) + 1
                 logger.exception("Manual source check failed for %s", source_id)
             finally:
-                _check_all_status["processed"] = int(_check_all_status["processed"]) + 1
+                progress["processed"] = int(progress["processed"]) + 1
     finally:
-        _check_all_status["state"] = "finished"
+        progress["state"] = "finished"
 
 
 def _source_out(source: NewsSource, email_enabled: bool = False) -> NewsSourceOut:
@@ -74,17 +77,21 @@ def _source_out(source: NewsSource, email_enabled: bool = False) -> NewsSourceOu
     output.collection_supported = source.type == "LINKEDIN" or (source.type in {"WEBSITE", "RSS"} and rss_url_is_supported(source.url))
     output.email_enabled = email_enabled
     output.collection_enabled = source.type == "LINKEDIN" and source.status == "ACTIVE" and settings.NEWS_ENABLE_COLLECTION and settings.NEWS_LINKEDIN_FETCH_ENABLED and not settings.NEWS_BRIGHTDATA_CANARY_LIVE_ENABLED and not source.linkedin_paused_reason
+    if source.type in {'WEBSITE','RSS'}:
+        output.collection_enabled = bool(output.collection_supported and source.status == 'ACTIVE' and settings.NEWS_ENABLE_COLLECTION)
+    if source.type in {'LINKEDIN','FACEBOOK'} and source.linkedin_paused_reason:
+        output.collection_note = source.linkedin_paused_reason
     if source.type == 'FACEBOOK':
         from app.intelligence.facebook_identity import identity_or_none as facebook_identity, setup_note, source_approved
         output.collection_supported = bool(facebook_identity(source.url))
         output.collection_enabled = bool(source.status == 'ACTIVE' and settings.NEWS_ENABLE_COLLECTION
             and settings.NEWS_FACEBOOK_FETCH_ENABLED and source_approved(source) and not source.linkedin_paused_reason)
-        output.collection_note = setup_note(source)
+        output.collection_note = source.linkedin_paused_reason or setup_note(source)
     return output
 
 
 @router.get("/status", response_model=IntelligenceStatusOut)
-async def intelligence_status(_: User = Depends(require_admin)) -> IntelligenceStatusOut:
+async def intelligence_status(_: User = Depends(get_current_user)) -> IntelligenceStatusOut:
     return IntelligenceStatusOut(linkedinConfigured=linkedin_configured())
 
 
@@ -116,6 +123,7 @@ async def list_items(
     source_ids: Annotated[list[uuid.UUID] | None, Query(max_length=20)] = None,
 ) -> NewsFeedOut:
     source_rows = (await db.execute(select(NewsSource.type, NewsSource.url).where(
+        NewsSource.owner_id == user.id,
         NewsSource.type.in_(["LINKEDIN", "WEBSITE", "RSS"]),
     ))).all()
     has_live_sources = any(kind == "LINKEDIN" or (kind in {"WEBSITE", "RSS"} and rss_url_is_supported(url)) for kind, url in source_rows)
@@ -123,6 +131,7 @@ async def list_items(
         select(NewsItem, NewsSource, NewsAnalysis, NewsUserState.read_at, NewsUserState.emailed_at, NewsUserState.saved_at)
         .join(NewsSource, NewsSource.id == NewsItem.source_id)
         .join(NewsAnalysis, NewsAnalysis.news_item_id == NewsItem.id)
+        .where(NewsSource.owner_id == user.id)
         .outerjoin(NewsUserState, and_(
             NewsUserState.news_item_id == NewsItem.id,
             NewsUserState.user_id == user.id,
@@ -136,6 +145,8 @@ async def list_items(
         query = query.where(NewsUserState.read_at.is_not(None))
     if saved_only:
         query = query.where(NewsUserState.saved_at.is_not(None))
+    else:
+        query = query.where(~excluded_item_query(NewsItem.id))
     if repost_group == "ALL":
         query = query.where(NewsSource.repost_groups != [])
     elif repost_group:
@@ -153,11 +164,12 @@ async def list_items(
                             NewsAnalysis.deadline.between(today, today + timedelta(days=30)))
         query = query.order_by(None).order_by(NewsAnalysis.deadline.asc(), NewsItem.published_at.desc())
     rows = (await db.execute(query)).all()
-    return NewsFeedOut(hasLiveSources=has_live_sources, emailConfigured=bool(settings.EMAIL_USER and settings.EMAIL_PASSWORD), emailRecipient=settings.NEWS_EMAIL_RECIPIENT, aiConfigured=bool(settings.OPENAI_API_KEY), items=[{
+    return NewsFeedOut(demoAllowed=user.id == ADMIN_ID, hasLiveSources=has_live_sources, emailConfigured=bool(settings.EMAIL_USER and settings.EMAIL_PASSWORD), emailRecipient=user_recipient(user), aiConfigured=bool(settings.OPENAI_API_KEY), items=[{
         "id": str(item.id), "sourceId": str(source.id), "sourceName": source.name,
         "sourceType": source.type, "externalId": item.external_id,
         "url": item.url, "title": item.title, "originalText": item.original_text,
         "publishedAt": (item.published_at or item.created_at).isoformat(),
+        "publicationTimeKnown": item.published_at is not None,
         "imageUrl": item.image_url, "contentHash": item.content_hash,
         "createdAt": item.created_at.isoformat(), "location": None,
         "linkedin": item.linkedin_data,
@@ -179,12 +191,14 @@ async def list_items(
     } for item, source, analysis, read_at, emailed_at, saved_at in rows])
 
 
-async def _brief_rows(db: AsyncSession) -> list[tuple[NewsItem, NewsSource, NewsAnalysis]]:
+async def _brief_rows(db: AsyncSession, user_id: uuid.UUID) -> list[tuple[NewsItem, NewsSource, NewsAnalysis]]:
     rows = (await db.execute(
         select(NewsItem, NewsSource, NewsAnalysis)
         .join(NewsSource, NewsSource.id == NewsItem.source_id)
         .join(NewsAnalysis, NewsAnalysis.news_item_id == NewsItem.id)
+        .where(~excluded_item_query(NewsItem.id))
         .order_by(NewsItem.published_at.desc().nullslast(), NewsItem.created_at.desc())
+        .where(NewsSource.owner_id == user_id)
         .limit(80)
     )).all()
     return [tuple(row) for row in rows]
@@ -195,7 +209,7 @@ async def get_strategic_brief(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ) -> StrategicBriefOut | None:
-    rows = await _brief_rows(db)
+    rows = await _brief_rows(db, _.id)
     return await cached_brief(db, rows) if rows else None
 
 
@@ -206,7 +220,7 @@ async def generate_strategic_brief(
 ) -> StrategicBriefOut:
     if not settings.OPENAI_API_KEY:
         raise HTTPException(status_code=503, detail="OpenAI analysis is not configured.")
-    rows = await _brief_rows(db)
+    rows = await _brief_rows(db, _.id)
     if not rows:
         raise HTTPException(status_code=404, detail="No updates are available for a briefing yet.")
     try:
@@ -220,7 +234,7 @@ async def generate_strategic_brief(
 async def analyze_item_deeply(
     item_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> DeepInsightOut:
     if not settings.OPENAI_API_KEY:
         raise HTTPException(status_code=503, detail="OpenAI analysis is not configured.")
@@ -228,7 +242,7 @@ async def analyze_item_deeply(
         select(NewsItem, NewsSource, NewsAnalysis)
         .join(NewsSource, NewsSource.id == NewsItem.source_id)
         .join(NewsAnalysis, NewsAnalysis.news_item_id == NewsItem.id)
-        .where(NewsItem.id == item_id)
+        .where(NewsItem.id == item_id, NewsSource.owner_id == user.id)
     )).one_or_none()
     if result is None:
         raise HTTPException(status_code=404, detail="Update not found")
@@ -249,7 +263,7 @@ async def email_item(
         select(NewsItem, NewsSource, NewsAnalysis)
         .join(NewsSource, NewsSource.id == NewsItem.source_id)
         .join(NewsAnalysis, NewsAnalysis.news_item_id == NewsItem.id)
-        .where(NewsItem.id == item_id)
+        .where(NewsItem.id == item_id, NewsSource.owner_id == user.id)
     )).one_or_none()
     if result is None:
         raise HTTPException(status_code=404, detail="Update not found")
@@ -264,9 +278,9 @@ async def email_item(
     if user_state.emailed_at:
         sent_at = user_state.emailed_at
         await db.rollback()
-        return EmailShareOut(recipient=INTELLIGENCE_RECIPIENT, sentAt=sent_at, alreadySent=True)
+        return EmailShareOut(recipient=user_recipient(user), sentAt=sent_at, alreadySent=True)
     try:
-        await send_news_email(item, source, analysis)
+        await send_news_email(item, source, analysis, recipient=user_recipient(user))
     except ValueError as exc:
         await db.rollback()
         logger.warning("Intelligence email configuration unavailable: %s", exc)
@@ -283,7 +297,14 @@ async def email_item(
         raise HTTPException(status_code=502, detail=detail) from exc
     user_state.emailed_at = datetime.now(timezone.utc)
     await db.commit()
-    return EmailShareOut(recipient=INTELLIGENCE_RECIPIENT, sentAt=user_state.emailed_at, alreadySent=False)
+    return EmailShareOut(recipient=user_recipient(user), sentAt=user_state.emailed_at, alreadySent=False)
+
+
+async def _owned_item(db: AsyncSession, item_id: uuid.UUID, user: User) -> None:
+    found = await db.scalar(select(NewsItem.id).join(NewsSource, NewsSource.id == NewsItem.source_id)
+                            .where(NewsItem.id == item_id, NewsSource.owner_id == user.id))
+    if found is None:
+        raise HTTPException(status_code=404, detail="Update not found")
 
 
 @router.put("/items/{item_id}/read", status_code=status.HTTP_204_NO_CONTENT)
@@ -292,8 +313,7 @@ async def mark_item_read(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Response:
-    if await db.get(NewsItem, item_id) is None:
-        raise HTTPException(status_code=404, detail="Update not found")
+    await _owned_item(db, item_id, user)
     statement = pg_insert(NewsUserState).values(
         user_id=user.id, news_item_id=item_id, read_at=func.now(),
     ).on_conflict_do_update(
@@ -311,6 +331,7 @@ async def mark_item_unread(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Response:
+    await _owned_item(db, item_id, user)
     await db.execute(update(NewsUserState).where(
         NewsUserState.user_id == user.id,
         NewsUserState.news_item_id == item_id,
@@ -325,8 +346,7 @@ async def save_item(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Response:
-    if await db.get(NewsItem, item_id) is None:
-        raise HTTPException(status_code=404, detail="Update not found")
+    await _owned_item(db, item_id, user)
     await db.execute(pg_insert(NewsUserState).values(
         user_id=user.id, news_item_id=item_id, saved_at=func.now(),
     ).on_conflict_do_update(
@@ -343,6 +363,7 @@ async def unsave_item(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Response:
+    await _owned_item(db, item_id, user)
     await db.execute(update(NewsUserState).where(
         NewsUserState.user_id == user.id,
         NewsUserState.news_item_id == item_id,
@@ -358,7 +379,7 @@ async def repost_watch_status(db: AsyncSession = Depends(get_db), user: User = D
         .join(NewsSource, NewsSource.id == NewsItem.source_id)
         .join(NewsAnalysis, NewsAnalysis.news_item_id == NewsItem.id)
         .outerjoin(NewsUserState, and_(NewsUserState.news_item_id == NewsItem.id, NewsUserState.user_id == user.id))
-        .where(NewsSource.repost_groups != [], NewsUserState.read_at.is_(None))
+        .where(NewsSource.owner_id == user.id, NewsSource.repost_groups != [], NewsUserState.read_at.is_(None))
     )
     rows = (await db.execute(unread)).all()
     return {"unread": len(rows), "CEO": sum("CEO" in groups for _, groups in rows),
@@ -366,8 +387,8 @@ async def repost_watch_status(db: AsyncSession = Depends(get_db), user: User = D
 
 
 @router.get("/sources", response_model=list[NewsSourceOut])
-async def list_sources(db: AsyncSession = Depends(get_db), user: User = Depends(require_admin)) -> list[NewsSourceOut]:
-    sources = (await db.execute(select(NewsSource).order_by(NewsSource.created_at.desc()))).scalars().all()
+async def list_sources(db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)) -> list[NewsSourceOut]:
+    sources = (await db.execute(select(NewsSource).where(NewsSource.owner_id == user.id).order_by(NewsSource.created_at.desc()))).scalars().all()
     subscribed = set((await db.scalars(select(NewsSourceEmailSubscription.source_id).where(
         NewsSourceEmailSubscription.user_id == user.id))).all())
     return [_source_out(source, source.id in subscribed) for source in sources]
@@ -376,27 +397,27 @@ async def list_sources(db: AsyncSession = Depends(get_db), user: User = Depends(
 @router.get("/linkedin-sources", response_model=list[LinkedInMonitorOut])
 async def linkedin_monitoring_sources(db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)) -> list[LinkedInMonitorOut]:
     # Feed readers can discover monitored accounts without receiving admin settings.
-    sources = await db.scalars(select(NewsSource).where(NewsSource.type == "LINKEDIN").order_by(NewsSource.created_at, NewsSource.id))
+    sources = await db.scalars(select(NewsSource).where(NewsSource.owner_id == _.id, NewsSource.type == "LINKEDIN").order_by(NewsSource.created_at, NewsSource.id))
     return [LinkedInMonitorOut(**_source_out(source).model_dump()) for source in sources]
 
 
 @router.get("/sources/check-all/status")
-async def check_all_sources_status(db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)) -> dict[str, object]:
+async def check_all_sources_status(db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)) -> dict[str, object]:
     from app.intelligence.cycle_service import cycle_status, trial_configuration, trial_active
     config = await trial_configuration(db)
-    if config:
+    if config and _.id == ADMIN_ID:
         current = await cycle_status(db)
         if current['cycle_id'] and (current['state'] == 'running' or trial_active(config, datetime.now(timezone.utc))):
             return current
-    return _check_all_status.copy()
+    return (_check_all_status if _.id == ADMIN_ID else _member_checks.get(_.id, {}).get("status", {"state": "idle", "total": 0, "processed": 0})).copy()
 
 
 @router.post("/sources/check-all")
-async def check_all_sources_now(db: AsyncSession = Depends(get_db), _: User = Depends(require_admin), repost_group: Literal["CEO", "COMPANY"] | None = None, source_id: uuid.UUID | None = None, source_ids: Annotated[list[uuid.UUID] | None, Query(max_length=20)] = None) -> dict[str, object]:
+async def check_all_sources_now(db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user), repost_group: Literal["CEO", "COMPANY"] | None = None, source_id: uuid.UUID | None = None, source_ids: Annotated[list[uuid.UUID] | None, Query(max_length=20)] = None) -> dict[str, object]:
     global _check_all_task, _check_all_status
     from app.intelligence.cycle_service import trial_configuration, trial_active, accept_manual_cycle, run_collection_trial_cycle
     now = datetime.now(timezone.utc)
-    if not settings.NEWS_SOCIAL_SCHEDULE_ENABLED and trial_active(await trial_configuration(db), now):
+    if _.id == ADMIN_ID and not settings.NEWS_SOCIAL_SCHEDULE_ENABLED and trial_active(await trial_configuration(db), now):
         try:
             accepted = await accept_manual_cycle(db, user_id=_.id, now=now)
         except ValueError as exc:
@@ -404,9 +425,10 @@ async def check_all_sources_now(db: AsyncSession = Depends(get_db), _: User = De
         asyncio.create_task(run_collection_trial_cycle())
         return accepted
     async with _check_all_lock:
-        if _check_all_task and not _check_all_task.done():
-            return _check_all_status.copy()
-        query = select(NewsSource).where(NewsSource.status == "ACTIVE", NewsSource.type != "LINKEDIN")
+        task = _check_all_task if _.id == ADMIN_ID else _member_checks.get(_.id, {}).get("task")
+        if task and not task.done():
+            return (_check_all_status if _.id == ADMIN_ID else _member_checks[_.id]["status"]).copy()
+        query = select(NewsSource).where(NewsSource.owner_id == _.id, NewsSource.status == "ACTIVE", NewsSource.type != "LINKEDIN")
         if repost_group:
             query = query.where(NewsSource.repost_groups.contains([repost_group]))
         if source_id is not None:
@@ -418,32 +440,36 @@ async def check_all_sources_now(db: AsyncSession = Depends(get_db), _: User = De
                       source.type in {"WEBSITE", "RSS"} and rss_url_is_supported(source.url)]
         if not source_ids:
             raise HTTPException(status_code=409, detail="LinkedIn checks run on the protected daily scheduler. Refresh the feed to see stored posts.")
-        _check_all_status = {"state": "running", "total": len(source_ids), "processed": 0, "failed": 0, "started": 0, "pending": 0}
-        _check_all_task = asyncio.create_task(_check_all_sources(source_ids))
-        return _check_all_status.copy()
+        progress = {"state": "running", "total": len(source_ids), "processed": 0, "failed": 0, "started": 0, "pending": 0}
+        task = asyncio.create_task(_check_all_sources(source_ids, progress))
+        if _.id == ADMIN_ID:
+            _check_all_task, _check_all_status = task, progress
+        else:
+            _member_checks[_.id] = {"task": task, "status": progress}
+        return progress.copy()
 
 
 @router.post("/sources", response_model=NewsSourceOut, status_code=status.HTTP_201_CREATED)
-async def create_source(payload: NewsSourceCreate, db: AsyncSession = Depends(get_db), user: User = Depends(require_admin)) -> NewsSourceOut:
+async def create_source(payload: NewsSourceCreate, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)) -> NewsSourceOut:
     if payload.type == 'FACEBOOK':
         from app.intelligence.facebook_identity import identity_or_none as facebook_identity, lock_identity_change as fb_lock, matching_sources as fb_matches
         identity=facebook_identity(payload.url)
         if identity:
             await fb_lock(db,'',payload.url)
-            if await fb_matches(db,identity):raise HTTPException(status_code=409,detail='This Facebook source already exists.')
+            if await fb_matches(db,identity, user.id):raise HTTPException(status_code=409,detail='This Facebook source already exists.')
     if payload.type in {"RSS", "WEBSITE"} and not rss_url_is_supported(payload.url):
         raise HTTPException(status_code=422, detail="Use a public HTTP or HTTPS URL without credentials or a custom port.")
     if payload.type == "LINKEDIN":
         identity = await lock_source_identity(db, payload.url)
-        if await matching_sources(db, identity):
+        if await matching_sources(db, identity, user.id):
             raise HTTPException(status_code=409, detail="This LinkedIn source already exists. Edit or resume the existing source.")
-    source = NewsSource(**payload.model_dump(exclude={"email_enabled"}))
+    source = NewsSource(owner_id=user.id, **payload.model_dump(exclude={"email_enabled"}))
     from app.intelligence.source_history import restore_collection_history
     await restore_collection_history(db, source)
     db.add(source)
     await db.flush()
     if payload.type == "LINKEDIN":
-        db.add(LinkedInSourceIdentity(canonical_url=identity, source_id=source.id))
+        db.add(LinkedInSourceIdentity(canonical_url=identity_key(identity, user.id), source_id=source.id))
     if payload.email_enabled:
         from app.intelligence.digest_service import ensure_digest_settings
         await ensure_digest_settings(db, user.id)
@@ -453,16 +479,16 @@ async def create_source(payload: NewsSourceCreate, db: AsyncSession = Depends(ge
     return _source_out(source, payload.email_enabled)
 
 
-async def _get_source(db: AsyncSession, source_id: uuid.UUID) -> NewsSource:
+async def _get_source(db: AsyncSession, source_id: uuid.UUID, user: User) -> NewsSource:
     source = await db.get(NewsSource, source_id)
-    if source is None:
+    if source is None or source.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Source not found")
     return source
 
 
 @router.post("/sources/{source_id}/check", response_model=SourceCheckOut)
-async def check_source_now(source_id: uuid.UUID, db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)) -> SourceCheckOut:
-    source = await _get_source(db, source_id)
+async def check_source_now(source_id: uuid.UUID, db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)) -> SourceCheckOut:
+    source = await _get_source(db, source_id, _)
     if source.type in {"WEBSITE", "RSS"}:
         if not rss_url_is_supported(source.url):
             raise HTTPException(status_code=422, detail="Use a public HTTP or HTTPS URL.")
@@ -476,15 +502,15 @@ async def check_source_now(source_id: uuid.UUID, db: AsyncSession = Depends(get_
 
 
 @router.put("/sources/{source_id}", response_model=NewsSourceOut)
-async def update_source(source_id: uuid.UUID, payload: NewsSourceUpdate, db: AsyncSession = Depends(get_db), user: User = Depends(require_admin)) -> NewsSourceOut:
+async def update_source(source_id: uuid.UUID, payload: NewsSourceUpdate, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)) -> NewsSourceOut:
     if payload.type in {"RSS", "WEBSITE"} and not rss_url_is_supported(payload.url):
         raise HTTPException(status_code=422, detail="Use a public HTTP or HTTPS URL without credentials or a custom port.")
-    initial = await _get_source(db, source_id)
+    initial = await _get_source(db, source_id, user)
     initial_identity = (initial.type, initial.url)
     from app.intelligence.facebook_identity import lock_identity_change as fb_lock, identity_or_none as facebook_identity, matching_sources as fb_matches
     await fb_lock(db,initial.url if initial.type=='FACEBOOK' else '',payload.url if payload.type=='FACEBOOK' else '')
     await lock_identity_change(db, initial.url if initial.type == "LINKEDIN" else "", payload.url if payload.type == "LINKEDIN" else "")
-    source = await db.scalar(select(NewsSource).where(NewsSource.id == source_id).with_for_update().execution_options(populate_existing=True))
+    source = await db.scalar(select(NewsSource).where(NewsSource.id == source_id, NewsSource.owner_id == user.id).with_for_update().execution_options(populate_existing=True))
     if source is None:
         raise HTTPException(status_code=404, detail="Source not found")
     if (source.type, source.url) != initial_identity:
@@ -498,15 +524,15 @@ async def update_source(source_id: uuid.UUID, payload: NewsSourceUpdate, db: Asy
             raise HTTPException(status_code=409, detail="A collected LinkedIn identity cannot be changed. Pause it and add a separate source to preserve history and daily limits.")
         from app.db import AppMetadata
         from app.intelligence.source_history import history_key
-        archived_key = history_key(payload)
+        archived_key = history_key(payload, owner_id=user.id)
         if archived_key and await db.get(AppMetadata, archived_key):
             raise HTTPException(status_code=409, detail="This address has previous collection history. Use Add source to restore its collection identity.")
     if payload.type=='FACEBOOK' and (identity:=facebook_identity(payload.url)):
-        if any(s.id!=source_id for s in await fb_matches(db,identity)):
+        if any(s.id!=source_id for s in await fb_matches(db,identity, user.id)):
             raise HTTPException(status_code=409,detail='This Facebook source already exists.')
     if payload.type == "LINKEDIN":
         identity = await lock_source_identity(db, payload.url)
-        if any(row.id != source_id for row in await matching_sources(db, identity)):
+        if any(row.id != source_id for row in await matching_sources(db, identity, user.id)):
             raise HTTPException(status_code=409, detail="This LinkedIn source already exists. Edit or resume the existing source.")
     source_changed = url_changed or source.status != payload.status
     if url_changed:
@@ -519,7 +545,7 @@ async def update_source(source_id: uuid.UUID, payload: NewsSourceUpdate, db: Asy
         source.last_checked_at = None
         source.last_error = None
     if payload.type == "LINKEDIN" and url_changed:
-        db.add(LinkedInSourceIdentity(canonical_url=identity, source_id=source_id))
+        db.add(LinkedInSourceIdentity(canonical_url=identity_key(identity, user.id), source_id=source_id))
     for field, value in payload.model_dump(exclude={"email_enabled"}).items():
         setattr(source, field, value)
     subscription = await db.get(NewsSourceEmailSubscription, source_id)
@@ -539,8 +565,8 @@ async def update_source(source_id: uuid.UUID, payload: NewsSourceUpdate, db: Asy
 
 
 @router.put("/sources/{source_id}/email", response_model=NewsSourceOut)
-async def set_source_email(source_id: uuid.UUID, payload: NewsSourceEmailInput, db: AsyncSession = Depends(get_db), user: User = Depends(require_admin)) -> NewsSourceOut:
-    source = await _get_source(db, source_id)
+async def set_source_email(source_id: uuid.UUID, payload: NewsSourceEmailInput, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)) -> NewsSourceOut:
+    source = await _get_source(db, source_id, user)
     subscription = await db.get(NewsSourceEmailSubscription, source_id)
     if subscription is not None and subscription.user_id != user.id:
         raise HTTPException(status_code=409, detail="Email updates for this source are managed by another administrator.")
@@ -555,13 +581,13 @@ async def set_source_email(source_id: uuid.UUID, payload: NewsSourceEmailInput, 
 
 
 @router.delete("/sources/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_source(source_id: uuid.UUID, db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)) -> Response:
-    source = await _get_source(db, source_id)
+async def delete_source(source_id: uuid.UUID, db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)) -> Response:
+    source = await _get_source(db, source_id, _)
     identity = (source.type, source.url)
     from app.intelligence.facebook_identity import lock_identity_change as fb_lock
     await fb_lock(db,source.url if source.type=='FACEBOOK' else '','')
     await lock_identity_change(db, source.url if source.type == "LINKEDIN" else "", "")
-    source = await db.scalar(select(NewsSource).where(NewsSource.id == source_id).with_for_update().execution_options(populate_existing=True))
+    source = await db.scalar(select(NewsSource).where(NewsSource.id == source_id, NewsSource.owner_id == _.id).with_for_update().execution_options(populate_existing=True))
     if source is None:
         raise HTTPException(status_code=404, detail="Source not found")
     if (source.type, source.url) != identity:
@@ -585,9 +611,9 @@ async def delete_source(source_id: uuid.UUID, db: AsyncSession = Depends(get_db)
 
 
 @router.post('/sources/{source_id}/resolve-facebook',response_model=NewsSourceOut)
-async def resolve_facebook_source(source_id: uuid.UUID,db: AsyncSession=Depends(get_db),user: User=Depends(require_admin)):
+async def resolve_facebook_source(source_id: uuid.UUID,db: AsyncSession=Depends(get_db),user: User=Depends(get_current_user)):
     from app.intelligence.facebook_resolution import resolve_facebook_url
-    source=await _get_source(db,source_id)
+    source=await _get_source(db,source_id,user)
     if source.type!='FACEBOOK':raise HTTPException(status_code=422,detail='Select a Facebook source.')
     initial=source.url
     try:resolved=await resolve_facebook_url(initial)

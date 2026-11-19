@@ -1,6 +1,32 @@
 # News Intelligence
 
-This folder is a standalone application. It has its own Next.js frontend, FastAPI backend, PostgreSQL database, login, source polling, and optional OpenAI, Bright Data, and SMTP integrations. It does not call PrimeFlow at runtime.
+This folder is a standalone application. It has its own Next.js frontend, FastAPI backend, PostgreSQL database, login, source polling, and optional OpenAI, Bright Data, and SMTP integrations. The optional GA attachments read PrimeFlow's authenticated print view; ordinary News collection does not depend on PrimeFlow.
+
+## Private user accounts
+
+The existing configured administrator can create member accounts in **Users**,
+disable or enable them, and reset passwords. There is no public registration.
+Members sign in with their account email and a password of at least 12 characters,
+manage their own **Sources**, and see only those sources' news, analyses and saved
+items. Share initial/reset credentials privately; the app does not email passwords.
+Disabling a member revokes sessions and stops their reports while preserving data.
+
+Startup adds the member account table and source ownership column in place. All
+existing sources remain owned by the original configured administrator ID; source
+and article IDs, subscriptions, history, read/saved state, delivery receipts,
+`NEWS_EMAIL_RECIPIENT` and schedules are preserved. Keep the administrator email
+configuration unchanged when upgrading because it determines that existing ID.
+New users start empty. Their manual, test and scheduled emails go to their own
+login email and include only their enabled personal sources. GA timetable
+attachments remain exclusive to the original administrator. SMTP credentials,
+collection schedules and provider spending limits remain shared server settings.
+The same social URL can be added independently by different users; each monitor
+uses its own history and consumes the existing shared allowance.
+
+Deploy the matching frontend and backend together during a maintenance restart;
+take the usual database backup first. No existing source or delivery settings need
+to be re-entered. This migration requires the same schema permissions as the
+existing additive startup migrations.
 
 ## Email reports
 
@@ -10,13 +36,16 @@ closed UTC day once at 00:05 UTC while keeping the 07:00/21:00 email reports.
 
 Each source has an Email on/off choice. With `NEWS_SOCIAL_SCHEDULE_ENABLED=true` (the default), LinkedIn and approved Facebook sources are checked in two daily cycles at **07:00 and 21:00 Europe/Budapest**, including daylight-saving changes. Website/RSS collection continues at each source's interval. Manual checks and ordinary scans cannot start extra social fetches. A delayed scheduler may start a slot within 30 minutes; missed slots are not replayed. Pending snapshots can still be retrieved after that window without starting replacement jobs.
 
-After collection finishes, a combined report includes previously undelivered updates from subscribed active sources, including periodic News/website/RSS updates. Reports wait up to 30 minutes for pending social results. No email is sent without new updates; empty categories, idle sources and collection diagnostics are omitted. Late results can enter the next report. Delivery claims and item receipts survive restarts; uncertain SMTP outcomes block automatic resending and subsequent reports for that recipient/user until verified. Collection continues under the existing account, daily/monthly, Facebook pilot and source-cap protections; these may defer sources and never guarantee complete coverage. Source inventory is frozen separately for each slot, so newly added sources enter the next slot.
+After collection finishes, the main section covers verified publications in `(21:00, 07:00]` or `(07:00, 21:00]` in Europe/Budapest. Reposts use the verified repost time. The report lists recent late discoveries (up to 48 hours) and discoveries without a verified publication time separately. The first import, older discoveries and batches of at least 20 records from one source are summarized in an authenticated archive. Verified publications inside the interval still appear in the main section. Report preparation uses stored results. Delivery claims and item receipts survive restarts. An uncertain SMTP result holds automatic resending until it is verified. The report shows coverage gaps and waits up to 30 minutes for pending collection.
+
+The twice-daily scheduler allocates the remaining operational Bright Data budget across the remaining slots of the month. Per-slot allocations are recorded before new requests. The existing monthly reserve and billing verification still apply, and pending snapshots can finish within their original reservations. Regular social slots use their own time window. Historical gaps require an authorized backfill.
 
 Recurring email uses `EMAIL_USER` / `EMAIL_PASSWORD` and `NEWS_EMAIL_RECIPIENT`; one-day trial credentials do not grant recurring email access. Email settings display the fixed report times. Setting `NEWS_SOCIAL_SCHEDULE_ENABLED=false` restores the legacy daily/trial schedule and editable email times. Application startup creates the additive schedule-report table without changing historical delivery or billing records.
 
+With `NEWS_GA_TIMETABLE_BINDING_FILE` configured, both the 07:00 and 21:00 reports attach a one-page PDF and an Excel workbook of Admin Tasks' GA Time Table, filtered to the report's local date. Both formats include the same printed comments, activities and meetings. These reports are sent even without new News items when attachments are enabled. The evening slot captures its own files, including later timetable edits, instead of reusing the morning snapshot. Export failures do not block News: the report sends without attachments and explains their absence, even without new items. Export is attempted again at the next scheduled slot without resending the delivered News report. Both files are frozen in a private dated cache per slot before SMTP; their filenames and hashes are recorded with the durable report claim. See [GA timetable attachments](docs/ga-morning-attachment.md).
+
 An owner-authorized `NEWS_COLLECTION_EXCEPTION_DATE=YYYY-MM-DD` enables a single evening experiment on that local date. Only its 21:00 cycle can exceed the ordinary daily and Facebook sublimits, with up to 80 returned records reserved per social source. The shared monthly ceiling, 1,000-record reserve, billing/account checks, identity checks and source pauses remain enforced; only previous record-cap saturation may retry for this specific cycle, retaining its pause history. The experiment requests the last 07:00–21:00 interval and also checks active website/RSS sources. New-request permission expires at 21:30; tomorrow's ordinary limits resume without a restart. Conservative reservations remain in the ledger. Provider usage observations before and after the cycle are stored separately in application metadata, refreshed through noon tomorrow, and labelled provisional while the provider rollup has not covered completed executions. Unsupported sources, unverifiable repost times and saturated results still prevent a claim of complete coverage.
 
-The experiment's email uses the exact `(07:00, 21:00]` activity window for every source type, even when the previous report checkpoint is older or results are inserted late. Undated or unverified activity remains excluded from this report. Ordinary scheduled reports retain their existing late-result handling.
 
 When the existing private `NEWS_TRIAL_BILLING_BINDING_FILE` is configured, each social cycle refreshes verified shared-account billing with read-only requests before starting new jobs. A failed refresh blocks new requests while permitting pending-result retrieval. Without that binding, fresh operator-imported billing evidence is still required and expires after 24 hours. Facebook retains its explicit dataset and approved-source binding requirements.
 

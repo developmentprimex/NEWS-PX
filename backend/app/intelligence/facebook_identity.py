@@ -51,8 +51,9 @@ async def lock_identity_change(db,old_url,new_url):
     for key in sorted({lock_key(i) for v in (old_url,new_url) if (i:=identity_or_none(v))}):
         await db.execute(text('SELECT pg_advisory_xact_lock(:key)'),{'key':key})
 
-async def matching_sources(db,identity):
+async def matching_sources(db,identity,owner_id=None):
+    from app.auth import ADMIN_ID
     from sqlalchemy import select
     from app.intelligence.models import NewsSource
-    rows=list(await db.scalars(select(NewsSource).where(NewsSource.type=='FACEBOOK')))
+    rows=list(await db.scalars(select(NewsSource).where(NewsSource.type=='FACEBOOK', NewsSource.owner_id == (owner_id or ADMIN_ID))))
     return [s for s in rows if identity_or_none(s.url)==identity]

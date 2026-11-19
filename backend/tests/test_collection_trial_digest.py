@@ -1,3 +1,4 @@
+from app.auth import ADMIN_ID, User
 import asyncio
 import json
 from datetime import date, datetime, timedelta, timezone
@@ -19,7 +20,7 @@ END = datetime(2026, 10, 19, 19, tzinfo=timezone.utc)
 
 
 async def prepare(db, *, state='finished'):
-    user = uuid4()
+    user = ADMIN_ID
     config = {'enabled': True, 'date': '2026-10-19', 'user_id': str(user),
               'recipient_fingerprint': service.recipient_fingerprint(settings.NEWS_EMAIL_RECIPIENT)}
     db.add(AppMetadata(key=TRIAL_KEY, value=json.dumps(config)))

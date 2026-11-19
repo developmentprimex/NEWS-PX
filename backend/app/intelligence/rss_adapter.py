@@ -68,7 +68,7 @@ def _plain_text(value: str) -> str:
 
 
 def _published(entry: feedparser.FeedParserDict) -> datetime | None:
-    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+    parsed = entry.get("published_parsed")
     if not parsed:
         return None
     try:
@@ -104,7 +104,7 @@ def parse_feed(payload: bytes, feed_url: str) -> list[CollectedNewsItem]:
             url=link, title=title,
             original_text=(f"{title}. {description}" if description else title)[:20_000],
             published_at=_published(entry),
-            publication_time_verified=publication_has_precise_time(entry.get('published') or entry.get('updated')),
+            publication_time_verified=publication_has_precise_time(entry.get('published')),
         ))
     return posts
 

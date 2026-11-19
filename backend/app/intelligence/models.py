@@ -8,12 +8,14 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
+from app.auth import ADMIN_ID
 
 
 class NewsSource(Base):
     __tablename__ = "intelligence_sources"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True, default=lambda: ADMIN_ID, server_default=text(f"'{ADMIN_ID}'"))
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     url: Mapped[str] = mapped_column(String(2000), nullable=False)
     type: Mapped[str] = mapped_column(String(24), nullable=False)
@@ -139,7 +141,7 @@ class NewsAnalysis(Base):
     deadline: Mapped[date | None] = mapped_column(Date)
     funding_amount: Mapped[str | None] = mapped_column(String(160))
     eligibility: Mapped[str | None] = mapped_column(Text)
-    opportunity_type: Mapped[str | None] = mapped_column(String(40))
+    opportunity_type: Mapped[str | None] = mapped_column(Text)
     tags: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
     analyzed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 

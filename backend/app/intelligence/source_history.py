@@ -10,16 +10,19 @@ from app.db import AppMetadata
 from app.intelligence.models import BrightDataExecution
 from app.intelligence.facebook_identity import identity_or_none as facebook_identity
 from app.intelligence.linkedin_identity import identity_or_none as linkedin_identity
+from app.auth import ADMIN_ID
 
 TIMESTAMPS = ('last_started_at', 'last_checked_at', 'last_successful_fetch_at')
 COLLECTION_STATE = ('empty_fetch_streak', 'last_new_posts', 'linkedin_paused_reason', 'last_error')
 
 
-def history_key(source):
+def history_key(source, *, owner_id=None):
     identity = (linkedin_identity(source.url) if source.type == 'LINKEDIN' else
                 facebook_identity(source.url) if source.type == 'FACEBOOK' else None)
     if identity:
-        return 'source-history:' + hashlib.sha256(f'{source.type}:{identity}'.encode()).hexdigest()
+        owner_id = owner_id or getattr(source, 'owner_id', None) or ADMIN_ID
+        scope = '' if owner_id == ADMIN_ID else f'{owner_id}:'
+        return 'source-history:' + hashlib.sha256(f'{scope}{source.type}:{identity}'.encode()).hexdigest()
     return None
 
 

@@ -173,6 +173,7 @@ class FeedItemOut(BaseModel):
     title: str
     originalText: str | None
     publishedAt: str
+    publicationTimeKnown: bool = True
     imageUrl: str | None
     contentHash: str | None
     createdAt: str
@@ -190,6 +191,7 @@ class FeedItemOut(BaseModel):
 
 class NewsFeedOut(BaseModel):
     items: list[FeedItemOut]
+    demoAllowed: bool = True
     hasLiveSources: bool
     emailConfigured: bool
     emailRecipient: str

@@ -3,7 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
-import { Bookmark, BriefcaseBusiness, ChevronRight, Compass, LayoutDashboard, Linkedin, LogOut, Mail, Menu, Newspaper, Radio, Sparkles, X, Zap } from "lucide-react"
+import { Bookmark, BriefcaseBusiness, ChevronRight, Compass, LayoutDashboard, Linkedin, LogOut, Mail, Menu, Newspaper, Radio, Sparkles, Users, X, Zap } from "lucide-react"
 import { useAuth } from "@/lib/auth"
 import { cn } from "@/lib/utils"
 import { filters } from "@/features/intelligence/components/news-filters"
@@ -16,7 +16,8 @@ const sections = [
   { label: "Opportunities", href: "/intelligence/opportunities", icon: BriefcaseBusiness },
   { label: "Saved", href: "/intelligence/saved", icon: Bookmark },
   { label: "Email settings", href: "/intelligence/email-settings", icon: Mail },
-  { label: "Sources", href: "/intelligence/sources", icon: Radio, adminOnly: true },
+  { label: "Sources", href: "/intelligence/sources", icon: Radio },
+  { label: "Users", href: "/intelligence/users", icon: Users, adminOnly: true },
 ]
 
 export default function WorkspaceLayout({ children }: { children: React.ReactNode }) {
@@ -87,7 +88,7 @@ function WorkspaceShell({ children }: { children: React.ReactNode }) {
           })}
         </nav>
       </div>
-      <div className="border-t border-[#eef1ec] p-4"><button type="button" onClick={() => void logout().then(() => router.replace("/login"))} className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left text-sm text-[#68776d] hover:bg-[#f5f7f3] hover:text-[#294633]"><LogOut className="size-4" /> Sign out</button></div>
+      <div className="border-t border-[#eef1ec] p-4"><p className="truncate px-2 pb-2 text-xs text-[#83958a]" title={user.email}>{user.email}</p><button type="button" onClick={() => void logout().then(() => router.replace("/login"))} className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left text-sm text-[#68776d] hover:bg-[#f5f7f3] hover:text-[#294633]"><LogOut className="size-4" /> Sign out</button></div>
     </aside>
     <main className="min-w-0 lg:pl-[264px]">{children}</main>
   </div>

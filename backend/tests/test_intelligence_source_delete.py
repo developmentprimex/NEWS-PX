@@ -7,7 +7,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from app.auth import require_admin
+from app.auth import get_current_user
 from app.intelligence import collection, collection_cycles
 from app.intelligence.credit_control import budget_status
 from app.intelligence.models import (
@@ -106,7 +106,7 @@ def test_delete_waits_for_pending_collection(database, pending):
     asyncio.run(run())
 
 
-def test_delete_requires_admin(database):
+def test_delete_requires_authentication(database):
     _, sessions = database
 
     async def run():
@@ -116,10 +116,10 @@ def test_delete_requires_admin(database):
             await db.commit()
             sid = source.id
         async with api(sessions) as client:
-            def deny_admin():
-                raise HTTPException(status_code=403)
-            client._transport.app.dependency_overrides[require_admin] = deny_admin
-            assert (await client.delete('/intelligence/sources/' + str(sid))).status_code == 403
+            def deny_access():
+                raise HTTPException(status_code=401)
+            client._transport.app.dependency_overrides[get_current_user] = deny_access
+            assert (await client.delete('/intelligence/sources/' + str(sid))).status_code == 401
         async with sessions() as db:
             assert await db.get(NewsSource, sid) is not None
     asyncio.run(run())

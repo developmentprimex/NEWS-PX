@@ -1,3 +1,4 @@
+from app.auth import ADMIN_ID, User
 import asyncio
 import hashlib
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
 from app.intelligence import digest_service as service
+from app.db import AppMetadata
 
 
 class AsyncSessionAdapter:
@@ -31,7 +33,7 @@ class AsyncSessionAdapter:
 def test_actual_query_interval_subscriptions_and_delivery_receipts(monkeypatch):
     engine = create_engine("sqlite://")
     metadata = MetaData()
-    for model in (service.NewsSource, service.NewsItem, service.NewsAnalysis,
+    for model in (AppMetadata, service.NewsSource, service.NewsItem, service.NewsAnalysis,
                   service.NewsDigestSettings, service.NewsSourceEmailSubscription, service.NewsDigestDelivery):
         table = model.__table__.to_metadata(metadata)
         for column in table.columns:
@@ -42,10 +44,10 @@ def test_actual_query_interval_subscriptions_and_delivery_receipts(monkeypatch):
     start = datetime(2026, 10, 6, 10, 30, tzinfo=timezone.utc)
     end = datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc)
     enabled = start - timedelta(days=1)
-    user = uuid4()
+    user = ADMIN_ID
     sent = []
 
-    async def send(*args):
+    async def send(*args, **kwargs):
         sent.append(args)
 
     monkeypatch.setattr(service, "_send_digest", send)

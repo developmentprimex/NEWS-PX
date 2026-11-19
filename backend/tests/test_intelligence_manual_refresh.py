@@ -1,3 +1,4 @@
+from app.auth import ADMIN_ID, User
 import asyncio
 from types import SimpleNamespace
 from uuid import uuid4
@@ -46,11 +47,11 @@ def test_manual_refresh_checks_active_sources_and_reports_progress(monkeypatch):
     monkeypatch.setattr(news_router, "_check_all_task", None)
 
     async def run():
-        status = await news_router.check_all_sources_now(db=FakeSession(), _=None)
+        status = await news_router.check_all_sources_now(db=FakeSession(), _=User(id=ADMIN_ID, email="test@example.com"))
         assert status == {"state": "running", "total": 2, "processed": 0, "failed": 0, "started": 0, "pending": 0}
         await news_router._check_all_task
         assert checked == [source.id for source in sources[:2]]
-        assert (await news_router.check_all_sources_status(db=FakeSession(), _=None)) == {
+        assert (await news_router.check_all_sources_status(db=FakeSession(), _=User(id=ADMIN_ID, email="test@example.com"))) == {
             "state": "finished", "total": 2, "processed": 2, "failed": 0, "started": 0, "pending": 1,
         }
 

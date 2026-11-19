@@ -9,6 +9,7 @@ os.environ.update({
     "NEWS_ADMIN_EMAIL": "test@example.com", "NEWS_ADMIN_PASSWORD": "test-password",
     "NEWS_SESSION_SECRET": "local-test-secret", "NEWS_ENABLE_COLLECTION": "false",
     "NEWS_SOCIAL_SCHEDULE_ENABLED": "false",
+    "NEWS_GA_TIMETABLE_BINDING_FILE": "",
     "NEWS_AUTO_IMPORT_SNAPSHOT": "false", "NEWS_LINKEDIN_FETCH_ENABLED": "false",
     "NEWS_LINKEDIN_HIGH_PRIORITY_EXTRA": "false", "BRIGHTDATA_API_TOKEN": "test-token",
     "NEWS_BRIGHTDATA_CANARY_LIVE_ENABLED": "false",

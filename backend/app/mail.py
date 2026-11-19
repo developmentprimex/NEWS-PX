@@ -3,9 +3,17 @@
 import asyncio
 import smtplib
 import ssl
+from dataclasses import dataclass
 from email.message import EmailMessage
 
 from app.config import settings
+
+
+@dataclass(frozen=True)
+class EmailAttachment:
+    filename: str
+    data: bytes
+    content_type: str = "application/pdf"
 
 
 class GmailService:
@@ -18,7 +26,8 @@ class GmailService:
         self.host = settings.EMAIL_HOST
         self.port = settings.EMAIL_PORT
 
-    async def send_verified(self, subject: str, recipients: list[str], body: str, html: str | None = None) -> None:
+    async def send_verified(self, subject: str, recipients: list[str], body: str, html: str | None = None,
+                            *, attachments: list[EmailAttachment] | None = None) -> None:
         message = EmailMessage()
         message["From"] = self.sender
         message["To"] = ", ".join(recipients)
@@ -26,6 +35,10 @@ class GmailService:
         message.set_content(body, charset="utf-8")
         if html:
             message.add_alternative(html, subtype="html", charset="utf-8")
+        for attachment in attachments or []:
+            maintype, subtype = attachment.content_type.split("/", 1)
+            message.add_attachment(attachment.data, maintype=maintype, subtype=subtype,
+                                   filename=attachment.filename)
 
         def send() -> None:
             context = ssl.create_default_context()

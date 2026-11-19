@@ -1,3 +1,4 @@
+from app.auth import ADMIN_ID, User
 """A single evening can exceed daily caps; expiry, billing and identity still hold."""
 import asyncio
 import json
@@ -164,7 +165,7 @@ def test_usage_baseline_and_delayed_rollup_are_distinct_from_reservations(databa
     asyncio.run(run())
 
 
-def test_today_additionally_checks_websites_but_tomorrow_does_not(database, monkeypatch):
+def test_recurring_website_checks_continue_after_the_exception_date(database, monkeypatch):
     _, sessions = database
     calls = []
     async def rss(adapter):
@@ -179,7 +180,7 @@ def test_today_additionally_checks_websites_but_tomorrow_does_not(database, monk
         await schedule.run_social_collection(PM+timedelta(minutes=1))
         assert calls == ['https://example.org/feed']
         await schedule.run_social_collection(PM+timedelta(days=1))
-        assert len(calls) == 1
+        assert len(calls) == 2
     asyncio.run(run())
 
 
@@ -212,11 +213,11 @@ def test_evening_email_only_contains_confirmed_activity_in_the_last_slot_for_eve
     monkeypatch.setattr(settings, 'EMAIL_USER', 'sender@example.org')
     monkeypatch.setattr(settings, 'EMAIL_PASSWORD', 'test-only')
     sent = []
-    async def smtp(subject, body, html):
+    async def smtp(subject, body, html, **kwargs):
         sent.append(body)
     monkeypatch.setattr(schedule, '_send_digest', smtp)
     async def run():
-        user_id = uuid4()
+        user_id = ADMIN_ID
         async with sessions() as db:
             await fresh(db, PM)
             db.add(NewsDigestSettings(user_id=user_id, times=['07:00','21:00'],

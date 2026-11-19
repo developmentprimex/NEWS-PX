@@ -14,13 +14,15 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.auth import account_recipient
+from app.intelligence.content_quality import excluded_item_query
 from app.db import SessionLocal
 from app.intelligence.email_service import _smtp_reachable
 from app.intelligence.models import (
     NewsAnalysis, NewsDigestDelivery, NewsDigestSettings,
     NewsItem, NewsSource, NewsSourceEmailSubscription,
 )
-from app.mail import GmailService
+from app.mail import EmailAttachment, GmailService
 
 logger = logging.getLogger(__name__)
 DIGEST_ZONE = ZoneInfo("Europe/Budapest")
@@ -84,7 +86,8 @@ def activity_delivery_key(item: NewsItem) -> str:
 
 
 def digest_content(entries: list[dict], slot: datetime, source_names: list[str] | None = None,
-                   *, interval_start: datetime | None = None, sources: list[NewsSource] | None = None) -> tuple[str, str, str]:
+                   *, interval_start: datetime | None = None, sources: list[NewsSource] | None = None,
+                   empty_status: str | None = None) -> tuple[str, str, str]:
     start = interval_start or slot
     interval = f"{_stamp(start)} · {_stamp(slot)}"
     count = len(entries)
@@ -95,12 +98,16 @@ def digest_content(entries: list[dict], slot: datetime, source_names: list[str] 
     summary = " · ".join(f"{counts[kind]} {label}" for kind, label in [("NEWS", "lajme"), ("POST", "postime"), ("REPOST", "repostime"), ("ARTICLE", "artikuj")] if counts[kind])
     if other:
         summary += f" · {other} aktivitete të tjera"
+    if not entries:
+        summary = "0 aktivitete të reja"
     text_lines = [title, f"Intervali: {interval} (Europe/Budapest)", summary, ""]
     sections: dict[str, list[dict]] = {}
     for entry in entries:
         sections.setdefault(str(entry["source"].id), []).append(entry)
     if not entries:
         message = "Nuk u gjet aktivitet i ri në të dhënat e mbledhura nga burimet e zgjedhura për këtë interval."
+        if empty_status:
+            message += " " + empty_status
         text_lines.extend([message, ""])
     else:
         message = "Lajme, postime, repostime dhe artikuj nga burimet me email të aktivizuar."
@@ -116,9 +123,10 @@ def digest_content(entries: list[dict], slot: datetime, source_names: list[str] 
             summary_text = getattr(analysis, "summary", None) or item.original_text or item.title
             summary_text = " ".join(summary_text.split())[:700]
             details = [label]
-            if item.published_at:
-                details.append(f"Publikuar: {_stamp(item.published_at)}")
-                if _utc(item.published_at) <= _utc(start):
+            activity_at = entry.get("activity_at") or item.published_at
+            if activity_at:
+                details.append(f"{'Ripostuar' if kind == 'REPOST' and entry.get('activity_at') else 'Publikuar'}: {_stamp(activity_at)}")
+                if _utc(activity_at) <= _utc(start):
                     details.append("Marrë me vonesë nga burimi")
             else:
                 details.append("Ora e publikimit nuk është dhënë nga burimi")
@@ -166,26 +174,75 @@ def digest_content(entries: list[dict], slot: datetime, source_names: list[str] 
     return subject, "\n".join(text_lines), html
 
 
-async def _send_digest(subject: str, body: str, html: str, *, credentials: tuple[str, str] | None = None) -> None:
+def digest_supplement(individual, archive, archive_url, coverage):
+    """Render discovery and coverage information outside the fixed publication interval."""
+    text_lines = []
+    blocks = []
+    headings = {
+        "late": "Zbuluar me vonesë",
+        "unverified": "Zbuluar që nga raporti i fundit",
+    }
+    for section, heading in headings.items():
+        entries = [entry for entry in individual if entry["section"] == section]
+        if not entries:
+            continue
+        text_lines.append(f"{heading} ({len(entries)})")
+        cards = []
+        for entry in entries:
+            item, source = entry["item"], entry["source"]
+            details = f"Zbuluar në {_stamp(item.created_at)}"
+            if entry["stamp"]:
+                details += f" · Publikuar më {_stamp(entry['stamp'])}"
+            else:
+                if item.published_at and activity_kind(item, source) != "REPOST":
+                    details += f" · Data e publikimit {_utc(item.published_at).astimezone(DIGEST_ZONE):%d.%m.%Y}"
+                details += " · Ora e publikimit e paverifikuar"
+            url = _safe_url(item.url)
+            text_lines.extend([f"{source.name} · {item.title}", details, url or "", ""])
+            title = escape(item.title)
+            if url:
+                title = f'<a href="{escape(url, quote=True)}">{title}</a>'
+            cards.append(f"<li><b>{escape(source.name)}</b> · {title}<br>{escape(details)}</li>")
+        blocks.append(f"<h2>{escape(heading)} ({len(entries)})</h2><ul>{''.join(cards)}</ul>")
+    if archive:
+        counts = {}
+        for entry in archive:
+            name = entry["source"].name
+            counts[name] = counts.get(name, 0) + 1
+        summary = f"Arkivi i importuar ({len(archive)}) · " + ", ".join(
+            f"{name} ({count})" for name, count in counts.items())
+        text_lines.extend([summary, archive_url, ""])
+        blocks.append(f'<p>{escape(summary)} · <a href="{escape(archive_url, quote=True)}">Hap listën në News</a></p>')
+    text_lines.append(coverage)
+    blocks.append(f"<p>{escape(coverage)}</p>")
+    return "\n".join(text_lines), '<div style="max-width:652px;margin:auto;padding:0 24px 20px">' + "".join(blocks) + "</div>"
+
+
+async def _send_digest(subject: str, body: str, html: str, *, credentials: tuple[str, str] | None = None,
+                       attachments: list[EmailAttachment] | None = None, recipient: str | None = None) -> None:
     mailer = GmailService(credentials=credentials) if credentials is not None else GmailService()
     if mailer.port != 465 and not await _smtp_reachable(mailer.host, mailer.port):
         if not await _smtp_reachable(mailer.host, 465):
             raise ConnectionError("SMTP submission ports are unreachable")
         mailer.port = 465
-    await mailer.send_verified(subject, [settings.NEWS_EMAIL_RECIPIENT], body, html=html)
+    extra = {"attachments": attachments} if attachments else {}
+    await mailer.send_verified(subject, [recipient or settings.NEWS_EMAIL_RECIPIENT], body, html=html, **extra)
 
 
-async def send_digest_test(*, credentials: tuple[str, str] | None = None) -> None:
+async def send_digest_test(*, credentials: tuple[str, str] | None = None, recipient: str | None = None) -> None:
     subject = "[News Intelligence] Test i raportit me email"
     body = "Ky është një email test. Raportet e planifikuara do të përmbajnë lajmet, postimet, repostimet dhe artikujt e rinj nga burimet ku emaili është aktiv."
     html = ('<div style="max-width:600px;margin:auto;padding:28px;font-family:Arial,sans-serif;color:#24342a">'
             '<p style="color:#63866a;font-size:12px;font-weight:700;letter-spacing:2px">NEWS INTELLIGENCE</p>'
             '<h1 style="font-size:24px">Test i raportit me email</h1>'
             '<p>Konfigurimi i emailit po punon. Raportet e planifikuara do të përmbajnë lajmet, postimet, repostimet dhe artikujt e rinj nga burimet ku emaili është aktiv.</p></div>')
-    await _send_digest(subject, body, html, credentials=credentials)
+    await _send_digest(subject, body, html, credentials=credentials, recipient=recipient)
 
 
 async def process_digest(db: AsyncSession, user_id: uuid.UUID, now: datetime | None = None) -> int:
+    recipient = await account_recipient(db, user_id)
+    if recipient is None:
+        return 0
     now = now or datetime.now(timezone.utc)
     digest = (await db.execute(select(NewsDigestSettings).where(NewsDigestSettings.user_id == user_id)
                                .with_for_update(skip_locked=True))).scalar_one_or_none()
@@ -197,7 +254,7 @@ async def process_digest(db: AsyncSession, user_id: uuid.UUID, now: datetime | N
     sources = (await db.scalars(
         select(NewsSource)
         .join(NewsSourceEmailSubscription, NewsSourceEmailSubscription.source_id == NewsSource.id)
-        .where(NewsSourceEmailSubscription.user_id == user_id, NewsSource.status == "ACTIVE")
+        .where(NewsSource.owner_id == user_id, NewsSourceEmailSubscription.user_id == user_id, NewsSource.status == "ACTIVE")
         .order_by(NewsSource.name)
     )).all()
     if not sources:
@@ -210,7 +267,8 @@ async def process_digest(db: AsyncSession, user_id: uuid.UUID, now: datetime | N
         .outerjoin(NewsAnalysis, NewsAnalysis.news_item_id == NewsItem.id)
         .join(NewsSource, NewsSource.id == NewsItem.source_id)
         .join(NewsSourceEmailSubscription, NewsSourceEmailSubscription.source_id == NewsSource.id)
-        .where(NewsSourceEmailSubscription.user_id == user_id, NewsSource.status == "ACTIVE",
+        .where(NewsSource.owner_id == user_id, NewsSourceEmailSubscription.user_id == user_id, NewsSource.status == "ACTIVE",
+               ~excluded_item_query(NewsItem.id),
                NewsItem.created_at >= NewsSourceEmailSubscription.enabled_at,
                NewsItem.created_at <= slot, activity_time <= slot,
                or_(activity_time > digest.last_slot_at,
@@ -243,7 +301,7 @@ async def process_digest(db: AsyncSession, user_id: uuid.UUID, now: datetime | N
         return 0
     subject, body, html = digest_content(entries, slot, interval_start=digest.last_slot_at, sources=sources)
     try:
-        await _send_digest(subject, body, html)
+        await _send_digest(subject, body, html, recipient=recipient)
     except Exception as exc:
         digest.last_error = str(exc)[:500]
         await db.commit()

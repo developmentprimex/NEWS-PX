@@ -23,7 +23,7 @@ def test_rss_entries_keep_direct_links_and_clean_text():
     assert "ignore me" not in posts[0].original_text
 
 
-def test_atom_entries_use_alternate_article_link_and_updated_date():
+def test_atom_updated_date_does_not_certify_publication():
     payload = b"""<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">
       <title>Events</title><entry><id>tag:example.org,2026:event-1</id><title>Business event</title>
       <updated>2026-09-23T12:30:00Z</updated><link rel="alternate" href="/events/1"/>
@@ -32,7 +32,8 @@ def test_atom_entries_use_alternate_article_link_and_updated_date():
     posts = parse_feed(payload, "https://example.org/atom.xml")
     assert len(posts) == 1
     assert posts[0].url == "https://example.org/events/1"
-    assert posts[0].published_at == datetime(2026, 9, 23, 12, 30, tzinfo=timezone.utc)
+    assert posts[0].published_at is None
+    assert not posts[0].publication_time_verified
     assert "Prishtina, 8 October." in posts[0].original_text
 
 
